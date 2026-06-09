@@ -62,7 +62,7 @@ def main(cfg: Config):
         collect(cfg, env)
         return
 
-    viewer = newton.viewer.ViewerGL()
+    viewer = newton.viewer.ViewerRerun()
     env = FrankaEnv(cfg, viewer)
     while viewer.is_running():
         if viewer.should_step():

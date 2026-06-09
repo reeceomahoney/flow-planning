@@ -38,7 +38,7 @@ def main(cfg: Config):
         dataset_stats=stats,  # ty: ignore[invalid-argument-type]
     )
 
-    viewer = newton.viewer.ViewerGL()
+    viewer = newton.viewer.ViewerRerun()
     env = FrankaEnv(cfg, viewer)
 
     while viewer.is_running():

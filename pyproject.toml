@@ -9,15 +9,13 @@ dependencies = [
   "lerobot>=0.5.1",
   "newton[examples]",
   "pre-commit>=4.6.0",
+  "rerun-sdk>=0.26.2",
   "ty>=0.0.46",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.uv.sources]
-newton = { git = "https://github.com/newton-physics/newton.git", branch = "main" }
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
