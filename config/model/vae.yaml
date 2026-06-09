@@ -1,5 +1,0 @@
-_target_: flow_planning.models.vae.VAE
-input_dim: ${obs_dim}
-latent_dim: 64
-hidden_dim: 512
-device: ${device}
