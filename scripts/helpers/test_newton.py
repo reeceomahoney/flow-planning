@@ -44,7 +44,10 @@ class FrankaEnv:
         # ------------------------------------------------------------------
         franka = newton.ModelBuilder()
         franka.add_urdf(
-            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            str(
+                newton.utils.download_asset("franka_emika_panda")
+                / "urdf/fr3_franka_hand.urdf"
+            ),
             floating=False,
         )
 
@@ -71,9 +74,13 @@ class FrankaEnv:
 
         # state, initialised from the model's default joint configuration
         self.state = self.model.state()
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
+        self._eval_fk()
 
         self._setup_ik()
+
+    def _eval_fk(self):
+        # ty: stubs type joint_q/joint_qd as float | None; both are set post-finalize.
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)  # ty: ignore[invalid-argument-type]
 
     # ----------------------------------------------------------------------
     # IK setup
@@ -81,22 +88,35 @@ class FrankaEnv:
     def _setup_ik(self):
         ik_dofs = self.model_single.joint_coord_count
 
+        joint_limit_lower = self.model.joint_limit_lower
+        joint_limit_upper = self.model.joint_limit_upper
+        joint_q = self.model.joint_q
+        body_q = self.state.body_q
+        assert joint_limit_lower is not None
+        assert joint_limit_upper is not None
+        assert joint_q is not None
+        assert body_q is not None
+
         self.pos_obj = ik.IKObjectivePosition(
             link_index=EE_INDEX,
             link_offset=wp.vec3(0.0, 0.0, 0.0),
             target_positions=wp.zeros(WORLD_COUNT, dtype=wp.vec3),
         )
 
-        joint_limit_lower = wp.clone(self.model.joint_limit_lower.reshape((WORLD_COUNT, -1))[:, :ik_dofs])
-        joint_limit_upper = wp.clone(self.model.joint_limit_upper.reshape((WORLD_COUNT, -1))[:, :ik_dofs])
+        limit_lower = wp.clone(
+            joint_limit_lower.reshape((WORLD_COUNT, -1))[:, :ik_dofs]
+        )
+        limit_upper = wp.clone(
+            joint_limit_upper.reshape((WORLD_COUNT, -1))[:, :ik_dofs]
+        )
         self.obj_joint_limits = ik.IKObjectiveJointLimit(
-            joint_limit_lower=joint_limit_lower.flatten(),
-            joint_limit_upper=joint_limit_upper.flatten(),
+            joint_limit_lower=limit_lower.flatten(),
+            joint_limit_upper=limit_upper.flatten(),
             weight=10.0,
         )
 
         # Joint coords the solver updates (one row per world).
-        self.joint_q_ik = wp.clone(self.model.joint_q.reshape((WORLD_COUNT, -1))[:, :ik_dofs])
+        self.joint_q_ik = wp.clone(joint_q.reshape((WORLD_COUNT, -1))[:, :ik_dofs])
 
         self.solver = ik.IKSolver(
             model=self.model_single,
@@ -107,7 +127,9 @@ class FrankaEnv:
         )
 
         # Start interpolating from the current TCP pose towards the first goal.
-        self.start_pos = self.state.body_q.numpy().reshape(WORLD_COUNT, -1, 7)[:, EE_INDEX, :3].copy()
+        self.start_pos = (
+            body_q.numpy().reshape(WORLD_COUNT, -1, 7)[:, EE_INDEX, :3].copy()
+        )
         self.goal_pos = self._sample_targets()
 
     def _sample_targets(self):
@@ -134,12 +156,18 @@ class FrankaEnv:
         target = self.start_pos + (self.goal_pos - self.start_pos) * s
         self.pos_obj.set_target_positions(wp.array(target, dtype=wp.vec3))
 
-        self.solver.step(self.joint_q_ik, self.joint_q_ik, iterations=IK_ITERS)
+        # ty: stubs want array2d here; the cloned reshape view already is one.
+        self.solver.step(self.joint_q_ik, self.joint_q_ik, iterations=IK_ITERS)  # ty: ignore[invalid-argument-type]
 
         # Write the solved arm coords back into the full model and run FK.
-        joint_q_view = self.model.joint_q.reshape((WORLD_COUNT, -1))
-        wp.copy(dest=joint_q_view[:, : self.model_single.joint_coord_count], src=self.joint_q_ik)
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
+        joint_q = self.model.joint_q
+        assert joint_q is not None
+        joint_q_view = joint_q.reshape((WORLD_COUNT, -1))
+        wp.copy(
+            dest=joint_q_view[:, : self.model_single.joint_coord_count],
+            src=self.joint_q_ik,
+        )
+        self._eval_fk()
 
         self.sim_time += self.frame_dt
 
