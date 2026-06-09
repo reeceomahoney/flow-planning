@@ -1,5 +1,6 @@
 import glob
 import os
+from typing import cast
 
 from PIL import Image
 
@@ -103,7 +104,7 @@ def overlay_images(image_paths, output_path):
         img_data = img.getdata()
         new_data = []
 
-        for item in img_data:
+        for item in cast("list[tuple[int, int, int, int]]", img_data):
             # Keep original RGB, but scale the alpha
             if item[3] > 0:  # If the pixel is not completely transparent
                 new_alpha = min(alpha, item[3])  # Don't increase alpha beyond original
@@ -118,7 +119,9 @@ def overlay_images(image_paths, output_path):
         print(f"Added {os.path.basename(img_path)} with alpha {alpha}")
 
     # resize
-    composite = composite.resize((int(0.75 * composite.width), int(0.75 * composite.height)))
+    composite = composite.resize(
+        (int(0.75 * composite.width), int(0.75 * composite.height))
+    )
 
     # square crop
     width, height = composite.size
