@@ -3,26 +3,13 @@ name = "flow_planning"
 version = "0.1.0"
 description = "Flow Planning IsaacLab Project"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 dependencies = [
-  "torch==2.5.1",
-  "isaacsim[all,extscache]==4.5.0",
-  "isaaclab",
-  "isaaclab_assets",
-  "isaaclab_mimic",
-  "isaaclab_rl[rsl-rl]",
-  "isaaclab_tasks",
-  "pip>=24.3.1",
-  "gymnasium-robotics>=1.2.4",
-  "wandb==0.12.21",
-  "minari[all]>=0.5.2",
-  "pyqt6>=6.8.0",
-  "diffusers>=0.32.2",
-  "pin>=2.7.0",
-  "example-robot-data>=4.3.0",
-  "pytorch-kinematics>=0.7.5",
-  "pillow>=11.0.0",
+  "lerobot>=0.5.1",
+  "newton[examples]",
+  "pre-commit>=4.6.0",
+  "ty>=0.0.46",
 ]
 
 [build-system]
@@ -30,50 +17,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv.sources]
-torch = { index = "pytorch" }
-isaacsim = { index = "nvidia" }
-isaaclab = { path = "IsaacLab/source/isaaclab", editable = true }
-isaaclab_assets = { path = "IsaacLab/source/isaaclab_assets", editable = true }
-isaaclab_mimic = { path = "IsaacLab/source/isaaclab_mimic", editable = true }
-isaaclab_rl = { path = "IsaacLab/source/isaaclab_rl", editable = true }
-isaaclab_tasks = { path = "IsaacLab/source/isaaclab_tasks", editable = true }
-
-[[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu121"
-explicit = true
-
-[[tool.uv.index]]
-name = "nvidia"
-url = "https://pypi.nvidia.com"
-explicit = true
-
-[tool.ruff]
-exclude = ["docs/*", "logs/*"]
-target-version = "py310"
+newton = { git = "https://github.com/newton-physics/newton.git", branch = "main" }
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "B", "I"]
-ignore = ["E402"]
-
-[tool.ruff.lint.isort]
-known-first-party = [
-  "isaaclab",
-  "isaaclab_assets",
-  "isaaclab_mimic",
-  "isaaclab_rl",
-  "isaaclab_tasks",
-]
-known-third-party = ["wandb"]
-
-[tool.pyright]
-typeCheckingMode = "basic"
-pythonVersion = "3.10"
-pythonPlatform = "Linux"
-extraPaths = [
-  "IsaacLab/source/isaaclab",
-  "IsaacLab/source/isaaclab_assets",
-  "IsaacLab/source/isaaclab_mimic",
-  "IsaacLab/source/isaaclab_rl",
-  "IsaacLab/source/isaaclab_tasks",
-]
+select = ["E", "F", "I"]
