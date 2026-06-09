@@ -1,6 +1,0 @@
-wandb_project: classifier
-run_dir: logs/classifier/${now:%b-%d}/${now:%H-%M-%S}
-save_interval: 1e3
-T: 64
-T_action: 64
-batch_size: 1024

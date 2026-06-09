@@ -1,6 +1,0 @@
-wandb_project: vae
-run_dir: logs/vae/${now:%b-%d}/${now:%H-%M-%S}
-save_interval: 1e4
-T: 64
-T_action: 1
-batch_size: 128

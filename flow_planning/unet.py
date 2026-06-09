@@ -5,7 +5,7 @@ import torch.nn as nn
 from einops.layers.torch import Rearrange
 from torch import Tensor
 
-from flow_planning.utils import SinusoidalPosEmb
+from flow_planning.policy import sinusoidal_embedding
 
 log = logging.getLogger(__name__)
 
@@ -72,10 +72,10 @@ class ConditionalUnet1D(nn.Module):
         all_dims = [input_dim] + list(down_dims)
         start_dim = down_dims[0]
         in_out = list(zip(all_dims[:-1], all_dims[1:], strict=False))
+        self.cond_dim = cond_dim
 
         # diffusion step embedding and observations
         self.cond_encoder = nn.Sequential(
-            SinusoidalPosEmb(cond_dim, device),
             nn.Linear(cond_dim, cond_dim * 4),
             nn.Mish(),
             nn.Linear(cond_dim * 4, cond_dim),
@@ -128,11 +128,12 @@ class ConditionalUnet1D(nn.Module):
 
     def forward(self, x: Tensor, t: Tensor, data: dict[str, Tensor]) -> Tensor:
         x = x.transpose(1, 2)
-        global_feature = self.cond_encoder(t.view(-1, 1)).squeeze(1)
+        temb = sinusoidal_embedding(t.view(-1), self.cond_dim)
+        global_feature = self.cond_encoder(temb)
 
         h = []
         for mod_list in self.down_modules:
-            # assert isinstance(mod_list, nn.ModuleList)
+            assert isinstance(mod_list, nn.ModuleList)
             x = mod_list[0](x, global_feature)
             x = mod_list[1](x, global_feature)
             h.append(x)
@@ -142,7 +143,7 @@ class ConditionalUnet1D(nn.Module):
             x = mid_module(x, global_feature)
 
         for mod_list in self.up_modules:
-            # assert isinstance(mod_list, nn.ModuleList)
+            assert isinstance(mod_list, nn.ModuleList)
             x = torch.cat((x, h.pop()), dim=1)
             x = mod_list[0](x, global_feature)
             x = mod_list[1](x, global_feature)

@@ -62,10 +62,10 @@ class GPFactor:
         ).repeat(self.num_factors, 1, 1)
 
     def calc_phi(self):
-        I = torch.eye(self.dim, **self.tensor_args)
+        eye = torch.eye(self.dim, **self.tensor_args)
         Z = torch.zeros(self.dim, self.dim, **self.tensor_args)
-        phi_u = torch.cat((I, self.d_t * I), dim=1)
-        phi_l = torch.cat((Z, I), dim=1)
+        phi_u = torch.cat((eye, self.d_t * eye), dim=1)
+        phi_l = torch.cat((Z, eye), dim=1)
         phi = torch.cat((phi_u, phi_l), dim=0)
         return phi
 
@@ -80,7 +80,7 @@ class GPFactor:
         return Q_inv
 
     def get_error(self, x_traj, calc_jacobian=True):
-        batch, horizon = x_traj.shape[0], x_traj.shape[1]
+        horizon = x_traj.shape[1]
         idx1 = torch.arange(0, horizon - 1, device=self.tensor_args["device"])
         idx2 = torch.arange(1, horizon, device=self.tensor_args["device"])
         state_1 = torch.index_select(x_traj, 1, idx1).unsqueeze(-1)

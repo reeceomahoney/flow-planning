@@ -1,6 +1,0 @@
-wandb_project: mpd
-run_dir: logs/mpd/${now:%b-%d}/${now:%H-%M-%S}
-save_interval: 1e4
-T: 64
-T_action: 64
-batch_size: 1024
