@@ -53,7 +53,14 @@ def main(cfg: Config):
     )
 
     loader = DataLoader(
-        dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=4, drop_last=True
+        dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=8,
+        drop_last=True,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
     optimizer = policy_cfg.get_optimizer_preset().build(policy.get_optim_params())
 
@@ -62,7 +69,8 @@ def main(cfg: Config):
     pbar = tqdm(range(cfg.num_iters), desc="Training")
     for it in pbar:
         batch = preprocessor(next(data_iter))
-        loss, _ = policy.forward(batch)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss, _ = policy.forward(batch)
 
         optimizer.zero_grad()
         loss.backward()
