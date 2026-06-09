@@ -12,7 +12,7 @@ clusters:
   arc:
     host: htc
     remote_path: /data/engs-robotics-ml/kebl6123/flow-planning
-    time: 12
+    time: 1
     gpu: h100
     ngpu: 1
     cpus: 24
@@ -23,16 +23,20 @@ clusters:
 envs:
   - WANDB_API_KEY
   - HF_TOKEN
+  - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+  # cpu thread limits
   - OPENBLAS_NUM_THREADS: 8
   - OMP_NUM_THREADS: 8
   - MKL_NUM_THREADS: 8
+
+  # cache directories
   - TORCHINDUCTOR_CACHE_DIR: $HOME/.cache/torchinductor
-  - TRITON_CACHE_DIR: $HOME/.cache/triton
-  - TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE: 0
-  - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-  - CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  - TRITON_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/triton
   - UV_PROJECT_ENVIRONMENT: /scratch/u6jz/reece.u6jz/flow-planning/.venv
+  - UV_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/uv
+  - HF_HOME: /scratch/u6jz/reece.u6jz/.cache/huggingface
+  - RATTLER_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/rattler
 
 command: |-
-  uv run scripts/record.py
   uv run scripts/train.py
