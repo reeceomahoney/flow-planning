@@ -24,7 +24,7 @@ class Config:
     batch_size: int = 256
     num_iters: int = 20_000
     device: str = "cuda"
-    out_dir: str = "output"
+    out_dir: str = "outputs"
 
 
 def cycle(loader):

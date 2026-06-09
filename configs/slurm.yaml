@@ -1,0 +1,38 @@
+clusters:
+  isambard:
+    host: u6jz.aip2.isambard
+    remote_path: /home/u6jz/reece.u6jz/flow-planning
+    time: 1
+    gpu: ""
+    ngpu: 1
+    cpus: 72
+    mem: 1600M
+    partition: workq
+
+  arc:
+    host: htc
+    remote_path: /data/engs-robotics-ml/kebl6123/flow-planning
+    time: 12
+    gpu: h100
+    ngpu: 1
+    cpus: 24
+    mem: 8G
+    partition: short
+    priority: true
+
+envs:
+  - WANDB_API_KEY
+  - HF_TOKEN
+  - OPENBLAS_NUM_THREADS: 8
+  - OMP_NUM_THREADS: 8
+  - MKL_NUM_THREADS: 8
+  - TORCHINDUCTOR_CACHE_DIR: $HOME/.cache/torchinductor
+  - TRITON_CACHE_DIR: $HOME/.cache/triton
+  - TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE: 0
+  - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  - CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  - UV_PROJECT_ENVIRONMENT: /scratch/u6jz/reece.u6jz/flow-planning/.venv
+
+command: |-
+  uv run scripts/record.py
+  uv run scripts/train.py
