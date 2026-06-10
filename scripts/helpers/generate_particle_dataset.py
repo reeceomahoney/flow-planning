@@ -1,11 +1,6 @@
-from isaaclab.app import AppLauncher
-
-# NOTE: We need to run the app launcher first to avoid import errors
-app_launcher = AppLauncher({"headless": True})
-
 import time
 
-from flow_planning.envs.particle import ParticleEnv
+from flow_planning.particle import ParticleEnv
 
 device = "cuda"
 save_path = "data/flow_planning/particle_env/dataset.pt"
@@ -29,7 +24,8 @@ dataset = env.generate_dataset(
     save_path=save_path,
 )
 print(
-    f"Generated dataset with obs shape {dataset['obs'].shape} samples in {time.time() - start_time:.2f} seconds"
+    f"Generated dataset with obs shape {dataset['obs'].shape} samples in"
+    f" {time.time() - start_time:.2f} seconds"
 )
 print(f"Saved dataset to {save_path}")
 env.visualize_trajectories(dataset, batch_size=50)
