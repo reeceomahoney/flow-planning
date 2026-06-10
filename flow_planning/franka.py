@@ -434,10 +434,13 @@ class FrankaEnv:
 
     # ----------------------------------------------------------- observation
     def get_obs(self):
-        # joint coords (9), cube position (3), goal position (3)
+        # joint coords (9), cube pos (3), cube yaw sin/cos (2), goal pos (3)
         n = self.cfg.world_count
         jq = self.state_0.joint_q.numpy().reshape(n, -1)
-        obs = np.concatenate([jq[:, :9], jq[:, 9:12], self.goal_pos], axis=1)
+        quat = jq[:, 12:16]  # cube orientation (xyzw); grasp depends on its yaw
+        yaw = 2.0 * np.arctan2(quat[:, 2], quat[:, 3])
+        yaw_sc = np.stack([np.sin(yaw), np.cos(yaw)], axis=1)
+        obs = np.concatenate([jq[:, :9], jq[:, 9:12], yaw_sc, self.goal_pos], axis=1)
         return obs.astype(np.float32)
 
     def record_frame(self):

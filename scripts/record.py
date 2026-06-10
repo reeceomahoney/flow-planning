@@ -18,7 +18,7 @@ class Config(FrankaConfig):
 
 def collect(cfg: Config, env: FrankaEnv):
     ik_dofs = env.model_single.joint_coord_count  # 9 joint targets = the action
-    obs_dim = ik_dofs + 6  # joint coords (9) + cube pos (3) + goal pos (3)
+    obs_dim = ik_dofs + 8  # joints (9), cube pos (3), cube yaw sin/cos (2), goal (3)
     features = {
         "observation.state": {"dtype": "float32", "shape": (obs_dim,), "names": None},
         "action": {"dtype": "float32", "shape": (ik_dofs,), "names": None},
