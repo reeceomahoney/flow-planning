@@ -5,7 +5,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import draccus
 import newton.viewer
@@ -22,6 +22,7 @@ from flow_planning.franka import FrankaConfig, FrankaEnv
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
+    FlowTransformer,
     make_flow_matching_pre_post_processors,
 )
 
@@ -127,14 +128,16 @@ def main(cfg: Config):
     dataset = LeRobotDataset(cfg.repo_id, delta_timestamps=delta_timestamps)
 
     policy = FlowMatchingPolicy(policy_cfg).to(device)
-    policy.model = torch.compile(policy.model, mode="reduce-overhead")  # ty: ignore[invalid-assignment]
+    policy.model = cast(
+        FlowTransformer, torch.compile(policy.model, mode="reduce-overhead")
+    )
 
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
 
     preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy_cfg,
-        dataset_stats=dataset.meta.stats,  # ty: ignore[invalid-argument-type]
+        dataset_stats=dataset.meta.stats,
     )
 
     env = None
@@ -205,7 +208,7 @@ def main(cfg: Config):
         )
 
     out_dir = Path(cfg.out_dir)
-    policy.model = policy.model._orig_mod  # ty: ignore[invalid-assignment]
+    policy.model = cast(FlowTransformer, policy.model._orig_mod)
     policy.save_pretrained(out_dir)
     print(f"Saved policy to {out_dir}")
     wandb.finish()

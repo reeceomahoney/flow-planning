@@ -2,7 +2,7 @@ clusters:
   isambard:
     host: u6jz.aip2.isambard
     remote_path: /home/u6jz/reece.u6jz/flow-planning
-    time: 1
+    time: 4
     gpu: ""
     ngpu: 1
     cpus: 72
@@ -12,7 +12,7 @@ clusters:
   arc:
     host: htc
     remote_path: /data/engs-robotics-ml/kebl6123/flow-planning
-    time: 1
+    time: 4
     gpu: h100
     ngpu: 1
     cpus: 24
@@ -39,4 +39,6 @@ envs:
   - RATTLER_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/rattler
 
 command: |-
+  # rm -rf /scratch/u6jz/reece.u6jz/.cache/huggingface/lerobot/reece-omahoney/franka_cube
+  # uv run scripts/record.py
   uv run scripts/train.py

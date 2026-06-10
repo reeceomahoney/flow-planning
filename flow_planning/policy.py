@@ -6,6 +6,7 @@ and `select_action` operate on already-normalized tensors.
 """
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import NormalizationMode
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -62,10 +63,10 @@ class FlowMatchingConfig(PreTrainedConfig):
     optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-2
 
-    normalization_mapping: dict[str, NormalizationMode] = field(
+    normalization_mapping: dict[FeatureType, NormalizationMode] = field(
         default_factory=lambda: {
-            "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.MEAN_STD,
+            FeatureType.STATE: NormalizationMode.MEAN_STD,
+            FeatureType.ACTION: NormalizationMode.MEAN_STD,
         }
     )
 
@@ -164,8 +165,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Policy parameters: {n_params / 1e6:.2f}M")
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()  # ty: ignore[invalid-return-type]
+    def get_optim_params(self) -> Iterator[nn.Parameter]:  # ty: ignore[invalid-method-override]
+        return self.parameters()
 
     def reset(self):
         self.chunk: Tensor | None = None
@@ -215,7 +216,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
 def make_flow_matching_pre_post_processors(
     config: FlowMatchingConfig,
-    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    dataset_stats: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -235,7 +236,7 @@ def make_flow_matching_pre_post_processors(
         DeviceProcessorStep(device=device),
         NormalizerProcessorStep(
             features=features,
-            norm_map=config.normalization_mapping,  # ty: ignore[invalid-argument-type]
+            norm_map=config.normalization_mapping,
             stats=dataset_stats,
             device=device,
         ),
@@ -243,7 +244,7 @@ def make_flow_matching_pre_post_processors(
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features or {},
-            norm_map=config.normalization_mapping,  # ty: ignore[invalid-argument-type]
+            norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
         DeviceProcessorStep(device="cpu"),

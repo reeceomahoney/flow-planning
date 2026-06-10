@@ -35,7 +35,7 @@ def main(cfg: Config):
     stats = LeRobotDataset(cfg.repo_id).meta.stats
     preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy.config,
-        dataset_stats=stats,  # ty: ignore[invalid-argument-type]
+        dataset_stats=stats,
     )
 
     viewer = newton.viewer.ViewerGL()
