@@ -41,6 +41,7 @@ def main(cfg: Config):
     viewer = newton.viewer.ViewerGL()
     env = FrankaEnv(cfg, viewer)
 
+    timeout_frames = 20 * cfg.fps
     frame = 0
     while viewer.is_running():
         if viewer.should_step():
@@ -48,9 +49,15 @@ def main(cfg: Config):
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
             joint_targets = postprocessor(action).numpy().astype(np.float32)
             env.apply_action(joint_targets)
+
+            # visualize the policy's planned EE path (world 0)
+            assert policy.chunk is not None
+            chunk = postprocessor(policy.chunk[0]).numpy().astype(np.float32)
+            env.set_predicted_ee(chunk)
             frame += 1
-            if frame % env.episode_frames == 0:
+            if env.success().all() or frame >= timeout_frames:
                 env.reset()
+                frame = 0
         env.render()
 
     viewer.close()

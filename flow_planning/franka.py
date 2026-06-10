@@ -60,6 +60,12 @@ class FrankaConfig:
     jitter: float = 0.1  # +/- xy range for cube/goal sampling
     success_dist: float = 0.05  # cube-to-goal distance for success (m)
 
+    # barrier bisecting cube start and goal
+    wall: bool = False
+    wall_height: float = 0.2
+    wall_width: float = 0.15
+    wall_thickness: float = 0.01
+
 
 @wp.kernel(enable_backward=False)
 def set_target_pose_kernel(
@@ -92,7 +98,6 @@ def set_target_pose_kernel(
     obj_quat = wp.transform_get_rotation(body_q[obj_body_id])
 
     drop = drop_off_pos[tid]
-    ee_pos_target = home_pos
     ee_quat_target = ee_quat_down
     t_gripper = float(0.0)
 
@@ -156,6 +161,8 @@ class FrankaEnv:
         cube_z = top[2] + 0.5 * self.cube_size
         self.cube_center = np.array([top[0], top[1] + 0.15, cube_z], np.float32)
         self.goal_center = np.array([top[0], top[1] - 0.15, cube_z], np.float32)
+        # wall sits on the table midway between cube and goal, running along x
+        self.wall_center = wp.vec3(top[0], top[1], top[2] + 0.5 * cfg.wall_height)
 
         franka = self.build_franka_with_table()
         self.robot_body_count = franka.body_count
@@ -255,6 +262,17 @@ class FrankaEnv:
             xform=wp.transform(self.table_pos, wp.quat_identity()),  # ty: ignore[missing-argument]
             cfg=shape_cfg,
         )
+        if self.cfg.wall:
+            builder.add_shape_box(
+                body=-1,
+                hx=self.cfg.wall_width,
+                hy=self.cfg.wall_thickness,
+                hz=0.5 * self.cfg.wall_height,
+                xform=wp.transform(self.wall_center, wp.quat_identity()),  # ty: ignore[missing-argument]
+                cfg=shape_cfg,
+                label="wall",
+                color=[0.5, 0.5, 0.5],
+            )
         return builder
 
     def build_scene(self, franka: newton.ModelBuilder):
@@ -318,6 +336,10 @@ class FrankaEnv:
             lambda_initial=0.1,
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
+
+        # FK scratch state for visualizing policy-predicted EE poses
+        self.fk_state = self.model_single.state()
+        self.predicted_ee = None
 
     def setup_tasks(self):
         n = self.cfg.world_count
@@ -427,6 +449,24 @@ class FrankaEnv:
                 self.reset()
         return new_episode, success
 
+    def set_predicted_ee(self, joint_targets):
+        """FK a chunk of predicted joint targets (steps, 9) to EE positions for viz."""
+        jq = np.asarray(joint_targets, np.float32)
+        ndof = self.model_single.joint_coord_count
+        out = np.zeros((len(jq), 3), np.float32)
+        for i in range(len(jq)):
+            q = np.zeros(ndof, np.float32)
+            q[: jq.shape[1]] = jq[i]
+            wp.copy(self.fk_state.joint_q, wp.array(q, dtype=wp.float32))
+            newton.eval_fk(
+                self.model_single,
+                self.fk_state.joint_q,
+                self.fk_state.joint_qd,
+                self.fk_state,
+            )
+            out[i] = self.fk_state.body_q.numpy()[self.cfg.ee_index][:3]
+        self.predicted_ee = out
+
     def apply_action(self, joint_targets):
         """Drive the sim with externally supplied joint targets, (world_count, 9)."""
         n = self.cfg.world_count
@@ -465,6 +505,7 @@ class FrankaEnv:
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.log_goal()
+        self.log_predicted_ee()
         self.viewer.end_frame()
         wp.synchronize()
 
@@ -476,3 +517,16 @@ class FrankaEnv:
         radii = wp.full(n, 0.02, dtype=wp.float32)
         colors = wp.full(n, wp.vec3(0.2, 0.8, 0.2), dtype=wp.vec3)
         self.viewer.log_points("goal", goal, radii=radii, colors=colors)
+
+    def log_predicted_ee(self):
+        if self.predicted_ee is None:
+            return
+        offsets = getattr(self.viewer, "world_offsets", None)
+        off = offsets.numpy()[0] if offsets is not None else 0.0
+        pts = (self.predicted_ee + off).astype(np.float32)
+        n = len(pts)
+        radii = wp.full(n, 0.01, dtype=wp.float32)
+        colors = wp.full(n, wp.vec3(0.2, 0.4, 0.9), dtype=wp.vec3)
+        self.viewer.log_points(
+            "predicted_ee", wp.array(pts, dtype=wp.vec3), radii=radii, colors=colors
+        )
