@@ -18,7 +18,7 @@ from flow_planning.policy import (
 
 @dataclass
 class Config(FrankaConfig):
-    repo_id: str = "reece-omahoney/franka_ik"
+    repo_id: str = "reece-omahoney/franka_cube"
     checkpoint: str = "outputs"
     device: str = "cuda"
 

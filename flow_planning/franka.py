@@ -47,7 +47,7 @@ HOME_Q = [
 
 @dataclass
 class FrankaConfig:
-    world_count: int = 16
+    world_count: int = 64
     ee_index: int = 11  # fr3_hand_tcp
     fps: int = 60
     sim_substeps: int = 10
@@ -56,6 +56,7 @@ class FrankaConfig:
     cube_size: float = 0.05
     table_height: float = 0.1
     jitter: float = 0.1  # +/- xy range for cube/goal sampling
+    success_dist: float = 0.05  # cube-to-goal distance for success (m)
 
 
 @wp.kernel(enable_backward=False)
@@ -441,6 +442,13 @@ class FrankaEnv:
         n = self.cfg.world_count
         action = self.control.joint_target_pos.numpy().reshape(n, -1)[:, :9]
         return self.get_obs(), action.astype(np.float32)
+
+    def success(self):
+        """Per-world bool: cube placed within success_dist of the goal."""
+        n = self.cfg.world_count
+        cube_pos = self.state_0.joint_q.numpy().reshape(n, -1)[:, 9:12]
+        dist = np.linalg.norm(cube_pos - self.goal_pos, axis=1)
+        return dist < self.cfg.success_dist
 
     # --------------------------------------------------------------- render
     def render(self):

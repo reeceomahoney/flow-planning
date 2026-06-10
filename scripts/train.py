@@ -1,17 +1,21 @@
 """Train the flow-matching transformer policy on the dataset from record.py."""
 
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 import draccus
+import newton.viewer
+import numpy as np
 import torch
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import OBS_STATE
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
+from flow_planning.franka import FrankaConfig, FrankaEnv
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
@@ -20,17 +24,39 @@ from flow_planning.policy import (
 
 
 @dataclass
-class Config:
+class Config(FrankaConfig):
     repo_id: str = "reece-omahoney/franka_cube"
     batch_size: int = 256
     num_iters: int = 20_000
     device: str = "cuda"
     out_dir: str = "outputs"
+    eval_every: int = 5_000  # 0 disables sim eval
+    eval_episodes: int = 64
 
 
 def cycle(loader):
     while True:
         yield from loader
+
+
+@torch.no_grad()
+def evaluate(policy, env, preprocessor, postprocessor, n_episodes):
+    """Roll the policy out in sim; return the cube-placement success rate."""
+    policy.eval()
+    n = env.cfg.world_count
+    successes = 0
+    total = 0
+    for _ in range(math.ceil(n_episodes / n)):
+        env.reset()
+        for _ in range(env.episode_frames):
+            obs = torch.from_numpy(env.get_obs())
+            action = policy.select_action(preprocessor({OBS_STATE: obs}))
+            joint_targets = postprocessor(action).numpy().astype(np.float32)
+            env.apply_action(joint_targets)
+        successes += int(env.success().sum())
+        total += n
+    policy.train()
+    return successes / total
 
 
 @draccus.wrap()
@@ -53,10 +79,14 @@ def main(cfg: Config):
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
 
-    preprocessor, _ = make_flow_matching_pre_post_processors(
+    preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy_cfg,
         dataset_stats=dataset.meta.stats,  # ty: ignore[invalid-argument-type]
     )
+
+    env = None
+    if cfg.eval_every > 0:
+        env = FrankaEnv(cfg, newton.viewer.ViewerNull())
 
     loader = DataLoader(
         dataset,
@@ -77,8 +107,7 @@ def main(cfg: Config):
 
     policy.train()
     data_iter = cycle(loader)
-    pbar = tqdm(range(cfg.num_iters), desc="Training")
-    for it in pbar:
+    for it in range(cfg.num_iters):
         batch = preprocessor(next(data_iter))
         with amp:
             loss, _ = policy.forward(batch)
@@ -87,8 +116,16 @@ def main(cfg: Config):
         loss.backward()
         optimizer.step()
 
-        if it % 100 == 0:
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+        if it % 1000 == 0:
+            print(f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}")
+
+        if env is not None and it > 0 and it % cfg.eval_every == 0:
+            sr = evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes)
+            print(f"step {it}  eval success rate {sr:.1%}")
+
+    if env is not None:
+        sr = evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes)
+        print(f"final eval success rate {sr:.1%}")
 
     out_dir = Path(cfg.out_dir)
     policy.model = policy.model._orig_mod  # ty: ignore[invalid-assignment]
