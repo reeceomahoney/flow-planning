@@ -34,7 +34,7 @@ class Config(FrankaConfig):
     device: str = "cuda"
     out_dir: str = "outputs"
     eval_every: int = 10_000
-    eval_episodes: int = 128
+    eval_episodes: int = 256
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
@@ -50,6 +50,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
     """Roll the policy out in sim"""
     policy.eval()
     t0 = time.perf_counter()
+    env.rng = np.random.default_rng(0)
     n = env.cfg.world_count
     successes = 0
     total = 0

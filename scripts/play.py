@@ -21,6 +21,7 @@ class Config(FrankaConfig):
     repo_id: str = "reece-omahoney/franka_cube"
     checkpoint: str = "outputs"
     device: str = "cuda"
+    world_count: int = 1
 
 
 @draccus.wrap()
