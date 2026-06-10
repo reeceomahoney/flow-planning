@@ -18,6 +18,8 @@ import newton.utils
 import numpy as np
 import warp as wp
 
+wp.config.quiet = True
+
 
 class TaskType(enum.IntEnum):
     APPROACH = 0
@@ -194,6 +196,8 @@ class FrankaEnv:
         if hasattr(self.viewer, "picking_enabled"):
             self.viewer.picking_enabled = False
         self.viewer.set_camera(pos=wp.vec3(2.0, -2.5, 2.0), pitch=-25.0, yaw=50.0)
+        if hasattr(self.viewer, "camera"):
+            self.viewer.camera.look_at(self.robot_base_pos)
 
         self.episode_frames = self.num_tasks * round(cfg.task_time * cfg.fps)
         self.reset()
