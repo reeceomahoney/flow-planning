@@ -48,6 +48,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes):
     total = 0
     for _ in range(math.ceil(n_episodes / n)):
         env.reset()
+        policy.reset()
         for _ in range(env.episode_frames):
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
@@ -73,6 +74,13 @@ def main(cfg: Config):
     policy_cfg = FlowMatchingConfig(
         input_features=input_features, output_features=output_features, device=device
     )
+
+    # reload with future-action windows so each sample carries an action chunk
+    delta_timestamps = {
+        "action": [i / dataset.fps for i in policy_cfg.action_delta_indices]
+    }
+    dataset = LeRobotDataset(cfg.repo_id, delta_timestamps=delta_timestamps)
+
     policy = FlowMatchingPolicy(policy_cfg).to(device)
     policy.model = torch.compile(policy.model, mode="reduce-overhead")  # ty: ignore[invalid-assignment]
 

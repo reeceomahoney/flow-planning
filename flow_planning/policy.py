@@ -46,6 +46,10 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     n_obs_steps: int = 1
 
+    # action chunking
+    horizon: int = 16
+    n_action_steps: int = 8
+
     # architecture
     dim_model: int = 128
     n_layers: int = 4
@@ -86,8 +90,8 @@ class FlowMatchingConfig(PreTrainedConfig):
         return None
 
     @property
-    def action_delta_indices(self) -> None:
-        return None
+    def action_delta_indices(self) -> list[int]:
+        return list(range(self.horizon))
 
     @property
     def reward_delta_indices(self) -> None:
@@ -104,19 +108,21 @@ def sinusoidal_embedding(t: Tensor, dim: int) -> Tensor:
 
 
 class FlowTransformer(nn.Module):
-    """Velocity field v(x_t, t | obs) over normalized actions.
+    """Velocity field v(x_t, t | obs) over a chunk of normalized actions.
 
-    The noisy-action token and observation token, each fused with a time
-    embedding, attend to each other; the action token reads out the velocity.
+    The `horizon` noisy-action tokens and the observation token, each fused with
+    a time embedding, attend to each other; the action tokens read out the
+    per-step velocity.
     """
 
     def __init__(self, obs_dim: int, act_dim: int, cfg: FlowMatchingConfig):
         super().__init__()
         d = cfg.dim_model
+        self.horizon = cfg.horizon
         self.act_in = nn.Linear(act_dim, d)
         self.obs_in = nn.Linear(obs_dim, d)
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
-        self.pos_emb = nn.Parameter(torch.randn(2, d) * 0.02)
+        self.pos_emb = nn.Parameter(torch.randn(self.horizon + 1, d) * 0.02)
 
         layer = nn.TransformerEncoderLayer(
             d, cfg.n_heads, 4 * d, activation="gelu", batch_first=True, norm_first=True
@@ -127,12 +133,13 @@ class FlowTransformer(nn.Module):
         self.head = nn.Linear(d, act_dim)
 
     def forward(self, x_t: Tensor, t: Tensor, obs: Tensor) -> Tensor:
+        # x_t: (B, H, act_dim), t: (B,), obs: (B, obs_dim)
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
-        a = self.act_in(x_t) + temb
-        o = self.obs_in(obs) + temb
-        tokens = torch.stack([a, o], dim=1) + self.pos_emb
+        a = self.act_in(x_t) + temb[:, None]
+        o = self.obs_in(obs)[:, None] + temb[:, None]
+        tokens = torch.cat([a, o], dim=1) + self.pos_emb
         h = self.transformer(tokens)
-        return self.head(h[:, 0])
+        return self.head(h[:, : self.horizon])
 
 
 class FlowMatchingPolicy(PreTrainedPolicy):
@@ -158,32 +165,49 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         return self.parameters()  # ty: ignore[invalid-return-type]
 
     def reset(self):
-        pass
+        self.chunk: Tensor | None = None
+        self.chunk_step = 0
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         obs = batch[OBS_STATE]
-        x_1 = batch[ACTION]
+        x_1 = batch[ACTION]  # (B, H, act_dim)
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
-        x_t = (1 - t[:, None]) * x_0 + t[:, None] * x_1
+        x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
         v = self.model(x_t, t, obs)
-        loss = F.mse_loss(v, x_1 - x_0)
+        loss = F.mse_loss(v, x_1 - x_0, reduction="none").mean(-1)  # (B, H)
+
+        pad = batch.get(f"{ACTION}_is_pad")
+        if pad is not None:
+            mask = (~pad).to(loss.dtype)
+            loss = (loss * mask).sum() / mask.sum().clamp(min=1.0)
+        else:
+            loss = loss.mean()
         return loss, {"loss": loss.item()}
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        return self.select_action(batch).unsqueeze(1)
-
-    @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+        """Flow-ODE integrate a full (B, horizon, act_dim) action chunk."""
         self.eval()
         obs = batch[OBS_STATE]
-        x = torch.randn(obs.shape[0], self.act_dim, device=obs.device)
+        x = torch.randn(
+            obs.shape[0], self.config.horizon, self.act_dim, device=obs.device
+        )
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
             t = torch.full((obs.shape[0],), i * dt, device=obs.device)
             x = x + dt * self.model(x, t, obs)
         return x
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+        """Return one action per call, replanning every n_action_steps frames."""
+        if self.chunk is None or self.chunk_step >= self.config.n_action_steps:
+            self.chunk = self.predict_action_chunk(batch)
+            self.chunk_step = 0
+        action = self.chunk[:, self.chunk_step]
+        self.chunk_step += 1
+        return action
 
 
 def make_flow_matching_pre_post_processors(
