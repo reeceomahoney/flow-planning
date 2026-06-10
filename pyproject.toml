@@ -11,7 +11,8 @@ dependencies = [
   "pre-commit>=4.6.0",
   "rerun-sdk>=0.26.2",
   "slurm-tools",
-  "torch>=2.10.0",
+  "torch>=2.11.0",
+  "torchcodec>=0.12",
   "ty>=0.0.46",
 ]
 
@@ -19,8 +20,13 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.uv]
+override-dependencies = ["torchcodec>=0.12", "torch>=2.11.0", "torchvision>=0.27"]
+
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu126" }]
+torchcodec = [{ index = "pytorch-cu126" }]
+torchvision = [{ index = "pytorch-cu126" }]
 slurm-tools = { git = "https://github.com/reeceomahoney/slurm-tools.git" }
 
 [[tool.uv.index]]
