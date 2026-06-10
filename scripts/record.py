@@ -12,27 +12,28 @@ from flow_planning.franka import FrankaConfig, FrankaEnv
 class Config(FrankaConfig):
     record: bool = True
     episodes: int = 64
-    repo_id: str = "reece-omahoney/franka_ik"
-    task: str = "Reach the target end-effector position."
+    repo_id: str = "reece-omahoney/franka_cube"
+    task: str = "Pick up the cube and place it at the goal position."
 
 
 def collect(cfg: Config, env: FrankaEnv):
-    ik_dofs = env.model_single.joint_coord_count
+    ik_dofs = env.model_single.joint_coord_count  # 9 joint targets = the action
+    obs_dim = ik_dofs + 6  # joint coords (9) + cube pos (3) + goal pos (3)
     features = {
-        "observation.state": {"dtype": "float32", "shape": (ik_dofs,), "names": None},
-        "action": {"dtype": "float32", "shape": (3,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (obs_dim,), "names": None},
+        "action": {"dtype": "float32", "shape": (ik_dofs,), "names": None},
     }
     dataset = LeRobotDataset.create(
         repo_id=cfg.repo_id, fps=cfg.fps, features=features, use_videos=False
     )
 
-    # one reach per world = one episode; flush all worlds when a new goal is sampled
+    # one pick-and-place per world = one episode; all worlds reset together
     buffers = [[] for _ in range(cfg.world_count)]
     collected = 0
     pbar = tqdm(total=cfg.episodes, desc="Collecting episodes")
     while collected < cfg.episodes:
-        resampled = env.step()
-        if resampled and buffers[0]:
+        new_episode = env.step()
+        if new_episode and buffers[0]:
             remaining = cfg.episodes - collected
             for buf in buffers[:remaining]:
                 for state, action in buf:
@@ -46,9 +47,9 @@ def collect(cfg: Config, env: FrankaEnv):
             buffers = [[] for _ in range(cfg.world_count)]
             continue
 
-        joint_q, target = env.record_frame()
+        obs, action = env.record_frame()
         for w in range(cfg.world_count):
-            buffers[w].append((joint_q[w], target[w]))
+            buffers[w].append((obs[w], action[w]))
 
     pbar.close()
     dataset.finalize()
@@ -62,7 +63,7 @@ def main(cfg: Config):
         collect(cfg, env)
         return
 
-    viewer = newton.viewer.ViewerRerun()
+    viewer = newton.viewer.ViewerGL()
     env = FrankaEnv(cfg, viewer)
     while viewer.is_running():
         if viewer.should_step():

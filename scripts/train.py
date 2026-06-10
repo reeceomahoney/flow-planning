@@ -20,7 +20,7 @@ from flow_planning.policy import (
 
 @dataclass
 class Config:
-    repo_id: str = "reece-omahoney/franka_ik"
+    repo_id: str = "reece-omahoney/franka_cube"
     batch_size: int = 256
     num_iters: int = 20_000
     device: str = "cuda"

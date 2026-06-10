@@ -1,4 +1,4 @@
-"""Roll out the trained flow-matching policy in the Franka IK environment."""
+"""Roll out the trained flow-matching policy in the Franka pick-and-place env."""
 
 from dataclasses import dataclass
 
@@ -38,15 +38,19 @@ def main(cfg: Config):
         dataset_stats=stats,  # ty: ignore[invalid-argument-type]
     )
 
-    viewer = newton.viewer.ViewerRerun()
+    viewer = newton.viewer.ViewerGL()
     env = FrankaEnv(cfg, viewer)
 
+    frame = 0
     while viewer.is_running():
         if viewer.should_step():
-            obs = torch.from_numpy(env.joint_q_ik.numpy())
+            obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
-            target = postprocessor(action).numpy().astype(np.float32)
-            env.solve_to_target(target)
+            joint_targets = postprocessor(action).numpy().astype(np.float32)
+            env.apply_action(joint_targets)
+            frame += 1
+            if frame % env.episode_frames == 0:
+                env.reset()
         env.render()
 
     viewer.close()
