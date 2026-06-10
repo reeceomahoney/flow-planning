@@ -867,6 +867,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchcodec" },
     { name = "ty" },
+    { name = "wandb" },
 ]
 
 [package.metadata]
@@ -879,6 +880,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchcodec", specifier = ">=0.12", index = "https://download.pytorch.org/whl/cu126" },
     { name = "ty", specifier = ">=0.0.46" },
+    { name = "wandb", specifier = ">=0.24.2" },
 ]
 
 [[package]]

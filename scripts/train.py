@@ -1,14 +1,17 @@
 """Train the flow-matching transformer policy on the dataset from record.py."""
 
 import math
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import draccus
 import newton.viewer
 import numpy as np
 import torch
+import wandb
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -32,6 +35,9 @@ class Config(FrankaConfig):
     out_dir: str = "outputs"
     eval_every: int = 5_000  # 0 disables sim eval
     eval_episodes: int = 64
+    log_every: int = 100
+    wandb_project: str = "flow-planning"
+    wandb_mode: Literal["online", "offline", "disabled"] = "online"
 
 
 def cycle(loader):
@@ -40,12 +46,14 @@ def cycle(loader):
 
 
 @torch.no_grad()
-def evaluate(policy, env, preprocessor, postprocessor, n_episodes):
-    """Roll the policy out in sim; return the cube-placement success rate."""
+def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
+    """Roll the policy out in sim"""
     policy.eval()
+    t0 = time.perf_counter()
     n = env.cfg.world_count
     successes = 0
     total = 0
+
     for _ in range(math.ceil(n_episodes / n)):
         env.reset()
         policy.reset()
@@ -57,13 +65,22 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes):
         successes += int(env.success().sum())
         total += n
     policy.train()
-    return successes / total
+
+    sr = successes / total
+    wandb.log(
+        {"eval/success_rate": sr, "eval/time": time.perf_counter() - t0}, step=step
+    )
+    print(f"step {step}  eval success rate {sr:.1%}")
 
 
 @draccus.wrap()
 def main(cfg: Config):
     torch.set_float32_matmul_precision("high")
     device = cfg.device if torch.cuda.is_available() else "cpu"
+
+    wandb.init(
+        project=cfg.wandb_project, mode=cfg.wandb_mode, config=draccus.encode(cfg)
+    )
 
     dataset = LeRobotDataset(cfg.repo_id)
     features = dataset_to_policy_features(dataset.features)
@@ -115,6 +132,7 @@ def main(cfg: Config):
 
     policy.train()
     data_iter = cycle(loader)
+    last_log_time = time.perf_counter()
     for it in range(cfg.num_iters):
         batch = preprocessor(next(data_iter))
         with amp:
@@ -124,21 +142,30 @@ def main(cfg: Config):
         loss.backward()
         optimizer.step()
 
+        if it % cfg.log_every == 0:
+            metrics = {"train/loss": loss.item()}
+            if it > 0:
+                now = time.perf_counter()
+                metrics["perf/steps_per_sec"] = cfg.log_every / (now - last_log_time)
+                last_log_time = now
+            wandb.log(metrics, step=it)
         if it % 1000 == 0:
             print(f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}")
 
         if env is not None and it > 0 and it % cfg.eval_every == 0:
-            sr = evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes)
-            print(f"step {it}  eval success rate {sr:.1%}")
+            evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes, it)
+            last_log_time = time.perf_counter()
 
     if env is not None:
-        sr = evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes)
-        print(f"final eval success rate {sr:.1%}")
+        evaluate(
+            policy, env, preprocessor, postprocessor, cfg.eval_episodes, cfg.num_iters
+        )
 
     out_dir = Path(cfg.out_dir)
     policy.model = policy.model._orig_mod  # ty: ignore[invalid-assignment]
     policy.save_pretrained(out_dir)
     print(f"Saved policy to {out_dir}")
+    wandb.finish()
 
 
 if __name__ == "__main__":
