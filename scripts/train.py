@@ -31,6 +31,8 @@ class Config(FrankaConfig):
     repo_id: str = "reece-omahoney/franka_cube"
     batch_size: int = 256
     num_iters: int = 50_000
+    warmup_iters: int = 500
+    ema_decay: float = 0.999
     device: str = "cuda"
     out_dir: str = "outputs"
     eval_every: int = 10_000
@@ -43,6 +45,31 @@ class Config(FrankaConfig):
 def cycle(loader):
     while True:
         yield from loader
+
+
+class EMA:
+    """Exponential moving average of model parameters, used at eval time."""
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = [p.detach().clone() for p in model.parameters()]
+        self.backup = None
+
+    @torch.no_grad()
+    def update(self, model):
+        for s, p in zip(self.shadow, model.parameters()):
+            s.lerp_(p.detach(), 1 - self.decay)
+
+    def store(self, model):
+        self.backup = [p.detach().clone() for p in model.parameters()]
+        for s, p in zip(self.shadow, model.parameters()):
+            p.data.copy_(s)
+
+    def restore(self, model):
+        assert self.backup is not None
+        for b, p in zip(self.backup, model.parameters()):
+            p.data.copy_(b)
+        self.backup = None
 
 
 @torch.no_grad()
@@ -131,6 +158,15 @@ def main(cfg: Config):
         fused=True,
     )
 
+    def lr_lambda(it):
+        if it < cfg.warmup_iters:
+            return (it + 1) / cfg.warmup_iters
+        progress = (it - cfg.warmup_iters) / max(1, cfg.num_iters - cfg.warmup_iters)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    ema = EMA(policy.model, cfg.ema_decay)
+
     policy.train()
     data_iter = cycle(loader)
     last_log_time = time.perf_counter()
@@ -142,9 +178,12 @@ def main(cfg: Config):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
+        ema.update(policy.model)
 
         if it % cfg.log_every == 0:
-            metrics = {"train/loss": loss.item()}
+            lr = scheduler.get_last_lr()[0]
+            metrics = {"train/loss": loss.item(), "train/lr": lr}
             if it > 0:
                 now = time.perf_counter()
                 metrics["perf/steps_per_sec"] = cfg.log_every / (now - last_log_time)
@@ -154,9 +193,12 @@ def main(cfg: Config):
             print(f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}", flush=True)
 
         if env is not None and it > 0 and it % cfg.eval_every == 0:
+            ema.store(policy.model)
             evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes, it)
+            ema.restore(policy.model)
             last_log_time = time.perf_counter()
 
+    ema.store(policy.model)
     if env is not None:
         evaluate(
             policy, env, preprocessor, postprocessor, cfg.eval_episodes, cfg.num_iters
