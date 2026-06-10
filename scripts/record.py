@@ -19,10 +19,12 @@ class Config:
 
 def collect(cfg: Config, env: FrankaEnv):
     ik_dofs = env.model_single.joint_coord_count
-    obs_dim = ik_dofs + 8  # joints (9), cube pos (3), cube yaw sin/cos (2), goal (3)
+    # joints (9), EE pos (3), EE rot6d (6), cube pos (3), cube yaw sc (2), goal (3)
+    obs_dim = ik_dofs + 17
+    action_dim = 10  # ee pos (3), 6D rotation (6), gripper (1)
     features = {
         "observation.state": {"dtype": "float32", "shape": (obs_dim,), "names": None},
-        "action": {"dtype": "float32", "shape": (ik_dofs,), "names": None},
+        "action": {"dtype": "float32", "shape": (action_dim,), "names": None},
         "next.success": {"dtype": "bool", "shape": (1,), "names": None},
     }
     dataset = LeRobotDataset.create(

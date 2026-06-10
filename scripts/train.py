@@ -90,8 +90,8 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
         for _ in range(env.episode_frames):
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
-            joint_targets = postprocessor(action).numpy().astype(np.float32)
-            env.apply_action(joint_targets)
+            ee_action = postprocessor(action).numpy().astype(np.float32)
+            env.apply_ee_action(ee_action)
         successes += int(env.success().sum())
         total += n
     policy.train()

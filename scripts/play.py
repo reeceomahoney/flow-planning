@@ -47,8 +47,8 @@ def main(cfg: Config):
         if viewer.should_step():
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
-            joint_targets = postprocessor(action).numpy().astype(np.float32)
-            env.apply_action(joint_targets)
+            ee_action = postprocessor(action).numpy().astype(np.float32)
+            env.apply_ee_action(ee_action)
 
             # visualize the policy's planned EE path (world 0)
             assert policy.chunk is not None

@@ -4,8 +4,9 @@ Shared by `record.py` (collect demos) and `play.py` (roll out a policy). A cube
 is grasped at `cube_start` and placed at `cube_goal`; a scripted task state
 machine drives an analytic-IK controller through a MuJoCo simulation (adapted
 from newton's `ik_cube_stacking` example). The observation is the per-world
-joint coords plus the cube and goal positions; the action is the 9 joint targets
-(7 arm + 2 fingers).
+joint coords, current EE pose, and the cube and goal positions; the action is the
+EE target pose (position + 6D rotation) plus a gripper command, mapped to joints
+by IK.
 """
 
 import enum
@@ -17,6 +18,8 @@ import newton.solvers
 import newton.utils
 import numpy as np
 import warp as wp
+
+from flow_planning.rotations import quat_to_rot6d, rot6d_to_quat
 
 wp.config.quiet = True
 
@@ -337,8 +340,6 @@ class FrankaEnv:
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
 
-        # FK scratch state for visualizing policy-predicted EE poses
-        self.fk_state = self.model_single.state()
         self.predicted_ee = None
 
     def setup_tasks(self):
@@ -449,48 +450,58 @@ class FrankaEnv:
                 self.reset()
         return new_episode, success
 
-    def set_predicted_ee(self, joint_targets):
-        """FK a chunk of predicted joint targets (steps, 9) to EE positions for viz."""
-        jq = np.asarray(joint_targets, np.float32)
-        ndof = self.model_single.joint_coord_count
-        out = np.zeros((len(jq), 3), np.float32)
-        for i in range(len(jq)):
-            q = np.zeros(ndof, np.float32)
-            q[: jq.shape[1]] = jq[i]
-            wp.copy(self.fk_state.joint_q, wp.array(q, dtype=wp.float32))
-            newton.eval_fk(
-                self.model_single,
-                self.fk_state.joint_q,
-                self.fk_state.joint_qd,
-                self.fk_state,
-            )
-            out[i] = self.fk_state.body_q.numpy()[self.cfg.ee_index][:3]
-        self.predicted_ee = out
+    def set_predicted_ee(self, ee_positions):
+        """Store the planned EE path (steps, 3) for visualization."""
+        self.predicted_ee = np.ascontiguousarray(ee_positions, np.float32)[:, :3]
 
-    def apply_action(self, joint_targets):
-        """Drive the sim with externally supplied joint targets, (world_count, 9)."""
+    def apply_ee_action(self, ee_action):
+        """Drive the sim with EE-pose actions, (world_count, 10).
+
+        Each action is EE position (3) + 6D rotation (6) + gripper (1); IK maps
+        the target pose to arm joint targets, the gripper sets both fingers.
+        """
         n = self.cfg.world_count
-        src = wp.array(np.asarray(joint_targets, np.float32).reshape(n, 9))
+        a = np.ascontiguousarray(np.asarray(ee_action, np.float32).reshape(n, 10))
+        pos = np.ascontiguousarray(a[:, :3])
+        quat = np.ascontiguousarray(rot6d_to_quat(a[:, 3:9]))
+        fingers = np.ascontiguousarray(np.repeat(a[:, 9:10], 2, axis=1))
+
+        wp.copy(self.ee_pos_target, wp.array(pos, dtype=wp.vec3))
+        wp.copy(self.ee_rot_target, wp.array(quat, dtype=wp.vec4))
+        self.pos_obj.set_target_positions(self.ee_pos_target)
+        self.rot_obj.set_target_rotations(self.ee_rot_target)
+        jq = self.joint_q_ik
+        self.ik_solver.step(jq, jq, iterations=self.cfg.ik_iters)  # ty: ignore[invalid-argument-type]
+
         jt = self.control.joint_target_pos.reshape((n, -1))
-        wp.copy(dest=jt[:, :9], src=src)
+        wp.copy(dest=jt[:, :7], src=jq[:, :7])
+        wp.copy(dest=jt[:, 7:9], src=wp.array(fingers, dtype=wp.float32))
         self.simulate()
         self.sim_time += self.frame_dt
 
     # ----------------------------------------------------------- observation
     def get_obs(self):
-        # joint coords (9), cube pos (3), cube yaw sin/cos (2), goal pos (3)
+        # joints (9), EE pos (3), EE rot6d (6), cube pos (3), cube yaw sc (2), goal (3)
         n = self.cfg.world_count
         jq = self.state_0.joint_q.numpy().reshape(n, -1)
         quat = jq[:, 12:16]  # cube orientation (xyzw); grasp depends on its yaw
         yaw = 2.0 * np.arctan2(quat[:, 2], quat[:, 3])
         yaw_sc = np.stack([np.sin(yaw), np.cos(yaw)], axis=1)
-        obs = np.concatenate([jq[:, :9], jq[:, 9:12], yaw_sc, self.goal_pos], axis=1)
+        ee = self.state_0.body_q.numpy().reshape(n, self.num_bodies_per_world, 7)
+        ee = ee[:, self.cfg.ee_index]  # current EE pose (world frame)
+        ee_pos, ee_rot6d = ee[:, :3], quat_to_rot6d(ee[:, 3:7])
+        obs = np.concatenate(
+            [jq[:, :9], ee_pos, ee_rot6d, jq[:, 9:12], yaw_sc, self.goal_pos], axis=1
+        )
         return obs.astype(np.float32)
 
     def record_frame(self):
-        n = self.cfg.world_count
-        action = self.control.joint_target_pos.numpy().reshape(n, -1)[:, :9]
-        return self.get_obs(), action.astype(np.float32)
+        # action: EE target pos (3) + 6D rotation (6) + gripper (1)
+        pos = self.ee_pos_target.numpy()
+        rot6d = quat_to_rot6d(self.ee_rot_target.numpy())
+        grip = self.gripper_target.numpy()[:, :1]
+        action = np.concatenate([pos, rot6d, grip], axis=1).astype(np.float32)
+        return self.get_obs(), action
 
     def success(self):
         """Per-world bool: cube placed within success_dist of the goal."""
