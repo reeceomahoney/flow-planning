@@ -30,11 +30,11 @@ from flow_planning.policy import (
 class Config(FrankaConfig):
     repo_id: str = "reece-omahoney/franka_cube"
     batch_size: int = 256
-    num_iters: int = 20_000
+    num_iters: int = 50_000
     device: str = "cuda"
     out_dir: str = "outputs"
-    eval_every: int = 5_000  # 0 disables sim eval
-    eval_episodes: int = 64
+    eval_every: int = 10_000
+    eval_episodes: int = 128
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
@@ -70,7 +70,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
     wandb.log(
         {"eval/success_rate": sr, "eval/time": time.perf_counter() - t0}, step=step
     )
-    print(f"step {step}  eval success rate {sr:.1%}")
+    print(f"step {step}  eval success rate {sr:.1%}", flush=True)
 
 
 @draccus.wrap()
@@ -150,7 +150,7 @@ def main(cfg: Config):
                 last_log_time = now
             wandb.log(metrics, step=it)
         if it % 1000 == 0:
-            print(f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}")
+            print(f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}", flush=True)
 
         if env is not None and it > 0 and it % cfg.eval_every == 0:
             evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes, it)

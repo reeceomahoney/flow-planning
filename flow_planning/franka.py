@@ -47,7 +47,7 @@ HOME_Q = [
 
 @dataclass
 class FrankaConfig:
-    world_count: int = 64
+    world_count: int = 128
     ee_index: int = 11  # fr3_hand_tcp
     fps: int = 60
     sim_substeps: int = 10

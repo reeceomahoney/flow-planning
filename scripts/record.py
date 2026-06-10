@@ -11,7 +11,7 @@ from flow_planning.franka import FrankaConfig, FrankaEnv
 @dataclass
 class Config(FrankaConfig):
     record: bool = True
-    episodes: int = 64
+    episodes: int = 128
     repo_id: str = "reece-omahoney/franka_cube"
     task: str = "Pick up the cube and place it at the goal position."
 
