@@ -411,6 +411,7 @@ class FrankaEnv:
         self.sim_time += self.frame_dt
 
         new_episode = False
+        success = None
         if self.task_time >= self.cfg.task_time:
             self.task_time = 0.0
             if self.task_idx < self.num_tasks - 1:
@@ -418,8 +419,9 @@ class FrankaEnv:
                 wp.copy(self.task_init_body_q, self.state_0.body_q)
             else:
                 new_episode = True
+                success = self.success()  # capture before reset wipes the cube
                 self.reset()
-        return new_episode
+        return new_episode, success
 
     def apply_action(self, joint_targets):
         """Drive the sim with externally supplied joint targets, (world_count, 9)."""

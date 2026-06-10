@@ -22,6 +22,7 @@ def collect(cfg: Config, env: FrankaEnv):
     features = {
         "observation.state": {"dtype": "float32", "shape": (obs_dim,), "names": None},
         "action": {"dtype": "float32", "shape": (ik_dofs,), "names": None},
+        "next.success": {"dtype": "bool", "shape": (1,), "names": None},
     }
     dataset = LeRobotDataset.create(
         repo_id=cfg.repo_id, fps=cfg.fps, features=features, use_videos=False
@@ -32,13 +33,18 @@ def collect(cfg: Config, env: FrankaEnv):
     collected = 0
     pbar = tqdm(total=cfg.episodes, desc="Collecting episodes")
     while collected < cfg.episodes:
-        new_episode = env.step()
+        new_episode, success = env.step()
         if new_episode and buffers[0]:
             remaining = cfg.episodes - collected
-            for buf in buffers[:remaining]:
+            for w, buf in enumerate(buffers[:remaining]):
                 for state, action in buf:
                     dataset.add_frame(
-                        {"observation.state": state, "action": action, "task": cfg.task}
+                        {
+                            "observation.state": state,
+                            "action": action,
+                            "next.success": success[w : w + 1],
+                            "task": cfg.task,
+                        }
                     )
                 dataset.save_episode()
             n = min(remaining, cfg.world_count)
