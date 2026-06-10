@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import draccus
 import newton.viewer
@@ -9,7 +9,8 @@ from flow_planning.franka import FrankaConfig, FrankaEnv
 
 
 @dataclass
-class Config(FrankaConfig):
+class Config:
+    env: FrankaConfig = field(default_factory=FrankaConfig)
     record: bool = True
     episodes: int = 256
     repo_id: str = "reece-omahoney/franka_cube"
@@ -25,11 +26,11 @@ def collect(cfg: Config, env: FrankaEnv):
         "next.success": {"dtype": "bool", "shape": (1,), "names": None},
     }
     dataset = LeRobotDataset.create(
-        repo_id=cfg.repo_id, fps=cfg.fps, features=features, use_videos=False
+        repo_id=cfg.repo_id, fps=cfg.env.fps, features=features, use_videos=False
     )
 
     # one pick-and-place per world = one episode; all worlds reset together
-    buffers = [[] for _ in range(cfg.world_count)]
+    buffers = [[] for _ in range(cfg.env.world_count)]
     collected = 0
     pbar = tqdm(total=cfg.episodes, desc="Collecting episodes")
     while collected < cfg.episodes:
@@ -47,14 +48,14 @@ def collect(cfg: Config, env: FrankaEnv):
                         }
                     )
                 dataset.save_episode()
-            n = min(remaining, cfg.world_count)
+            n = min(remaining, cfg.env.world_count)
             collected += n
             pbar.update(n)
-            buffers = [[] for _ in range(cfg.world_count)]
+            buffers = [[] for _ in range(cfg.env.world_count)]
             continue
 
         obs, action = env.record_frame()
-        for w in range(cfg.world_count):
+        for w in range(cfg.env.world_count):
             buffers[w].append((obs[w], action[w]))
 
     pbar.close()
@@ -65,12 +66,12 @@ def collect(cfg: Config, env: FrankaEnv):
 @draccus.wrap()
 def main(cfg: Config):
     if cfg.record:
-        env = FrankaEnv(cfg, newton.viewer.ViewerNull())
+        env = FrankaEnv(cfg.env, newton.viewer.ViewerNull())
         collect(cfg, env)
         return
 
     viewer = newton.viewer.ViewerGL()
-    env = FrankaEnv(cfg, viewer)
+    env = FrankaEnv(cfg.env, viewer)
     while viewer.is_running():
         if viewer.should_step():
             env.step()

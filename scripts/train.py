@@ -3,7 +3,7 @@
 import math
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, cast
 
@@ -28,7 +28,8 @@ from flow_planning.policy import (
 
 
 @dataclass
-class Config(FrankaConfig):
+class Config:
+    env: FrankaConfig = field(default_factory=FrankaConfig)
     repo_id: str = "reece-omahoney/franka_cube"
     batch_size: int = 256
     num_iters: int = 50_000
@@ -142,7 +143,7 @@ def main(cfg: Config):
 
     env = None
     if cfg.eval_every > 0:
-        env = FrankaEnv(cfg, newton.viewer.ViewerNull())
+        env = FrankaEnv(cfg.env, newton.viewer.ViewerNull())
 
     loader = DataLoader(
         dataset,

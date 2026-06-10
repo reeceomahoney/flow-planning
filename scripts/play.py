@@ -1,6 +1,6 @@
 """Roll out the trained flow-matching policy in the Franka pick-and-place env."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import draccus
 import newton.viewer
@@ -17,11 +17,11 @@ from flow_planning.policy import (
 
 
 @dataclass
-class Config(FrankaConfig):
+class Config:
+    env: FrankaConfig = field(default_factory=lambda: FrankaConfig(world_count=1))
     repo_id: str = "reece-omahoney/franka_cube"
     checkpoint: str = "outputs"
     device: str = "cuda"
-    world_count: int = 1
 
 
 @draccus.wrap()
@@ -39,9 +39,9 @@ def main(cfg: Config):
     )
 
     viewer = newton.viewer.ViewerGL()
-    env = FrankaEnv(cfg, viewer)
+    env = FrankaEnv(cfg.env, viewer)
 
-    timeout_frames = 20 * cfg.fps
+    timeout_frames = 20 * cfg.env.fps
     frame = 0
     while viewer.is_running():
         if viewer.should_step():
