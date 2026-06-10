@@ -51,7 +51,7 @@ HOME_Q = [
 class FrankaConfig:
     world_count: int = 256
     ee_index: int = 11  # fr3_hand_tcp
-    fps: int = 60
+    fps: int = 50
     sim_substeps: int = 10
     task_time: float = 1.0  # seconds per task phase
     ik_iters: int = 24

@@ -47,8 +47,8 @@ class FlowMatchingConfig(PreTrainedConfig):
     n_obs_steps: int = 1
 
     # action chunking
-    horizon: int = 16
-    n_action_steps: int = 8
+    horizon: int = 50
+    n_action_steps: int = 20
 
     # architecture
     dim_model: int = 128
