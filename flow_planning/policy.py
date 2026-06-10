@@ -161,6 +161,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.model = FlowTransformer(obs_dim, act_dim, config)
         self.reset()
 
+        n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Policy parameters: {n_params / 1e6:.2f}M")
+
     def get_optim_params(self) -> dict:
         return self.parameters()  # ty: ignore[invalid-return-type]
 
