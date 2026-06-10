@@ -31,7 +31,6 @@ def main(cfg: Config):
     policy.config.device = device
     policy.to(device)
 
-    # processors aren't saved with the policy; rebuild them from dataset stats
     stats = LeRobotDataset(cfg.repo_id).meta.stats
     preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy.config,

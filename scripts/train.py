@@ -62,6 +62,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes):
 
 @draccus.wrap()
 def main(cfg: Config):
+    torch.set_float32_matmul_precision("high")
     device = cfg.device if torch.cuda.is_available() else "cpu"
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -75,7 +76,6 @@ def main(cfg: Config):
         input_features=input_features, output_features=output_features, device=device
     )
 
-    # reload with future-action windows so each sample carries an action chunk
     delta_timestamps = {
         "action": [i / dataset.fps for i in policy_cfg.action_delta_indices]
     }
