@@ -21,3 +21,4 @@ venv/
 imgui.ini
 
 outputs/
+.envrc
