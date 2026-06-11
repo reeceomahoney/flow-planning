@@ -14,6 +14,7 @@ import newton.solvers
 import numpy as np
 import warp as wp
 
+from flow_planning.envs.contact import ObstacleContactSensor
 from flow_planning.envs.env import EnvConfig
 from flow_planning.guidance import ObstacleGuidance
 
@@ -85,6 +86,9 @@ class ParticleEnv:
         self.state_1 = self.model.state()
         self.control = self.model.control()
         self.contacts = self.model.contacts()
+        self.obstacle_sensor = (
+            ObstacleContactSensor(self.model) if cfg.obstacle else None
+        )
 
         self.target = wp.zeros(n, dtype=wp.vec3)
         self.goal_pos = np.zeros((n, 2), np.float32)
@@ -171,6 +175,8 @@ class ParticleEnv:
             self.start_pos = self.sample()
             self.goal_pos = self.sample()
         self.task_time = 0.0
+        if self.obstacle_sensor is not None:
+            self.obstacle_sensor.reset()
 
         jq = np.zeros((n, self.coords_per_world), np.float32)
         jq[:, :2] = self.start_pos
@@ -212,7 +218,7 @@ class ParticleEnv:
 
         new_episode = False
         success = None
-        if self.task_time >= self.cfg.task_time:
+        if self.task_time >= self.cfg.task_time or self.failure().all():
             new_episode = True
             success = self.success()
             self.reset()
@@ -224,6 +230,8 @@ class ParticleEnv:
 
     def simulate(self):
         self.model.collide(self.state_0, self.contacts)
+        if self.obstacle_sensor is not None:
+            self.obstacle_sensor.update(self.contacts, self.state_0.body_q)
         for _ in range(self.cfg.sim_substeps):
             self.state_0.clear_forces()
             wp.launch(
@@ -254,10 +262,16 @@ class ParticleEnv:
         return np.concatenate([pos, vel, self.goal_pos], axis=1).astype(np.float32)
 
     def success(self):
-        """Per-world bool: ball within success_dist of the goal."""
+        """Per-world bool: ball within success_dist of the goal, obstacle untouched."""
         obs = self.get_obs()
         dist = np.linalg.norm(obs[:, :2] - self.goal_pos, axis=1)
-        return dist < self.cfg.success_dist
+        return (dist < self.cfg.success_dist) & ~self.failure()
+
+    def failure(self):
+        """Per-world bool: ball has touched the obstacle this episode."""
+        if self.obstacle_sensor is None:
+            return np.zeros(self.cfg.world_count, dtype=bool)
+        return self.obstacle_sensor.read()
 
     # -------------------------------------------------------------- guidance
     def make_guidance(self, action_mean, action_std, scale, margin, device):

@@ -42,7 +42,11 @@ select = ["E", "F", "I"]
 
 # warp's kernel DSL confuses type checkers
 [[tool.ty.overrides]]
-include = ["flow_planning/envs/particle.py", "flow_planning/envs/franka.py"]
+include = [
+  "flow_planning/envs/contact.py",
+  "flow_planning/envs/particle.py",
+  "flow_planning/envs/franka.py",
+]
 
 [tool.ty.overrides.rules]
 invalid-argument-type = "ignore"

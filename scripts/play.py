@@ -77,7 +77,7 @@ def main(cfg: Config):
             chunk = postprocessor(policy.chunk[0]).numpy().astype(np.float32)
             env.set_predicted_path(chunk)
             frame += 1
-            if env.success().all() or frame >= timeout_frames:
+            if (env.success() | env.failure()).all() or frame >= timeout_frames:
                 env.reset()
                 frame = 0
         env.render()
