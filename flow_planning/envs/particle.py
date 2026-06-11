@@ -15,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from flow_planning.envs.env import EnvConfig
+from flow_planning.guidance import ObstacleGuidance
 
 wp.config.quiet = True
 
@@ -34,7 +35,6 @@ class ParticleConfig(EnvConfig):
     success_dist: float = 0.05
 
     # barrier bisecting start and goal, running along x
-    obstacle: bool = False
     obstacle_width: float = 0.5  # half-extent along x
     obstacle_thickness: float = 0.05
 
@@ -258,6 +258,19 @@ class ParticleEnv:
         obs = self.get_obs()
         dist = np.linalg.norm(obs[:, :2] - self.goal_pos, axis=1)
         return dist < self.cfg.success_dist
+
+    # -------------------------------------------------------------- guidance
+    def make_guidance(self, action_mean, action_std, scale, margin, device):
+        """Cost gradient keeping planned xy targets clear of the obstacle."""
+        return ObstacleGuidance(
+            center=[0.0, 0.0],
+            half_extents=[self.cfg.obstacle_width, self.cfg.obstacle_thickness],
+            action_mean=action_mean,
+            action_std=action_std,
+            scale=scale,
+            margin=margin,
+            device=device,
+        )
 
     # --------------------------------------------------------------- render
     def set_predicted_path(self, positions):

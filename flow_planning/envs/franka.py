@@ -20,6 +20,7 @@ import numpy as np
 import warp as wp
 
 from flow_planning.envs.env import EnvConfig
+from flow_planning.guidance import ObstacleGuidance
 from flow_planning.rotations import quat_to_rot6d, rot6d_to_quat
 
 wp.config.quiet = True
@@ -64,10 +65,9 @@ class FrankaConfig(EnvConfig):
     success_dist: float = 0.05  # cube-to-goal distance for success (m)
 
     # barrier bisecting cube start and goal
-    wall: bool = False
-    wall_height: float = 0.2
-    wall_width: float = 0.15
-    wall_thickness: float = 0.01
+    obstacle_height: float = 0.2
+    obstacle_width: float = 0.15
+    obstacle_thickness: float = 0.01
 
 
 @wp.kernel(enable_backward=False)
@@ -164,8 +164,10 @@ class FrankaEnv:
         cube_z = top[2] + 0.5 * self.cube_size
         self.cube_center = np.array([top[0], top[1] + 0.15, cube_z], np.float32)
         self.goal_center = np.array([top[0], top[1] - 0.15, cube_z], np.float32)
-        # wall sits on the table midway between cube and goal, running along x
-        self.wall_center = wp.vec3(top[0], top[1], top[2] + 0.5 * cfg.wall_height)
+        # obstacle sits on the table midway between cube and goal, running along x
+        self.obstacle_center = wp.vec3(
+            top[0], top[1], top[2] + 0.5 * cfg.obstacle_height
+        )
 
         franka = self.build_franka_with_table()
         self.robot_body_count = franka.body_count
@@ -265,15 +267,15 @@ class FrankaEnv:
             xform=wp.transform(self.table_pos, wp.quat_identity()),
             cfg=shape_cfg,
         )
-        if self.cfg.wall:
+        if self.cfg.obstacle:
             builder.add_shape_box(
                 body=-1,
-                hx=self.cfg.wall_width,
-                hy=self.cfg.wall_thickness,
-                hz=0.5 * self.cfg.wall_height,
-                xform=wp.transform(self.wall_center, wp.quat_identity()),
+                hx=self.cfg.obstacle_width,
+                hy=self.cfg.obstacle_thickness,
+                hz=0.5 * self.cfg.obstacle_height,
+                xform=wp.transform(self.obstacle_center, wp.quat_identity()),
                 cfg=shape_cfg,
-                label="wall",
+                label="obstacle",
                 color=[0.5, 0.5, 0.5],
             )
         return builder
@@ -509,6 +511,24 @@ class FrankaEnv:
         cube_pos = self.state_0.joint_q.numpy().reshape(n, -1)[:, 9:12]
         dist = np.linalg.norm(cube_pos - self.goal_pos, axis=1)
         return dist < self.cfg.success_dist
+
+    # -------------------------------------------------------------- guidance
+    def make_guidance(self, action_mean, action_std, scale, margin, device):
+        """Cost gradient keeping planned EE positions clear of the obstacle."""
+        return ObstacleGuidance(
+            center=list(self.obstacle_center),
+            half_extents=[
+                self.cfg.obstacle_width,
+                self.cfg.obstacle_thickness,
+                0.5 * self.cfg.obstacle_height,
+            ],
+            action_mean=action_mean,
+            action_std=action_std,
+            scale=scale,
+            margin=margin,
+            device=device,
+            over_top=True,
+        )
 
     # --------------------------------------------------------------- render
     def render(self):

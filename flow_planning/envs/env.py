@@ -9,6 +9,7 @@ import draccus
 class EnvConfig(draccus.ChoiceRegistry):
     world_count: int = 256
     fps: int = 50
+    obstacle: bool = False  # add a barrier between start and goal
 
     @property
     def type(self) -> str:

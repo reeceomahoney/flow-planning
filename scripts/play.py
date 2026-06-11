@@ -9,8 +9,7 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import OBS_STATE
 
-from flow_planning.envs import EnvConfig, FrankaConfig, make_env
-from flow_planning.guidance import WallGuidance
+from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.paths import latest_run_dir
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -21,12 +20,12 @@ from flow_planning.policy import (
 @dataclass
 class Config:
     env: EnvConfig = field(
-        default_factory=lambda: FrankaConfig(world_count=1, wall=True)
+        default_factory=lambda: ParticleConfig(world_count=1, obstacle=True)
     )
-    repo_id: str = "reece-omahoney/franka_cube"
+    repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    guidance_scale: float = 0.0  # >0 enables wall guidance; ~1000 works well
+    guidance_scale: float = 0.0  # >0 enables obstacle guidance; ~1000 works well
     guidance_margin: float = 0.05
 
 
@@ -48,20 +47,14 @@ def main(cfg: Config):
     )
 
     viewer = newton.viewer.ViewerGL()
-    use_guidance = cfg.guidance_scale > 0 and isinstance(cfg.env, FrankaConfig)
+    use_guidance = cfg.guidance_scale > 0
     if use_guidance:
-        cfg.env.wall = True
+        cfg.env.obstacle = True
     env = make_env(cfg.env, viewer)
 
     guidance_fn = None
     if use_guidance:
-        guidance_fn = WallGuidance(
-            center=list(env.wall_center),
-            half_extents=[
-                cfg.env.wall_width,
-                cfg.env.wall_thickness,
-                0.5 * cfg.env.wall_height,
-            ],
+        guidance_fn = env.make_guidance(
             action_mean=stats["action"]["mean"],
             action_std=stats["action"]["std"],
             scale=cfg.guidance_scale,
