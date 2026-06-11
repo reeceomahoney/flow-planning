@@ -11,6 +11,7 @@ from lerobot.utils.constants import OBS_STATE
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import WallGuidance
+from flow_planning.paths import latest_run_dir
 from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
@@ -23,7 +24,7 @@ class Config:
         default_factory=lambda: FrankaConfig(world_count=1, wall=True)
     )
     repo_id: str = "reece-omahoney/franka_cube"
-    checkpoint: str = "outputs"
+    checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
     guidance_scale: float = 0.0  # >0 enables wall guidance; ~1000 works well
     guidance_margin: float = 0.05
@@ -33,7 +34,9 @@ class Config:
 def main(cfg: Config):
     device = cfg.device if torch.cuda.is_available() else "cpu"
 
-    policy = FlowMatchingPolicy.from_pretrained(cfg.checkpoint)
+    checkpoint = cfg.checkpoint or latest_run_dir("outputs", cfg.env.type)
+    print(f"Loading checkpoint: {checkpoint}")
+    policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
     policy.to(device)
 

@@ -4,7 +4,6 @@ import math
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal, cast
 
 import draccus
@@ -19,6 +18,7 @@ from lerobot.utils.constants import OBS_STATE
 from torch.utils.data import DataLoader
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
+from flow_planning.paths import make_run_dir
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
@@ -106,6 +106,8 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
 def main(cfg: Config):
     torch.set_float32_matmul_precision("high")
     device = cfg.device if torch.cuda.is_available() else "cpu"
+    out_dir = make_run_dir(cfg.out_dir, cfg.env.type)
+    print(f"Output directory: {out_dir}")
 
     wandb.init(
         project=cfg.wandb_project, mode=cfg.wandb_mode, config=draccus.encode(cfg)
@@ -207,7 +209,6 @@ def main(cfg: Config):
             policy, env, preprocessor, postprocessor, cfg.eval_episodes, cfg.num_iters
         )
 
-    out_dir = Path(cfg.out_dir)
     policy.model = cast(FlowTransformer, policy.model._orig_mod)
     policy.save_pretrained(out_dir)
     print(f"Saved policy to {out_dir}")

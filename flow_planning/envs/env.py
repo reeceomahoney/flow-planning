@@ -10,6 +10,10 @@ class EnvConfig(draccus.ChoiceRegistry):
     world_count: int = 256
     fps: int = 50
 
+    @property
+    def type(self) -> str:
+        return self.get_choice_name(self.__class__)
+
 
 def make_env(cfg: EnvConfig, viewer):
     from flow_planning.envs.franka import FrankaConfig, FrankaEnv
