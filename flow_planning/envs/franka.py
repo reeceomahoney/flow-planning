@@ -74,29 +74,29 @@ class FrankaConfig(EnvConfig):
 def set_target_pose_kernel(
     task: int,
     t: float,
-    drop_off_pos: wp.array(dtype=wp.vec3),  # ty: ignore[invalid-type-form]
+    drop_off_pos: wp.array(dtype=wp.vec3),
     off_approach: wp.vec3,
     off_lift: wp.vec3,
     off_retract: wp.vec3,
     home_pos: wp.vec3,
-    task_init_body_q: wp.array(dtype=wp.transform),  # ty: ignore[invalid-type-form]
-    body_q: wp.array(dtype=wp.transform),  # ty: ignore[invalid-type-form]
+    task_init_body_q: wp.array(dtype=wp.transform),
+    body_q: wp.array(dtype=wp.transform),
     ee_index: int,
     cube_body_index: int,
     num_bodies_per_world: int,
     # outputs
-    ee_pos_out: wp.array(dtype=wp.vec3),  # ty: ignore[invalid-type-form]
-    ee_rot_out: wp.array(dtype=wp.vec4),  # ty: ignore[invalid-type-form]
-    gripper_out: wp.array2d(dtype=wp.float32),  # ty: ignore[invalid-type-form]
+    ee_pos_out: wp.array(dtype=wp.vec3),
+    ee_rot_out: wp.array(dtype=wp.vec4),
+    gripper_out: wp.array2d(dtype=wp.float32),
 ):
     tid = wp.tid()
 
-    ee_body_id = tid * num_bodies_per_world + ee_index  # ty: ignore[unsupported-operator]
+    ee_body_id = tid * num_bodies_per_world + ee_index
     ee_pos_prev = wp.transform_get_translation(task_init_body_q[ee_body_id])
     ee_quat_prev = wp.transform_get_rotation(task_init_body_q[ee_body_id])
     ee_quat_down = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), wp.pi)
 
-    obj_body_id = tid * num_bodies_per_world + cube_body_index  # ty: ignore[unsupported-operator]
+    obj_body_id = tid * num_bodies_per_world + cube_body_index
     obj_pos = wp.transform_get_translation(body_q[obj_body_id])
     obj_quat = wp.transform_get_rotation(body_q[obj_body_id])
 
@@ -106,7 +106,7 @@ def set_target_pose_kernel(
 
     if task == TaskType.APPROACH.value:
         ee_pos_target = obj_pos + off_approach
-        ee_quat_target = ee_quat_down * wp.quat_inverse(obj_quat)  # ty: ignore[unsupported-operator]
+        ee_quat_target = ee_quat_down * wp.quat_inverse(obj_quat)
     elif task == TaskType.REFINE_APPROACH.value:
         ee_pos_target = obj_pos
         ee_quat_target = ee_quat_prev
@@ -132,9 +132,9 @@ def set_target_pose_kernel(
     else:  # HOME
         ee_pos_target = home_pos
 
-    ee_pos_out[tid] = ee_pos_prev * (1.0 - t) + ee_pos_target * t  # ty: ignore[unsupported-operator]
+    ee_pos_out[tid] = ee_pos_prev * (1.0 - t) + ee_pos_target * t
     q = wp.quat_slerp(ee_quat_prev, ee_quat_target, t)
-    ee_rot_out[tid] = wp.vec4(q[0], q[1], q[2], q[3])  # ty: ignore[not-subscriptable]
+    ee_rot_out[tid] = wp.vec4(q[0], q[1], q[2], q[3])
 
     gripper_pos = 0.06 * (1.0 - t_gripper)
     gripper_out[tid, 0] = gripper_pos
@@ -222,7 +222,7 @@ class FrankaEnv:
                 newton.utils.download_asset("franka_emika_panda")
                 / "urdf/fr3_franka_hand.urdf"
             ),
-            xform=wp.transform(self.robot_base_pos, wp.quat_identity()),  # ty: ignore[missing-argument]
+            xform=wp.transform(self.robot_base_pos, wp.quat_identity()),
             floating=False,
             enable_self_collisions=False,
             parse_visuals_as_colliders=False,
@@ -262,7 +262,7 @@ class FrankaEnv:
             hx=0.4,
             hy=0.4,
             hz=0.5 * self.cfg.table_height,
-            xform=wp.transform(self.table_pos, wp.quat_identity()),  # ty: ignore[missing-argument]
+            xform=wp.transform(self.table_pos, wp.quat_identity()),
             cfg=shape_cfg,
         )
         if self.cfg.wall:
@@ -271,7 +271,7 @@ class FrankaEnv:
                 hx=self.cfg.wall_width,
                 hy=self.cfg.wall_thickness,
                 hz=0.5 * self.cfg.wall_height,
-                xform=wp.transform(self.wall_center, wp.quat_identity()),  # ty: ignore[missing-argument]
+                xform=wp.transform(self.wall_center, wp.quat_identity()),
                 cfg=shape_cfg,
                 label="wall",
                 color=[0.5, 0.5, 0.5],
@@ -292,7 +292,7 @@ class FrankaEnv:
         shape_cfg = newton.ModelBuilder.ShapeConfig(density=400.0, margin=0.0)
         half = 0.5 * self.cube_size
         body = scene.add_body(
-            xform=wp.transform(wp.vec3(*self.cube_center), wp.quat_identity())  # ty: ignore[missing-argument]
+            xform=wp.transform(wp.vec3(*self.cube_center), wp.quat_identity())
         )
         scene.add_shape_box(
             body=body,
@@ -319,7 +319,7 @@ class FrankaEnv:
         )
         self.rot_obj = ik.IKObjectiveRotation(
             link_index=self.cfg.ee_index,
-            link_offset_rotation=wp.quat_identity(),  # ty: ignore[invalid-argument-type, missing-argument]
+            link_offset_rotation=wp.quat_identity(),
             target_rotations=wp.array([ee_quat] * n, dtype=wp.vec4),
         )
 
@@ -416,7 +416,7 @@ class FrankaEnv:
         self.pos_obj.set_target_positions(self.ee_pos_target)
         self.rot_obj.set_target_rotations(self.ee_rot_target)
         jq = self.joint_q_ik
-        self.ik_solver.step(jq, jq, iterations=self.cfg.ik_iters)  # ty: ignore[invalid-argument-type]
+        self.ik_solver.step(jq, jq, iterations=self.cfg.ik_iters)
 
         jt = self.control.joint_target_pos.reshape((n, -1))
         wp.copy(dest=jt[:, :7], src=self.joint_q_ik[:, :7])
@@ -471,7 +471,7 @@ class FrankaEnv:
         self.pos_obj.set_target_positions(self.ee_pos_target)
         self.rot_obj.set_target_rotations(self.ee_rot_target)
         jq = self.joint_q_ik
-        self.ik_solver.step(jq, jq, iterations=self.cfg.ik_iters)  # ty: ignore[invalid-argument-type]
+        self.ik_solver.step(jq, jq, iterations=self.cfg.ik_iters)
 
         jt = self.control.joint_target_pos.reshape((n, -1))
         wp.copy(dest=jt[:, :7], src=jq[:, :7])

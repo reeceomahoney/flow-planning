@@ -41,21 +41,21 @@ class ParticleConfig(EnvConfig):
 
 @wp.kernel(enable_backward=False)
 def pd_force_kernel(
-    body_q: wp.array(dtype=wp.transform),  # ty: ignore[invalid-type-form]
-    body_qd: wp.array(dtype=wp.spatial_vector),  # ty: ignore[invalid-type-form]
-    target: wp.array(dtype=wp.vec3),  # ty: ignore[invalid-type-form]
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    target: wp.array(dtype=wp.vec3),
     kp: float,
     kd: float,
     bodies_per_world: int,
     # outputs
-    body_f: wp.array(dtype=wp.spatial_vector),  # ty: ignore[invalid-type-form]
+    body_f: wp.array(dtype=wp.spatial_vector),
 ):
     tid = wp.tid()
     bid = tid * bodies_per_world
     pos = wp.transform_get_translation(body_q[bid])
     vel = wp.spatial_top(body_qd[bid])  # linear velocity
-    f = kp * (target[tid] - pos) - kd * vel  # ty: ignore[unsupported-operator]
-    body_f[bid] = wp.spatial_vector(f[0], f[1], 0.0, 0.0, 0.0, 0.0)  # ty: ignore[no-matching-overload]
+    f = kp * (target[tid] - pos) - kd * vel
+    body_f[bid] = wp.spatial_vector(f[0], f[1], 0.0, 0.0, 0.0, 0.0)
 
 
 class ParticleEnv:
@@ -111,7 +111,7 @@ class ParticleEnv:
 
         ball_cfg = newton.ModelBuilder.ShapeConfig(density=1000.0)
         body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, cfg.ball_radius), wp.quat_identity())  # ty: ignore[missing-argument]
+            xform=wp.transform(wp.vec3(0.0, 0.0, cfg.ball_radius), wp.quat_identity())
         )
         builder.add_shape_sphere(
             body=body, radius=cfg.ball_radius, cfg=ball_cfg, color=[0.8, 0.2, 0.2]
@@ -125,7 +125,7 @@ class ParticleEnv:
                 hx=t,
                 hy=a + 2.0 * t,
                 hz=h,
-                xform=wp.transform(wp.vec3(x, y, h), wp.quat_identity()),  # ty: ignore[missing-argument]
+                xform=wp.transform(wp.vec3(x, y, h), wp.quat_identity()),
                 label=f"wall_x{i}",
                 color=[0.5, 0.5, 0.5],
             )
@@ -135,7 +135,7 @@ class ParticleEnv:
                 hx=a + 2.0 * t,
                 hy=t,
                 hz=h,
-                xform=wp.transform(wp.vec3(x, y, h), wp.quat_identity()),  # ty: ignore[missing-argument]
+                xform=wp.transform(wp.vec3(x, y, h), wp.quat_identity()),
                 label=f"wall_y{i}",
                 color=[0.5, 0.5, 0.5],
             )
@@ -145,7 +145,7 @@ class ParticleEnv:
                 hx=cfg.obstacle_width,
                 hy=cfg.obstacle_thickness,
                 hz=h,
-                xform=wp.transform(wp.vec3(0.0, 0.0, h), wp.quat_identity()),  # ty: ignore[missing-argument]
+                xform=wp.transform(wp.vec3(0.0, 0.0, h), wp.quat_identity()),
                 label="obstacle",
                 color=[0.5, 0.5, 0.5],
             )
@@ -176,12 +176,12 @@ class ParticleEnv:
         jq[:, :2] = self.start_pos
         jq[:, 2] = self.cfg.ball_radius
         jq[:, 6] = 1.0  # identity quat (xyzw)
-        wp.copy(self.state_0.joint_q, wp.array(jq.flatten(), dtype=wp.float32))  # ty: ignore[invalid-argument-type]
-        self.state_0.joint_qd.zero_()  # ty: ignore[unresolved-attribute]
+        wp.copy(self.state_0.joint_q, wp.array(jq.flatten(), dtype=wp.float32))
+        self.state_0.joint_qd.zero_()
         newton.eval_fk(
             self.model,
-            self.state_0.joint_q,  # ty: ignore[invalid-argument-type]
-            self.state_0.joint_qd,  # ty: ignore[invalid-argument-type]
+            self.state_0.joint_q,
+            self.state_0.joint_qd,
             self.state_0,
         )
 
@@ -248,8 +248,8 @@ class ParticleEnv:
     def get_obs(self):
         # ball xy pos (2), xy vel (2), goal xy (2)
         n = self.cfg.world_count
-        q = self.state_0.body_q.numpy().reshape(n, self.num_bodies_per_world, 7)  # ty: ignore[unresolved-attribute]
-        qd = self.state_0.body_qd.numpy().reshape(n, self.num_bodies_per_world, 6)  # ty: ignore[unresolved-attribute]
+        q = self.state_0.body_q.numpy().reshape(n, self.num_bodies_per_world, 7)
+        qd = self.state_0.body_qd.numpy().reshape(n, self.num_bodies_per_world, 6)
         pos, vel = q[:, 0, :2], qd[:, 0, :2]  # linear velocity first
         return np.concatenate([pos, vel, self.goal_pos], axis=1).astype(np.float32)
 

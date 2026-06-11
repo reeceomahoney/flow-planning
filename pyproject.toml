@@ -39,3 +39,16 @@ explicit = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+# warp's kernel DSL confuses type checkers
+[[tool.ty.overrides]]
+include = ["flow_planning/envs/particle.py", "flow_planning/envs/franka.py"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+invalid-type-form = "ignore"
+missing-argument = "ignore"
+no-matching-overload = "ignore"
+not-subscriptable = "ignore"
+unresolved-attribute = "ignore"
+unsupported-operator = "ignore"
