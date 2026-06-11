@@ -1,7 +1,8 @@
 """Particle environment built on newton: a ball confined to a square arena.
 
 A dynamic ball rolls on the ground inside four static walls; the action is a
-2D target position tracked by a PD force on the ball's center. Mirrors the
+2D target position tracked by a PD force on the ball's center. An optional
+obstacle bisects the arena, with start and goal sampled on opposite sides. Mirrors the
 FrankaEnv interface: vectorized worlds, get_obs/apply_action/success/render,
 plus a scripted straight-to-goal controller (step/record_frame) for demos.
 """
@@ -31,6 +32,11 @@ class ParticleConfig(EnvConfig):
     kd: float = 10.0
     sample_margin: float = 0.15  # start/goal distance from the walls
     success_dist: float = 0.05
+
+    # barrier bisecting start and goal, running along x
+    obstacle: bool = False
+    obstacle_width: float = 0.5  # half-extent along x
+    obstacle_thickness: float = 0.05
 
 
 @wp.kernel(enable_backward=False)
@@ -133,18 +139,37 @@ class ParticleEnv:
                 label=f"wall_y{i}",
                 color=[0.5, 0.5, 0.5],
             )
+        if cfg.obstacle:
+            builder.add_shape_box(
+                body=-1,
+                hx=cfg.obstacle_width,
+                hy=cfg.obstacle_thickness,
+                hz=h,
+                xform=wp.transform(wp.vec3(0.0, 0.0, h), wp.quat_identity()),  # ty: ignore[missing-argument]
+                label="obstacle",
+                color=[0.5, 0.5, 0.5],
+            )
         return builder
 
     # ----------------------------------------------------------------- reset
-    def sample(self):
+    def sample(self, side: float = 0.0):
+        """Uniform xy in the arena; side=+/-1 keeps y on that side of the obstacle."""
         n = self.cfg.world_count
         lim = self.cfg.arena_size - self.cfg.sample_margin
-        return self.rng.uniform(-lim, lim, (n, 2)).astype(np.float32)
+        pos = self.rng.uniform(-lim, lim, (n, 2)).astype(np.float32)
+        if side != 0.0:
+            lo = self.cfg.obstacle_thickness + self.cfg.sample_margin
+            pos[:, 1] = (side * self.rng.uniform(lo, lim, n)).astype(np.float32)
+        return pos
 
     def reset(self):
         n = self.cfg.world_count
-        self.start_pos = self.sample()
-        self.goal_pos = self.sample()
+        if self.cfg.obstacle:
+            self.start_pos = self.sample(side=1.0)
+            self.goal_pos = self.sample(side=-1.0)
+        else:
+            self.start_pos = self.sample()
+            self.goal_pos = self.sample()
         self.task_time = 0.0
 
         jq = np.zeros((n, self.coords_per_world), np.float32)
