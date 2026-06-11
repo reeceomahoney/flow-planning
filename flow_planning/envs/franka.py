@@ -19,6 +19,7 @@ import newton.utils
 import numpy as np
 import warp as wp
 
+from flow_planning.envs.env import EnvConfig
 from flow_planning.rotations import quat_to_rot6d, rot6d_to_quat
 
 wp.config.quiet = True
@@ -50,11 +51,10 @@ HOME_Q = [
 ]
 
 
+@EnvConfig.register_subclass("franka")
 @dataclass
-class FrankaConfig:
-    world_count: int = 256
+class FrankaConfig(EnvConfig):
     ee_index: int = 11  # fr3_hand_tcp
-    fps: int = 50
     sim_substeps: int = 10
     task_time: float = 1.0  # seconds per task phase
     ik_iters: int = 24
@@ -347,7 +347,7 @@ class FrankaEnv:
         self.num_tasks = len(self.TASKS)
         self.task_init_body_q = wp.clone(self.state_0.body_q)
         self.ee_pos_target = wp.zeros(n, dtype=wp.vec3)
-        self.ee_rot_target = wp.zeros(n, dtype=wp.vec4)
+        self.ee_rot_target = wp.full(n, wp.vec4(0.0, 0.0, 0.0, 1.0), dtype=wp.vec4)
         self.gripper_target = wp.zeros((n, 2), dtype=wp.float32)
         self.goal_wp = wp.zeros(n, dtype=wp.vec3)
         self.task_idx = 0
@@ -450,11 +450,11 @@ class FrankaEnv:
                 self.reset()
         return new_episode, success
 
-    def set_predicted_ee(self, ee_positions):
-        """Store the planned EE path (steps, 3) for visualization."""
-        self.predicted_ee = np.ascontiguousarray(ee_positions, np.float32)[:, :3]
+    def set_predicted_path(self, positions):
+        """Store the planned EE path (steps, 3+) for visualization."""
+        self.predicted_ee = np.ascontiguousarray(positions, np.float32)[:, :3]
 
-    def apply_ee_action(self, ee_action):
+    def apply_action(self, ee_action):
         """Drive the sim with EE-pose actions, (world_count, 10).
 
         Each action is EE position (3) + 6D rotation (6) + gripper (1); IK maps

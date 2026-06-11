@@ -18,7 +18,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import OBS_STATE
 from torch.utils.data import DataLoader
 
-from flow_planning.franka import FrankaConfig, FrankaEnv
+from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
@@ -29,7 +29,7 @@ from flow_planning.policy import (
 
 @dataclass
 class Config:
-    env: FrankaConfig = field(default_factory=FrankaConfig)
+    env: EnvConfig = field(default_factory=FrankaConfig)
     repo_id: str = "reece-omahoney/franka_cube"
     batch_size: int = 256
     num_iters: int = 50_000
@@ -90,8 +90,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
         for _ in range(env.episode_frames):
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
-            ee_action = postprocessor(action).numpy().astype(np.float32)
-            env.apply_ee_action(ee_action)
+            env.apply_action(postprocessor(action).numpy().astype(np.float32))
         successes += int(env.success().sum())
         total += n
     policy.train()
@@ -143,7 +142,7 @@ def main(cfg: Config):
 
     env = None
     if cfg.eval_every > 0:
-        env = FrankaEnv(cfg.env, newton.viewer.ViewerNull())
+        env = make_env(cfg.env, newton.viewer.ViewerNull())
 
     loader = DataLoader(
         dataset,

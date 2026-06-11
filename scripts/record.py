@@ -5,26 +5,27 @@ import newton.viewer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
-from flow_planning.franka import FrankaConfig, FrankaEnv
+from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 
 
 @dataclass
 class Config:
-    env: FrankaConfig = field(default_factory=FrankaConfig)
+    env: EnvConfig = field(default_factory=FrankaConfig)
     record: bool = True
     episodes: int = 256
     repo_id: str = "reece-omahoney/franka_cube"
     task: str = "Pick up the cube and place it at the goal position."
 
 
-def collect(cfg: Config, env: FrankaEnv):
-    ik_dofs = env.model_single.joint_coord_count
-    # joints (9), EE pos (3), EE rot6d (6), cube pos (3), cube yaw sc (2), goal (3)
-    obs_dim = ik_dofs + 17
-    action_dim = 10  # ee pos (3), 6D rotation (6), gripper (1)
+def collect(cfg: Config, env):
+    obs, action = env.record_frame()
     features = {
-        "observation.state": {"dtype": "float32", "shape": (obs_dim,), "names": None},
-        "action": {"dtype": "float32", "shape": (action_dim,), "names": None},
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (obs.shape[1],),
+            "names": None,
+        },
+        "action": {"dtype": "float32", "shape": (action.shape[1],), "names": None},
         "next.success": {"dtype": "bool", "shape": (1,), "names": None},
     }
     dataset = LeRobotDataset.create(
@@ -68,12 +69,12 @@ def collect(cfg: Config, env: FrankaEnv):
 @draccus.wrap()
 def main(cfg: Config):
     if cfg.record:
-        env = FrankaEnv(cfg.env, newton.viewer.ViewerNull())
+        env = make_env(cfg.env, newton.viewer.ViewerNull())
         collect(cfg, env)
         return
 
     viewer = newton.viewer.ViewerGL()
-    env = FrankaEnv(cfg.env, viewer)
+    env = make_env(cfg.env, viewer)
     while viewer.is_running():
         if viewer.should_step():
             env.step()

@@ -1,4 +1,4 @@
-"""Roll out the trained flow-matching policy in the Franka pick-and-place env."""
+"""Roll out the trained flow-matching policy in sim."""
 
 from dataclasses import dataclass, field
 
@@ -9,7 +9,7 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import OBS_STATE
 
-from flow_planning.franka import FrankaConfig, FrankaEnv
+from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import WallGuidance
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -19,7 +19,7 @@ from flow_planning.policy import (
 
 @dataclass
 class Config:
-    env: FrankaConfig = field(
+    env: EnvConfig = field(
         default_factory=lambda: FrankaConfig(world_count=1, wall=True)
     )
     repo_id: str = "reece-omahoney/franka_cube"
@@ -45,12 +45,13 @@ def main(cfg: Config):
     )
 
     viewer = newton.viewer.ViewerGL()
-    if cfg.guidance_scale > 0:
+    use_guidance = cfg.guidance_scale > 0 and isinstance(cfg.env, FrankaConfig)
+    if use_guidance:
         cfg.env.wall = True
-    env = FrankaEnv(cfg.env, viewer)
+    env = make_env(cfg.env, viewer)
 
     guidance_fn = None
-    if cfg.guidance_scale > 0:
+    if use_guidance:
         guidance_fn = WallGuidance(
             center=list(env.wall_center),
             half_extents=[
@@ -73,13 +74,12 @@ def main(cfg: Config):
             action = policy.select_action(
                 preprocessor({OBS_STATE: obs}), guidance_fn=guidance_fn
             )
-            ee_action = postprocessor(action).numpy().astype(np.float32)
-            env.apply_ee_action(ee_action)
+            env.apply_action(postprocessor(action).numpy().astype(np.float32))
 
-            # visualize the policy's planned EE path (world 0)
+            # visualize the policy's planned path (world 0)
             assert policy.chunk is not None
             chunk = postprocessor(policy.chunk[0]).numpy().astype(np.float32)
-            env.set_predicted_ee(chunk)
+            env.set_predicted_path(chunk)
             frame += 1
             if env.success().all() or frame >= timeout_frames:
                 env.reset()
