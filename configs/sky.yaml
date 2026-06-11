@@ -1,0 +1,24 @@
+name: distal-train
+
+resources:
+  infra: ssh/ori
+  accelerators: RTX4090:2
+  cpus: 30
+
+envs:
+  HF_TOKEN:
+  WANDB_API_KEY:
+  CUDA_VISIBLE_DEVICES: 1
+workdir: .
+
+setup: |
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env
+  cd ~/sky_workdir
+  uv sync
+
+run: |
+  cd ~/sky_workdir
+  uv run scripts/record.py
+  uv run scripts/train.py
+

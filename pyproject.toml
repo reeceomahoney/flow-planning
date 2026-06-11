@@ -11,6 +11,7 @@ dependencies = [
   "pre-commit>=4.6.0",
   "rerun-sdk>=0.26.2",
   "scipy>=1.17",
+  "skypilot[kubernetes]>=0.12.3.post1",
   "slurm-tools",
   "torch>=2.11.0",
   "torchcodec>=0.12",
