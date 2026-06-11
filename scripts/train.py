@@ -102,6 +102,14 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
     print(f"step {step}  eval success rate {sr:.1%}", flush=True)
 
 
+def save_policy(policy, out_dir):
+    compiled = policy.model
+    policy.model = cast(FlowTransformer, compiled._orig_mod)
+    policy.save_pretrained(out_dir)
+    policy.model = compiled
+    print(f"Saved policy to {out_dir}", flush=True)
+
+
 @draccus.wrap()
 def main(cfg: Config):
     torch.set_float32_matmul_precision("high")
@@ -200,6 +208,7 @@ def main(cfg: Config):
         if env is not None and it > 0 and it % cfg.eval_every == 0:
             ema.store(policy.model)
             evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes, it)
+            save_policy(policy, out_dir)
             ema.restore(policy.model)
             last_log_time = time.perf_counter()
 
@@ -208,10 +217,7 @@ def main(cfg: Config):
         evaluate(
             policy, env, preprocessor, postprocessor, cfg.eval_episodes, cfg.num_iters
         )
-
-    policy.model = cast(FlowTransformer, policy.model._orig_mod)
-    policy.save_pretrained(out_dir)
-    print(f"Saved policy to {out_dir}")
+    save_policy(policy, out_dir)
     wandb.finish()
 
 
