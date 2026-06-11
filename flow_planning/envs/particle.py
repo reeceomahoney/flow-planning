@@ -178,9 +178,9 @@ class ParticleEnv:
         self.sim_time += self.frame_dt
 
     def step(self):
-        """Scripted demo: interpolate the target from start to goal."""
+        """Scripted demo: ramp the target from start to goal, then hold to settle."""
         self.task_time += self.frame_dt
-        t = min(1.0, self.task_time / self.cfg.task_time)
+        t = min(1.0, self.task_time / (0.75 * self.cfg.task_time))
         self.set_target(self.start_pos * (1.0 - t) + self.goal_pos * t)
         self.simulate()
         self.sim_time += self.frame_dt

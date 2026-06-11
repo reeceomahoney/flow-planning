@@ -17,7 +17,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import OBS_STATE
 from torch.utils.data import DataLoader
 
-from flow_planning.envs import EnvConfig, FrankaConfig, make_env
+from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.paths import make_run_dir
 from flow_planning.policy import (
     FlowMatchingConfig,
@@ -29,8 +29,8 @@ from flow_planning.policy import (
 
 @dataclass
 class Config:
-    env: EnvConfig = field(default_factory=FrankaConfig)
-    repo_id: str = "reece-omahoney/franka_cube"
+    env: EnvConfig = field(default_factory=ParticleConfig)
+    repo_id: str = "reece-omahoney/particle"
     batch_size: int = 256
     num_iters: int = 50_000
     warmup_iters: int = 500

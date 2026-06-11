@@ -5,16 +5,16 @@ import newton.viewer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
-from flow_planning.envs import EnvConfig, FrankaConfig, make_env
+from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 
 
 @dataclass
 class Config:
-    env: EnvConfig = field(default_factory=FrankaConfig)
+    env: EnvConfig = field(default_factory=ParticleConfig)
     record: bool = True
     episodes: int = 256
-    repo_id: str = "reece-omahoney/franka_cube"
-    task: str = "Pick up the cube and place it at the goal position."
+    repo_id: str = "reece-omahoney/particle"
+    task: str = "Move the particle to the target position"
 
 
 def collect(cfg: Config, env):
@@ -35,6 +35,7 @@ def collect(cfg: Config, env):
     # one pick-and-place per world = one episode; all worlds reset together
     buffers = [[] for _ in range(cfg.env.world_count)]
     collected = 0
+    successes = 0
     pbar = tqdm(total=cfg.episodes, desc="Collecting episodes")
     while collected < cfg.episodes:
         new_episode, success = env.step()
@@ -52,6 +53,7 @@ def collect(cfg: Config, env):
                     )
                 dataset.save_episode()
             n = min(remaining, cfg.env.world_count)
+            successes += int(success[:n].sum())
             collected += n
             pbar.update(n)
             buffers = [[] for _ in range(cfg.env.world_count)]
@@ -64,6 +66,7 @@ def collect(cfg: Config, env):
     pbar.close()
     dataset.finalize()
     print(f"Saved {dataset.meta.total_episodes} episodes to {dataset.root}")
+    print(f"Demo success rate: {successes / collected:.1%}")
 
 
 @draccus.wrap()
