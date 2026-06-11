@@ -191,7 +191,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        """Flow-ODE integrate a full (B, horizon, act_dim) action chunk."""
+        """Flow-ODE integrate a full (B, horizon, act_dim) action chunk.
+
+        `guidance_fn`, if given, maps the predicted clean chunk to a cost
+        gradient that is subtracted from the velocity at each step.
+        """
+        guidance_fn = kwargs.get("guidance_fn")
         self.eval()
         obs = batch[OBS_STATE]
         x = torch.randn(
@@ -200,14 +205,17 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
             t = torch.full((obs.shape[0],), i * dt, device=obs.device)
-            x = x + dt * self.model(x, t, obs)
+            v = self.model(x, t, obs)
+            if guidance_fn is not None:
+                v = v - guidance_fn(x + (1 - i * dt) * v)
+            x = x + dt * v
         return x
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Return one action per call, replanning every n_action_steps frames."""
         if self.chunk is None or self.chunk_step >= self.config.n_action_steps:
-            self.chunk = self.predict_action_chunk(batch)
+            self.chunk = self.predict_action_chunk(batch, **kwargs)
             self.chunk_step = 0
         action = self.chunk[:, self.chunk_step]
         self.chunk_step += 1
