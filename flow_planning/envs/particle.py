@@ -284,6 +284,7 @@ class ParticleEnv:
             scale=scale,
             margin=margin,
             device=device,
+            around=True,
         )
 
     # --------------------------------------------------------------- render

@@ -1,6 +1,7 @@
 """Roll out the trained flow-matching policy in sim."""
 
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import draccus
 import newton.viewer
@@ -25,8 +26,10 @@ class Config:
     repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    guidance_scale: float = 0.0  # >0 enables obstacle guidance; ~1000 works well
-    guidance_margin: float = 0.05
+    guidance_scale: float = 50.0  # >0 enables obstacle guidance
+    guidance_margin: float = 0.08
+    n_action_steps: int = 10  # >0 overrides the policy's replan interval
+    viewer: str = "rerun"  # "rerun" or "opengl"
 
 
 @draccus.wrap()
@@ -38,6 +41,8 @@ def main(cfg: Config):
     policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
     policy.to(device)
+    if cfg.n_action_steps > 0:
+        policy.config.n_action_steps = cfg.n_action_steps
 
     stats = LeRobotDataset(cfg.repo_id).meta.stats
     assert stats is not None
@@ -46,7 +51,17 @@ def main(cfg: Config):
         dataset_stats=stats,
     )
 
-    viewer = newton.viewer.ViewerGL()
+    if cfg.viewer == "opengl":
+        viewer = newton.viewer.ViewerGL()
+    elif cfg.viewer == "rerun":
+        web_port = 9090
+        viewer = newton.viewer.ViewerRerun(web_port=web_port)
+        if viewer._grpc_server_uri is not None:
+            grpc_uri = quote(viewer._grpc_server_uri, safe="")
+            print(f"Rerun viewer: http://localhost:{web_port}/?url={grpc_uri}")
+    else:
+        raise ValueError(f"Unknown viewer: {cfg.viewer}")
+
     use_guidance = cfg.guidance_scale > 0
     if use_guidance:
         cfg.env.obstacle = True
@@ -79,6 +94,7 @@ def main(cfg: Config):
             frame += 1
             if (env.success() | env.failure()).all() or frame >= timeout_frames:
                 env.reset()
+                policy.reset()
                 frame = 0
         env.render()
 

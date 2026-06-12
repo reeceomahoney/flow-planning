@@ -16,11 +16,14 @@ class ObstacleGuidance:
     """Collision-cost gradient on a normalized action chunk.
 
     The leading `len(center)` action dims are unnormalized into positions and
-    pushed off the obstacle by a squared hinge on its box SDF. With `over_top`,
-    waypoints inside the obstacle's xy footprint are also lifted above it (a
-    thin obstacle's SDF gradient is sideways, which would split a crossing path
-    around the obstacle instead of routing it over). The returned gradient
-    lives in the policy's normalized action space.
+    pushed off the obstacle by a squared hinge on its box SDF. The cost is
+    evaluated on points interpolated along the path so segments crossing a thin
+    obstacle between waypoints are also penalized. A thin obstacle's SDF
+    gradient points off its broad face, which stalls a crossing path against it
+    instead of routing it past an edge, so points inside the blocked band can
+    additionally be pushed past the nearest free edge: `around` routes them
+    beyond the obstacle's x extent, `over_top` lifts them above it. The
+    returned gradient lives in the policy's normalized action space.
     """
 
     def __init__(
@@ -32,7 +35,9 @@ class ObstacleGuidance:
         scale: float,
         margin: float,
         device: str,
+        around: bool = False,
         over_top: bool = False,
+        interp: int = 4,
     ):
         kw = {"dtype": torch.float32, "device": device}
         self.center = torch.as_tensor(center, **kw)
@@ -42,23 +47,48 @@ class ObstacleGuidance:
         self.std = torch.as_tensor(action_std, **kw)[:d]
         self.scale = scale
         self.margin = margin
+        self.around = around
         self.over_top = over_top
+        self.interp = interp
+
+    def path_points(self, pos: Tensor) -> Tensor:
+        """Interpolate `interp` points per segment along the path, plus the end."""
+        if self.interp <= 1:
+            return pos
+        a, b = pos[..., :-1, :], pos[..., 1:, :]
+        s = torch.linspace(0.0, 1.0, self.interp + 1, device=pos.device)[:-1]
+        pts = a.unsqueeze(-2) + s.view(-1, 1) * (b - a).unsqueeze(-2)
+        return torch.cat([pts.flatten(-3, -2), pos[..., -1:, :]], dim=-2)
 
     def __call__(self, x1_hat: Tensor) -> Tensor:
         d = len(self.center)
         with torch.enable_grad():
             x = x1_hat.detach().requires_grad_(True)
             pos = x[..., :d] * self.std + self.mean
-            sdf = box_sdf(pos, self.center, self.half_extents)
+            pts = self.path_points(pos)
+            sdf = box_sdf(pts, self.center, self.half_extents)
             cost = torch.relu(self.margin - sdf).square().sum()
 
+            q = (pts - self.center).abs()
+            if self.around:
+                band = q[..., 1] < self.half_extents[1] + self.margin
+                # one detour side per path, else points dither around x=0
+                xrel = (pts[..., 0] - self.center[0]).detach()
+                side = torch.sign((xrel * band).sum(-1, keepdim=True))
+                side = torch.where(side == 0, torch.ones_like(side), side)
+                out = torch.relu(
+                    self.half_extents[0]
+                    + self.margin
+                    - side * (pts[..., 0] - self.center[0])
+                )
+                cost = cost + (out * band).square().sum()
+
             if self.over_top:
-                q = (pos - self.center).abs()
                 band = (q[..., 0] < self.half_extents[0] + self.margin) & (
                     q[..., 1] < self.half_extents[1] + self.margin
                 )
                 z_top = self.center[2] + self.half_extents[2]
-                over = torch.relu(z_top + self.margin - pos[..., 2]) * band
+                over = torch.relu(z_top + self.margin - pts[..., 2]) * band
                 cost = cost + over.square().sum()
             (grad,) = torch.autograd.grad(cost, x)
         return self.scale * grad
