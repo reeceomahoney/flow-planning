@@ -61,7 +61,7 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # classifier-free goal conditioning
     goal_dim: int = 2  # trailing obs dims holding the goal, 0 disables
-    goal_dropout: float = 0.2  # P(replace goal with null token) during training
+    goal_dropout: float = 0.2  # P(mask the goal token) during training
     goal_guidance_weight: float = 1.0  # w=1: conditional, w=0: unconditional
 
     # training
@@ -116,21 +116,25 @@ def sinusoidal_embedding(t: Tensor, dim: int) -> Tensor:
 class FlowTransformer(nn.Module):
     """Velocity field v(x_t, t | obs) over a chunk of normalized actions.
 
-    The `horizon` noisy-action tokens and the observation token, each fused with
-    a time embedding, attend to each other; the action tokens read out the
-    per-step velocity.
+    The `horizon` noisy-action tokens, the state token, and the goal token,
+    each fused with a time embedding, attend to each other; the action tokens
+    read out the per-step velocity. `drop_goal` masks the goal token out of
+    attention entirely, so the unconditional model never sees a goal value.
     """
 
     def __init__(self, obs_dim: int, act_dim: int, cfg: FlowMatchingConfig):
         super().__init__()
         d = cfg.dim_model
         self.horizon = cfg.horizon
+        self.goal_dim = cfg.goal_dim
         self.act_in = nn.Linear(act_dim, d)
-        self.obs_in = nn.Linear(obs_dim, d)
-        if cfg.goal_dim > 0:
-            self.null_goal = nn.Parameter(torch.zeros(cfg.goal_dim))
+        self.obs_in = nn.Linear(obs_dim - self.goal_dim, d)
+        n_tokens = self.horizon + 1
+        if self.goal_dim > 0:
+            self.goal_in = nn.Linear(self.goal_dim, d)
+            n_tokens += 1
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
-        self.pos_emb = nn.Parameter(torch.randn(self.horizon + 1, d) * 0.02)
+        self.pos_emb = nn.Parameter(torch.randn(n_tokens, d) * 0.02)
 
         layer = nn.TransformerEncoderLayer(
             d, cfg.n_heads, 4 * d, activation="gelu", batch_first=True, norm_first=True
@@ -144,16 +148,21 @@ class FlowTransformer(nn.Module):
         self, x_t: Tensor, t: Tensor, obs: Tensor, drop_goal: Tensor | None = None
     ) -> Tensor:
         # x_t: (B, H, act_dim), t: (B,), obs: (B, obs_dim), drop_goal: (B,) bool
-        if drop_goal is not None:
-            gd = self.null_goal.shape[0]
-            null = self.null_goal.expand(obs.shape[0], -1)
-            goal = torch.where(drop_goal[:, None], null, obs[:, -gd:])
-            obs = torch.cat([obs[:, :-gd], goal], dim=-1)
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
         a = self.act_in(x_t) + temb[:, None]
-        o = self.obs_in(obs)[:, None] + temb[:, None]
-        tokens = torch.cat([a, o], dim=1) + self.pos_emb
-        h = self.transformer(tokens)
+        if self.goal_dim > 0:
+            state, goal = obs[:, : -self.goal_dim], obs[:, -self.goal_dim :]
+            o = self.obs_in(state)[:, None] + temb[:, None]
+            g = self.goal_in(goal)[:, None] + temb[:, None]
+            tokens = torch.cat([a, o, g], dim=1) + self.pos_emb
+        else:
+            o = self.obs_in(obs)[:, None] + temb[:, None]
+            tokens = torch.cat([a, o], dim=1) + self.pos_emb
+        mask = None
+        if drop_goal is not None:
+            mask = torch.zeros(tokens.shape[:2], dtype=torch.bool, device=obs.device)
+            mask[:, -1] = drop_goal
+        h = self.transformer(tokens, src_key_padding_mask=mask)
         return self.head(h[:, : self.horizon])
 
 
