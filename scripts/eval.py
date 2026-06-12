@@ -31,6 +31,7 @@ class Config:
     device: str = "cuda"
     guidance_scale: float = 50.0  # >0 enables obstacle guidance
     guidance_margin: float = 0.08
+    goal_weight: float = 1.0  # classifier-free goal conditioning weight
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
     n_action_steps: int = 10  # >0 overrides the policy's replan interval
@@ -65,6 +66,7 @@ def main(cfg: Config):
     policy.to(device)
     if cfg.n_action_steps > 0:
         policy.config.n_action_steps = cfg.n_action_steps
+    policy.config.goal_guidance_weight = cfg.goal_weight
 
     stats = LeRobotDataset(cfg.repo_id).meta.stats
     assert stats is not None

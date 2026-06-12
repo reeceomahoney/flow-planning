@@ -59,6 +59,11 @@ class FlowMatchingConfig(PreTrainedConfig):
     # flow matching
     num_inference_steps: int = 10
 
+    # classifier-free goal conditioning
+    goal_dim: int = 2  # trailing obs dims holding the goal, 0 disables
+    goal_dropout: float = 0.2  # P(replace goal with null token) during training
+    goal_guidance_weight: float = 1.0  # w=1: conditional, w=0: unconditional
+
     # training
     optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-2
@@ -122,6 +127,8 @@ class FlowTransformer(nn.Module):
         self.horizon = cfg.horizon
         self.act_in = nn.Linear(act_dim, d)
         self.obs_in = nn.Linear(obs_dim, d)
+        if cfg.goal_dim > 0:
+            self.null_goal = nn.Parameter(torch.zeros(cfg.goal_dim))
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
         self.pos_emb = nn.Parameter(torch.randn(self.horizon + 1, d) * 0.02)
 
@@ -133,8 +140,15 @@ class FlowTransformer(nn.Module):
         )
         self.head = nn.Linear(d, act_dim)
 
-    def forward(self, x_t: Tensor, t: Tensor, obs: Tensor) -> Tensor:
-        # x_t: (B, H, act_dim), t: (B,), obs: (B, obs_dim)
+    def forward(
+        self, x_t: Tensor, t: Tensor, obs: Tensor, drop_goal: Tensor | None = None
+    ) -> Tensor:
+        # x_t: (B, H, act_dim), t: (B,), obs: (B, obs_dim), drop_goal: (B,) bool
+        if drop_goal is not None:
+            gd = self.null_goal.shape[0]
+            null = self.null_goal.expand(obs.shape[0], -1)
+            goal = torch.where(drop_goal[:, None], null, obs[:, -gd:])
+            obs = torch.cat([obs[:, :-gd], goal], dim=-1)
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
         a = self.act_in(x_t) + temb[:, None]
         o = self.obs_in(obs)[:, None] + temb[:, None]
@@ -178,7 +192,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
-        v = self.model(x_t, t, obs)
+        drop = None
+        if self.config.goal_dim > 0 and self.config.goal_dropout > 0:
+            drop = (
+                torch.rand(obs.shape[0], device=obs.device) < self.config.goal_dropout
+            )
+        v = self.model(x_t, t, obs, drop)
         loss = F.mse_loss(v, x_1 - x_0, reduction="none").mean(-1)  # (B, H)
 
         pad = batch.get(f"{ACTION}_is_pad")
@@ -194,18 +213,29 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         """Flow-ODE integrate a full (B, horizon, act_dim) action chunk.
 
         `guidance_fn`, if given, maps the predicted clean chunk to a cost
-        gradient that is subtracted from the velocity at each step.
+        gradient that is subtracted from the velocity at each step. With
+        `goal_guidance_weight` w != 1 the velocity is the classifier-free mix
+        v_uncond + w * (v_cond - v_uncond).
         """
         guidance_fn = kwargs.get("guidance_fn")
         self.eval()
         obs = batch[OBS_STATE]
-        x = torch.randn(
-            obs.shape[0], self.config.horizon, self.act_dim, device=obs.device
-        )
+        n = obs.shape[0]
+        w = self.config.goal_guidance_weight
+        cfg_mix = w != 1.0 and self.config.goal_dim > 0
+        if cfg_mix:
+            obs = obs.repeat(2, 1)
+            drop = torch.zeros(2 * n, dtype=torch.bool, device=obs.device)
+            drop[n:] = True
+        x = torch.randn(n, self.config.horizon, self.act_dim, device=obs.device)
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
             t = torch.full((obs.shape[0],), i * dt, device=obs.device)
-            v = self.model(x, t, obs)
+            if cfg_mix:
+                v_c, v_u = self.model(x.repeat(2, 1, 1), t, obs, drop).chunk(2)
+                v = v_u + w * (v_c - v_u)
+            else:
+                v = self.model(x, t, obs)
             if guidance_fn is not None:
                 v = v - guidance_fn(x + (1 - i * dt) * v)
             x = x + dt * v
