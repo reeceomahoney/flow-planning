@@ -1,6 +1,6 @@
 """Franka FR3 pick-and-place environment built on newton, with physics + IK.
 
-Shared by `record.py` (collect demos) and `play.py` (roll out a policy). A cube
+Shared by `record.py` (collect demos) and `eval.py` (roll out a policy). A cube
 is grasped at `cube_start` and placed at `cube_goal`; a scripted task state
 machine drives an analytic-IK controller through a MuJoCo simulation (adapted
 from newton's `ik_cube_stacking` example). The observation is the per-world
