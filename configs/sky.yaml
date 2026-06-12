@@ -19,6 +19,7 @@ setup: |
 
 run: |
   cd ~/sky_workdir
-  uv run scripts/record.py
+  # rm -rf /home/sky/.cache/huggingface/lerobot/reece-omahoney/particle
+  # uv run scripts/record.py
   uv run scripts/train.py
 
