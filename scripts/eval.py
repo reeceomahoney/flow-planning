@@ -22,7 +22,9 @@ from flow_planning.policy import (
 @dataclass
 class Config:
     env: EnvConfig = field(
-        default_factory=lambda: ParticleConfig(world_count=256, obstacle=True)
+        default_factory=lambda: ParticleConfig(
+            world_count=256, obstacle=True, obstacle_random=True
+        )
     )
     repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>

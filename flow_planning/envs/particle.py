@@ -2,7 +2,8 @@
 
 A dynamic ball rolls on the ground inside four static walls; the action is a
 2D target position tracked by a PD force on the ball's center. An optional
-obstacle bisects the arena, with start and goal sampled on opposite sides. Mirrors the
+obstacle (optionally randomized per world) bisects the arena, with start and
+goal sampled on opposite sides. Mirrors the
 FrankaEnv interface: vectorized worlds, get_obs/apply_action/success/render,
 plus a scripted straight-to-goal controller (step/record_frame) for demos.
 """
@@ -38,6 +39,7 @@ class ParticleConfig(EnvConfig):
     # barrier bisecting start and goal, running along x
     obstacle_width: float = 0.5  # half-extent along x
     obstacle_thickness: float = 0.05
+    obstacle_random: bool = False  # randomize per-world obstacle size and position
 
 
 @wp.kernel(enable_backward=False)
@@ -70,9 +72,12 @@ class ParticleEnv:
 
         scene = newton.ModelBuilder()
         world = self.build_world()
-        for _ in range(cfg.world_count):
+        self.obstacle_box = self.sample_obstacles()
+        for i in range(cfg.world_count):
             scene.begin_world()
             scene.add_builder(world)
+            if cfg.obstacle:
+                self.add_obstacle(scene, self.obstacle_box[i])
             scene.end_world()
         scene.add_ground_plane()
 
@@ -143,17 +148,38 @@ class ParticleEnv:
                 label=f"wall_y{i}",
                 color=[0.5, 0.5, 0.5],
             )
-        if cfg.obstacle:
-            builder.add_shape_box(
-                body=-1,
-                hx=cfg.obstacle_width,
-                hy=cfg.obstacle_thickness,
-                hz=h,
-                xform=wp.transform(wp.vec3(0.0, 0.0, h), wp.quat_identity()),
-                label="obstacle",
-                color=[0.5, 0.5, 0.5],
-            )
         return builder
+
+    def sample_obstacles(self):
+        """Per-world obstacle box [cx, cy, hx, hy], fixed unless obstacle_random."""
+        cfg = self.cfg
+        n, a = cfg.world_count, cfg.arena_size
+        box = np.tile(
+            np.array(
+                [0.0, 0.0, cfg.obstacle_width, cfg.obstacle_thickness], np.float32
+            ),
+            (n, 1),
+        )
+        if cfg.obstacle_random:
+            # ranges keep a >=0.2*a gap to the walls so every world stays solvable
+            box[:, 0] = self.rng.uniform(-0.2 * a, 0.2 * a, n)
+            box[:, 1] = self.rng.uniform(-0.3 * a, 0.3 * a, n)
+            box[:, 2] = self.rng.uniform(0.3 * a, 0.6 * a, n)
+            box[:, 3] = self.rng.uniform(0.03 * a, 0.1 * a, n)
+        return box
+
+    def add_obstacle(self, builder, box):
+        cx, cy, hx, hy = (float(v) for v in box)
+        h = 0.5 * self.cfg.wall_height
+        builder.add_shape_box(
+            body=-1,
+            hx=hx,
+            hy=hy,
+            hz=h,
+            xform=wp.transform(wp.vec3(cx, cy, h), wp.quat_identity()),
+            label="obstacle",
+            color=[0.5, 0.5, 0.5],
+        )
 
     # ----------------------------------------------------------------- reset
     def sample(self, side: float = 0.0):
@@ -162,8 +188,9 @@ class ParticleEnv:
         lim = self.cfg.arena_size - self.cfg.sample_margin
         pos = self.rng.uniform(-lim, lim, (n, 2)).astype(np.float32)
         if side != 0.0:
-            lo = self.cfg.obstacle_thickness + self.cfg.sample_margin
-            pos[:, 1] = (side * self.rng.uniform(lo, lim, n)).astype(np.float32)
+            cy, hy = self.obstacle_box[:, 1], self.obstacle_box[:, 3]
+            lo = side * cy + hy + self.cfg.sample_margin
+            pos[:, 1] = (side * self.rng.uniform(lo, lim)).astype(np.float32)
         return pos
 
     def reset(self):
@@ -277,8 +304,8 @@ class ParticleEnv:
     def make_guidance(self, action_mean, action_std, scale, margin, device):
         """Cost gradient keeping planned xy targets clear of the obstacle."""
         return ObstacleGuidance(
-            center=[0.0, 0.0],
-            half_extents=[self.cfg.obstacle_width, self.cfg.obstacle_thickness],
+            center=self.obstacle_box[:, :2],
+            half_extents=self.obstacle_box[:, 2:],
             action_mean=action_mean,
             action_std=action_std,
             scale=scale,

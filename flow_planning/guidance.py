@@ -24,6 +24,7 @@ class ObstacleGuidance:
     additionally be pushed past the nearest free edge: `around` routes them
     beyond the obstacle's x extent, `over_top` lifts them above it. The
     returned gradient lives in the policy's normalized action space.
+    `center`/`half_extents` are one box (d,) or per-batch boxes (B, d).
     """
 
     def __init__(
@@ -42,7 +43,10 @@ class ObstacleGuidance:
         kw = {"dtype": torch.float32, "device": device}
         self.center = torch.as_tensor(center, **kw)
         self.half_extents = torch.as_tensor(half_extents, **kw)
-        d = len(self.center)
+        if self.center.ndim == 2:  # per-world boxes: broadcast over path points
+            self.center = self.center.unsqueeze(1)
+            self.half_extents = self.half_extents.unsqueeze(1)
+        d = self.center.shape[-1]
         self.mean = torch.as_tensor(action_mean, **kw)[:d]
         self.std = torch.as_tensor(action_std, **kw)[:d]
         self.scale = scale
@@ -61,7 +65,7 @@ class ObstacleGuidance:
         return torch.cat([pts.flatten(-3, -2), pos[..., -1:, :]], dim=-2)
 
     def __call__(self, x1_hat: Tensor) -> Tensor:
-        d = len(self.center)
+        d = self.center.shape[-1]
         with torch.enable_grad():
             x = x1_hat.detach().requires_grad_(True)
             pos = x[..., :d] * self.std + self.mean
@@ -71,23 +75,23 @@ class ObstacleGuidance:
 
             q = (pts - self.center).abs()
             if self.around:
-                band = q[..., 1] < self.half_extents[1] + self.margin
+                band = q[..., 1] < self.half_extents[..., 1] + self.margin
                 # one detour side per path, else points dither around x=0
-                xrel = (pts[..., 0] - self.center[0]).detach()
+                xrel = (pts[..., 0] - self.center[..., 0]).detach()
                 side = torch.sign((xrel * band).sum(-1, keepdim=True))
                 side = torch.where(side == 0, torch.ones_like(side), side)
                 out = torch.relu(
-                    self.half_extents[0]
+                    self.half_extents[..., 0]
                     + self.margin
-                    - side * (pts[..., 0] - self.center[0])
+                    - side * (pts[..., 0] - self.center[..., 0])
                 )
                 cost = cost + (out * band).square().sum()
 
             if self.over_top:
-                band = (q[..., 0] < self.half_extents[0] + self.margin) & (
-                    q[..., 1] < self.half_extents[1] + self.margin
+                band = (q[..., 0] < self.half_extents[..., 0] + self.margin) & (
+                    q[..., 1] < self.half_extents[..., 1] + self.margin
                 )
-                z_top = self.center[2] + self.half_extents[2]
+                z_top = self.center[..., 2] + self.half_extents[..., 2]
                 over = torch.relu(z_top + self.margin - pts[..., 2]) * band
                 cost = cost + over.square().sum()
             (grad,) = torch.autograd.grad(cost, x)
