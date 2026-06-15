@@ -300,11 +300,6 @@ class ParticleEnv:
             return np.zeros(self.cfg.world_count, dtype=bool)
         return self.obstacle_sensor.read()
 
-    # -------------------------------------------------------------- planning
-    def endpoints(self, obs):
-        """Physical (start, goal) xy for inpainting/tracking; obs=[pos,vel,goal]."""
-        return obs[:, :2], obs[:, 4:6]
-
     # -------------------------------------------------------------- guidance
     def make_guidance(self, action_mean, action_std, scale, margin, device, smooth=0.0):
         """Cost gradient keeping planned xy targets clear of the obstacle."""

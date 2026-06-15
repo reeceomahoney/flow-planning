@@ -5,9 +5,7 @@ and handled by the tracker at execution time. This lets endpoint inpainting pin
 the goal at a known index while the realized horizon stays flexible.
 """
 
-import numpy as np
 import torch
-from lerobot.utils.constants import OBS_STATE
 from torch import Tensor
 
 
@@ -78,75 +76,3 @@ class PathTracker:
         s_goal = arclen.gather(1, closest) + self.lookahead
         idx = torch.searchsorted(arclen, s_goal, right=True).clamp(max=N - 1)
         return plan.gather(1, idx.view(B, 1, 1).expand(B, 1, D)).squeeze(1)
-
-
-def normalize(x, mean: Tensor, std: Tensor, pos_dim: int) -> Tensor:
-    """Physical (..., pos_dim) -> normalized action space using leading stats."""
-    x = torch.as_tensor(x, dtype=torch.float32, device=mean.device)
-    return (x - mean[:pos_dim]) / std[:pos_dim]
-
-
-def unnormalize(x: Tensor, mean: Tensor, std: Tensor) -> Tensor:
-    """Normalized action chunk -> physical."""
-    return x * std + mean
-
-
-class Planner:
-    """Plan a geometric path with endpoint inpainting, then pure-pursuit track it.
-
-    `act(obs)` replans every `replan_every` steps and returns the per-frame
-    action; the realized horizon is whatever the tracker takes to reach the goal.
-    """
-
-    def __init__(
-        self,
-        policy,
-        preprocessor,
-        env,
-        action_mean,
-        action_std,
-        lookahead: float,
-        replan_every: int,
-        guidance_fn=None,
-        inpaint: bool = True,
-        device: str = "cuda",
-    ):
-        self.policy = policy
-        self.pre = preprocessor
-        self.env = env
-        self.device = device
-        self.mean = torch.as_tensor(action_mean, dtype=torch.float32, device=device)
-        self.std = torch.as_tensor(action_std, dtype=torch.float32, device=device)
-        self.pos_dim = policy.config.position_dim or self.mean.shape[0]
-        self.tracker = PathTracker(self.pos_dim, lookahead)
-        self.replan_every = replan_every
-        self.guidance_fn = guidance_fn
-        self.inpaint = inpaint
-        self.step = 0
-
-    def reset(self) -> None:
-        self.step = 0
-        self.tracker.plan = None
-
-    @torch.no_grad()
-    def replan(self, obs: np.ndarray) -> None:
-        start, goal = self.env.endpoints(obs)
-        kw = {"guidance_fn": self.guidance_fn}
-        if self.inpaint:
-            kw["inpaint"] = {
-                "start": normalize(start, self.mean, self.std, self.pos_dim),
-                "goal": normalize(goal, self.mean, self.std, self.pos_dim),
-            }
-        batch = self.pre({OBS_STATE: torch.from_numpy(obs)})
-        plan = self.policy.predict_action_chunk(batch, **kw)
-        self.tracker.set_plan(unnormalize(plan, self.mean, self.std))
-
-    @torch.no_grad()
-    def act(self, obs: np.ndarray) -> np.ndarray:
-        if self.tracker.plan is None or self.step % self.replan_every == 0:
-            self.replan(obs)
-        self.step += 1
-        pos = torch.as_tensor(
-            self.env.endpoints(obs)[0], dtype=torch.float32, device=self.device
-        )
-        return self.tracker.target(pos).cpu().numpy().astype(np.float32)

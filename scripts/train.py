@@ -14,6 +14,7 @@ import wandb
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import OBS_STATE
 from torch.utils.data import DataLoader
 
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
@@ -24,7 +25,6 @@ from flow_planning.policy import (
     FlowTransformer,
     make_flow_matching_pre_post_processors,
 )
-from flow_planning.trajectory import Planner
 
 
 @dataclass
@@ -78,8 +78,8 @@ class EMA:
 
 
 @torch.no_grad()
-def evaluate(policy, env, preprocessor, stats, cfg, n_episodes, step):
-    """Roll the policy out in sim via plan + endpoint inpainting + tracking."""
+def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
+    """Roll the policy out in sim via the standard select_action loop."""
     policy.eval()
     t0 = time.perf_counter()
     env.rng = np.random.default_rng(0)
@@ -87,22 +87,13 @@ def evaluate(policy, env, preprocessor, stats, cfg, n_episodes, step):
     successes = 0
     total = 0
 
-    planner = Planner(
-        policy,
-        preprocessor,
-        env,
-        action_mean=stats["action"]["mean"],
-        action_std=stats["action"]["std"],
-        lookahead=cfg.lookahead,
-        replan_every=cfg.replan_every,
-        inpaint=cfg.inpaint,
-        device=policy.config.device,
-    )
     for _ in range(math.ceil(n_episodes / n)):
         env.reset()
-        planner.reset()
+        policy.reset()
         for _ in range(env.episode_frames):
-            env.apply_action(planner.act(env.get_obs()))
+            obs = torch.from_numpy(env.get_obs())
+            action = policy.select_action(preprocessor({OBS_STATE: obs}))
+            env.apply_action(postprocessor(action).numpy().astype(np.float32))
         successes += int(env.success().sum())
         total += n
     policy.train()
@@ -145,6 +136,9 @@ def main(cfg: Config):
     )
     # window every sample to the episode end so each plan spans start -> goal
     policy_cfg.traj_steps = int(max(dataset.meta.episodes["length"]))
+    policy_cfg.lookahead = cfg.lookahead
+    policy_cfg.replan_every = cfg.replan_every
+    policy_cfg.inpaint = cfg.inpaint
     print(f"traj_steps (max episode length): {policy_cfg.traj_steps}")
 
     delta_timestamps = {
@@ -152,7 +146,7 @@ def main(cfg: Config):
     }
     dataset = LeRobotDataset(cfg.repo_id, delta_timestamps=delta_timestamps)
 
-    policy = FlowMatchingPolicy(policy_cfg).to(device)
+    policy = FlowMatchingPolicy(policy_cfg, dataset_stats=dataset.meta.stats).to(device)
     policy.model = cast(
         FlowTransformer, torch.compile(policy.model, mode="reduce-overhead")
     )
@@ -160,7 +154,7 @@ def main(cfg: Config):
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
 
-    preprocessor, _ = make_flow_matching_pre_post_processors(
+    preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy_cfg,
         dataset_stats=dataset.meta.stats,
     )
@@ -222,15 +216,7 @@ def main(cfg: Config):
 
         if env is not None and it > 0 and it % cfg.eval_every == 0:
             ema.store(policy.model)
-            evaluate(
-                policy,
-                env,
-                preprocessor,
-                dataset.meta.stats,
-                cfg,
-                cfg.eval_episodes,
-                it,
-            )
+            evaluate(policy, env, preprocessor, postprocessor, cfg.eval_episodes, it)
             save_policy(policy, out_dir)
             ema.restore(policy.model)
             last_log_time = time.perf_counter()
@@ -238,13 +224,7 @@ def main(cfg: Config):
     ema.store(policy.model)
     if env is not None:
         evaluate(
-            policy,
-            env,
-            preprocessor,
-            dataset.meta.stats,
-            cfg,
-            cfg.eval_episodes,
-            cfg.num_iters,
+            policy, env, preprocessor, postprocessor, cfg.eval_episodes, cfg.num_iters
         )
     save_policy(policy, out_dir)
     wandb.finish()

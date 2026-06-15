@@ -1,9 +1,10 @@
 """A small flow-matching transformer policy in the lerobot policy style.
 
-Normalization is handled by the processor pipeline (see
-`make_flow_matching_pre_post_processors`), not inside the policy, so `forward`
-and `predict_action_chunk` operate on already-normalized tensors. Rollout is
-plan-based via `flow_planning.trajectory.Planner`, not per-frame `select_action`.
+Outer normalization is handled by the processor pipeline (see
+`make_flow_matching_pre_post_processors`), so `forward` and `predict_action_chunk`
+operate on already-normalized tensors. `select_action` follows the standard
+lerobot API: it plans a chunk and pure-pursuit-tracks it one action per call,
+using stat buffers only to bridge the obs and action normalization frames.
 """
 
 import math
@@ -40,7 +41,7 @@ from lerobot.utils.constants import (
 )
 from torch import Tensor
 
-from flow_planning.trajectory import resample_arc_length
+from flow_planning.trajectory import PathTracker, resample_arc_length
 
 
 @PreTrainedConfig.register_subclass("flow_matching")
@@ -53,6 +54,12 @@ class FlowMatchingConfig(PreTrainedConfig):
     horizon: int = 32  # support points per plan (plan resolution N)
     traj_steps: int = 0  # data window in frames; train.py auto-sets to max ep length
     position_dim: int = 0  # leading action dims for arc length/inpainting; 0 = all
+    obs_pos_start: int = 0  # index of the current position within the observation
+
+    # rollout (select_action): replan, inpaint endpoints, pure-pursuit track
+    lookahead: float = 0.15  # pursuit lookahead in physical units
+    replan_every: int = 10  # frames between replans
+    inpaint: bool = True  # pin plan endpoints to current state and goal
 
     # architecture
     dim_model: int = 128
@@ -174,8 +181,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     config_class = FlowMatchingConfig
     name = "flow_matching"
     config: FlowMatchingConfig
+    obs_mean: Tensor
+    obs_std: Tensor
+    action_mean: Tensor
+    action_std: Tensor
 
-    def __init__(self, config: FlowMatchingConfig, **kwargs):
+    def __init__(self, config: FlowMatchingConfig, dataset_stats=None, **kwargs):
         super().__init__(config)
         config.validate_features()
         self.config = config
@@ -185,8 +196,21 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         obs_dim = config.robot_state_feature.shape[0]
         act_dim = config.action_feature.shape[0]
         self.act_dim = act_dim
+        self.pos_dim = config.position_dim or act_dim
 
         self.model = FlowTransformer(obs_dim, act_dim, config)
+
+        # stats bridge the obs and action normalization frames inside
+        # select_action; not persisted (reloaded from the dataset at eval)
+        self.register_buffer("obs_mean", torch.zeros(obs_dim), persistent=False)
+        self.register_buffer("obs_std", torch.ones(obs_dim), persistent=False)
+        self.register_buffer("action_mean", torch.zeros(act_dim), persistent=False)
+        self.register_buffer("action_std", torch.ones(act_dim), persistent=False)
+        if dataset_stats is not None:
+            self.load_stats(dataset_stats)
+
+        self.guidance_fn = None  # optional obstacle cost, set before rollout
+        self.tracker = PathTracker(self.pos_dim, config.lookahead)
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -195,8 +219,18 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> Iterator[nn.Parameter]:  # ty: ignore[invalid-method-override]
         return self.parameters()
 
+    def load_stats(self, stats: dict[str, Any]) -> None:
+        def to_buf(v):
+            return torch.as_tensor(v, dtype=torch.float32, device=self.obs_mean.device)
+
+        self.obs_mean.copy_(to_buf(stats[OBS_STATE]["mean"]))
+        self.obs_std.copy_(to_buf(stats[OBS_STATE]["std"]))
+        self.action_mean.copy_(to_buf(stats[ACTION]["mean"]))
+        self.action_std.copy_(to_buf(stats[ACTION]["std"]))
+
     def reset(self):
-        pass
+        self.step = 0
+        self.tracker.plan = None
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         obs = batch[OBS_STATE]
@@ -268,12 +302,38 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 x = pin(x, (i + 1) * dt)
         return x
 
-    def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        # required by PreTrainedPolicy; rollout uses predict_action_chunk via Planner
-        raise NotImplementedError(
-            "Per-frame action API removed; roll out with "
-            "flow_planning.trajectory.Planner"
+    def physical_slice(self, obs: Tensor, lo: int, n: int) -> Tensor:
+        """Unnormalize obs[:, lo:lo+n] back to physical units."""
+        sl = slice(lo, lo + n)
+        return obs[:, sl] * self.obs_std[sl] + self.obs_mean[sl]
+
+    @torch.no_grad()
+    def replan(self, obs: Tensor) -> None:
+        inpaint = None
+        if self.config.inpaint:
+            p, g = self.pos_dim, self.config.goal_dim
+            start = self.physical_slice(obs, self.config.obs_pos_start, p)
+            goal = self.physical_slice(obs, obs.shape[-1] - g, g)
+            inpaint = {
+                "start": (start - self.action_mean[:p]) / self.action_std[:p],
+                "goal": (goal - self.action_mean[:g]) / self.action_std[:g],
+            }
+        plan = self.predict_action_chunk(
+            {OBS_STATE: obs}, inpaint=inpaint, guidance_fn=self.guidance_fn
         )
+        self.tracker.set_plan(plan * self.action_std + self.action_mean)
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+        """Plan + pure-pursuit one action per call, replanning periodically."""
+        obs = batch[OBS_STATE]
+        if self.tracker.plan is None or self.step % self.config.replan_every == 0:
+            self.replan(obs)
+        self.step += 1
+        self.tracker.lookahead = self.config.lookahead
+        pos = self.physical_slice(obs, self.config.obs_pos_start, self.pos_dim)
+        target = self.tracker.target(pos)  # physical action
+        return (target - self.action_mean) / self.action_std
 
 
 def make_flow_matching_pre_post_processors(

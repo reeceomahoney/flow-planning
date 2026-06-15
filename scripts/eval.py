@@ -9,6 +9,7 @@ import newton.viewer
 import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import OBS_STATE
 
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.paths import latest_run_dir
@@ -16,7 +17,6 @@ from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
 )
-from flow_planning.trajectory import Planner
 
 
 @dataclass
@@ -68,10 +68,14 @@ def main(cfg: Config):
     policy.config.device = device
     policy.to(device)
     policy.config.goal_guidance_weight = cfg.goal_weight
+    policy.config.lookahead = cfg.lookahead
+    policy.config.replan_every = cfg.replan_every
+    policy.config.inpaint = cfg.inpaint
 
     stats = LeRobotDataset(cfg.repo_id).meta.stats
     assert stats is not None
-    preprocessor, _ = make_flow_matching_pre_post_processors(
+    policy.load_stats(stats)
+    preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy.config, dataset_stats=stats
     )
 
@@ -82,9 +86,8 @@ def main(cfg: Config):
         cfg.env.obstacle = True
     env = make_env(cfg.env, viewer)
 
-    guidance_fn = None
     if cfg.guidance_scale > 0:
-        guidance_fn = env.make_guidance(
+        policy.guidance_fn = env.make_guidance(
             action_mean=stats["action"]["mean"],
             action_std=stats["action"]["std"],
             scale=cfg.guidance_scale,
@@ -93,19 +96,6 @@ def main(cfg: Config):
             smooth=cfg.guidance_smooth,
         )
 
-    planner = Planner(
-        policy,
-        preprocessor,
-        env,
-        action_mean=stats["action"]["mean"],
-        action_std=stats["action"]["std"],
-        lookahead=cfg.lookahead,
-        replan_every=cfg.replan_every,
-        guidance_fn=guidance_fn,
-        inpaint=cfg.inpaint,
-        device=device,
-    )
-
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
     total_succ = total_fail = total = 0
@@ -113,18 +103,19 @@ def main(cfg: Config):
     for ep in episodes:
         if not viewer.is_running():
             break
-        planner.reset()
+        policy.reset()
         env.reset()
         succ = np.zeros(n, dtype=bool)
         frame = 0
         while frame < frames and viewer.is_running():
             if viewer.should_step():
-                obs = env.get_obs()
-                env.apply_action(planner.act(obs))
+                obs = torch.from_numpy(env.get_obs())
+                action = policy.select_action(preprocessor({OBS_STATE: obs}))
+                env.apply_action(postprocessor(action).numpy().astype(np.float32))
                 if live:
                     # visualize the current plan (world 0)
-                    assert planner.tracker.plan is not None
-                    env.set_predicted_path(planner.tracker.plan[0].cpu().numpy())
+                    assert policy.tracker.plan is not None
+                    env.set_predicted_path(policy.tracker.plan[0].cpu().numpy())
                 frame += 1
                 succ |= env.success()
                 if (succ | env.failure()).all():
