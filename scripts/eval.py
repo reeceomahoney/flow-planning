@@ -32,7 +32,6 @@ class Config:
     guidance_scale: float = 50.0  # >0 enables obstacle guidance
     guidance_margin: float = 0.08
     guidance_smooth: float = 3.0  # smoothness weight (accel penalty); see sweep_smooth
-    goal_weight: float = 1.0  # classifier-free goal conditioning weight
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
     replan_every: int = 10  # frames between replans (receding horizon)
@@ -67,7 +66,6 @@ def main(cfg: Config):
     policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
     policy.to(device)
-    policy.config.goal_guidance_weight = cfg.goal_weight
     policy.config.lookahead = cfg.lookahead
     policy.config.replan_every = cfg.replan_every
     policy.config.inpaint = cfg.inpaint

@@ -69,10 +69,9 @@ class FlowMatchingConfig(PreTrainedConfig):
     # flow matching
     num_inference_steps: int = 10
 
-    # classifier-free goal conditioning
+    # the goal enters only via endpoint inpainting; these dims locate it in the obs
     goal_dim: int = 2  # trailing obs dims holding the goal, 0 disables
-    goal_dropout: float = 0.0  # P(mask the goal token) during training
-    goal_guidance_weight: float = 1.0  # w=1: conditional, w=0: unconditional
+    attn_window: int = 0  # local attention half-width over action tokens; 0 = global
 
     # training
     optimizer_lr: float = 1e-4
@@ -127,10 +126,11 @@ def sinusoidal_embedding(t: Tensor, dim: int) -> Tensor:
 class FlowTransformer(nn.Module):
     """Velocity field v(x_t, t | obs) over a chunk of normalized actions.
 
-    The `horizon` noisy-action tokens, the state token, and the goal token,
-    each fused with a time embedding, attend to each other; the action tokens
-    read out the per-step velocity. `drop_goal` masks the goal token out of
-    attention entirely, so the unconditional model never sees a goal value.
+    The `horizon` noisy-action tokens and the state token, each fused with a
+    time embedding, attend to each other; the action tokens read out the
+    per-step velocity. There is no goal token: the goal enters only via
+    endpoint inpainting, and `attn_window` restricts each action token to a
+    local neighbourhood so the prior is closed under stitching.
     """
 
     def __init__(self, obs_dim: int, act_dim: int, cfg: FlowMatchingConfig):
@@ -139,11 +139,9 @@ class FlowTransformer(nn.Module):
         self.horizon = cfg.horizon
         self.goal_dim = cfg.goal_dim
         self.act_in = nn.Linear(act_dim, d)
+        # the state token never sees the goal value; the goal enters via inpainting
         self.obs_in = nn.Linear(obs_dim - self.goal_dim, d)
         n_tokens = self.horizon + 1
-        if self.goal_dim > 0:
-            self.goal_in = nn.Linear(self.goal_dim, d)
-            n_tokens += 1
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
         self.pos_emb = nn.Parameter(torch.randn(n_tokens, d) * 0.02)
 
@@ -155,25 +153,25 @@ class FlowTransformer(nn.Module):
         )
         self.head = nn.Linear(d, act_dim)
 
-    def forward(
-        self, x_t: Tensor, t: Tensor, obs: Tensor, drop_goal: Tensor | None = None
-    ) -> Tensor:
-        # x_t: (B, H, act_dim), t: (B,), obs: (B, obs_dim), drop_goal: (B,) bool
+        # local attention: each action token attends only +/-attn_window neighbours;
+        # the state/goal tokens stay global. A local prior is closed under stitching.
+        if cfg.attn_window > 0:
+            i = torch.arange(self.horizon)
+            band = (i[:, None] - i[None, :]).abs() > cfg.attn_window
+            mask = torch.zeros(n_tokens, n_tokens, dtype=torch.bool)
+            mask[: self.horizon, : self.horizon] = band
+            self.register_buffer("attn_mask", mask, persistent=False)
+        else:
+            self.attn_mask = None
+
+    def forward(self, x_t: Tensor, t: Tensor, obs: Tensor) -> Tensor:
+        # x_t: (B, H, act_dim), t: (B,), obs: (B, obs_dim)
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
         a = self.act_in(x_t) + temb[:, None]
-        if self.goal_dim > 0:
-            state, goal = obs[:, : -self.goal_dim], obs[:, -self.goal_dim :]
-            o = self.obs_in(state)[:, None] + temb[:, None]
-            g = self.goal_in(goal)[:, None] + temb[:, None]
-            tokens = torch.cat([a, o, g], dim=1) + self.pos_emb
-        else:
-            o = self.obs_in(obs)[:, None] + temb[:, None]
-            tokens = torch.cat([a, o], dim=1) + self.pos_emb
-        mask = None
-        if drop_goal is not None:
-            mask = torch.zeros(tokens.shape[:2], dtype=torch.bool, device=obs.device)
-            mask[:, -1] = drop_goal
-        h = self.transformer(tokens, src_key_padding_mask=mask)
+        state = obs[:, : -self.goal_dim] if self.goal_dim > 0 else obs
+        o = self.obs_in(state)[:, None] + temb[:, None]
+        tokens = torch.cat([a, o], dim=1) + self.pos_emb
+        h = self.transformer(tokens, mask=self.attn_mask)
         return self.head(h[:, : self.horizon])
 
 
@@ -243,12 +241,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
-        drop = None
-        if self.config.goal_dim > 0 and self.config.goal_dropout > 0:
-            drop = (
-                torch.rand(obs.shape[0], device=obs.device) < self.config.goal_dropout
-            )
-        v = self.model(x_t, t, obs, drop)
+        v = self.model(x_t, t, obs)
         loss = F.mse_loss(v, x_1 - x_0)
         return loss, {"loss": loss.item()}
 
@@ -257,21 +250,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         """Flow-ODE integrate a full (B, horizon, act_dim) action chunk.
 
         `guidance_fn`, if given, maps the predicted clean chunk to a cost
-        gradient that is subtracted from the velocity at each step. With
-        `goal_guidance_weight` w != 1 the velocity is the classifier-free mix
-        v_uncond + w * (v_cond - v_uncond).
+        gradient that is subtracted from the velocity at each step.
         """
         guidance_fn = kwargs.get("guidance_fn")
         inpaint = kwargs.get("inpaint")  # {"start": (n,p), "goal": (n,p)} normalized
         self.eval()
         obs = batch[OBS_STATE]
         n = obs.shape[0]
-        w = self.config.goal_guidance_weight
-        cfg_mix = w != 1.0 and self.config.goal_dim > 0
-        if cfg_mix:
-            obs = obs.repeat(2, 1)
-            drop = torch.zeros(2 * n, dtype=torch.bool, device=obs.device)
-            drop[n:] = True
         x = torch.randn(n, self.config.horizon, self.act_dim, device=obs.device)
 
         # pin the ends along the noise->data interpolant: exact start/goal at t=1
@@ -289,12 +274,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
-            t = torch.full((obs.shape[0],), i * dt, device=obs.device)
-            if cfg_mix:
-                v_c, v_u = self.model(x.repeat(2, 1, 1), t, obs, drop).chunk(2)
-                v = v_u + w * (v_c - v_u)
-            else:
-                v = self.model(x, t, obs)
+            t = torch.full((n,), i * dt, device=obs.device)
+            v = self.model(x, t, obs)
             if guidance_fn is not None:
                 v = v - guidance_fn(x + (1 - i * dt) * v)
             x = x + dt * v

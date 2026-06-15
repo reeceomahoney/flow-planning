@@ -42,6 +42,7 @@ class Config:
     replan_every: int = 10  # frames between replans during eval rollout
     lookahead: float = 0.15  # pure-pursuit lookahead (physical units)
     inpaint: bool = True  # pin plan endpoints during eval rollout
+    attn_window: int = 0  # local attention half-width over action tokens; 0 = global
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
@@ -139,6 +140,7 @@ def main(cfg: Config):
     policy_cfg.lookahead = cfg.lookahead
     policy_cfg.replan_every = cfg.replan_every
     policy_cfg.inpaint = cfg.inpaint
+    policy_cfg.attn_window = cfg.attn_window
     print(f"traj_steps (max episode length): {policy_cfg.traj_steps}")
 
     delta_timestamps = {
