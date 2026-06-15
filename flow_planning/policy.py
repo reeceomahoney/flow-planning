@@ -39,6 +39,8 @@ from lerobot.utils.constants import (
 )
 from torch import Tensor
 
+from flow_planning.trajectory import resample_arc_length
+
 
 @PreTrainedConfig.register_subclass("flow_matching")
 @dataclass
@@ -48,8 +50,9 @@ class FlowMatchingConfig(PreTrainedConfig):
     n_obs_steps: int = 1
 
     # action chunking
-    horizon: int = 50
+    horizon: int = 32  # support points per plan (plan resolution N)
     n_action_steps: int = 20
+    traj_steps: int = 200  # data window in frames; must span to the episode end
 
     # architecture
     dim_model: int = 128
@@ -59,9 +62,15 @@ class FlowMatchingConfig(PreTrainedConfig):
     # flow matching
     num_inference_steps: int = 10
 
+    # phase parameterization (Design B): plan a fixed number of support points
+    # spaced by arc length; physical horizon is handled by the tracker at exec.
+    arc_length: bool = True  # resample action targets by arc length in training
+    position_dim: int = 0  # leading action dims used for arc length / inpainting
+    # (0 = all dims; e.g. 2 for particle xy, 3 for franka ee xyz)
+
     # classifier-free goal conditioning
     goal_dim: int = 2  # trailing obs dims holding the goal, 0 disables
-    goal_dropout: float = 0.2  # P(mask the goal token) during training
+    goal_dropout: float = 0.0  # P(mask the goal token) during training
     goal_guidance_weight: float = 1.0  # w=1: conditional, w=0: unconditional
 
     # training
@@ -97,7 +106,9 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list[int]:
-        return list(range(self.horizon))
+        # arc-length mode loads the full window to the goal, then resamples to
+        # `horizon` support points; legacy mode loads exactly `horizon` frames
+        return list(range(self.traj_steps if self.arc_length else self.horizon))
 
     @property
     def reward_delta_indices(self) -> None:
@@ -198,6 +209,14 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         obs = batch[OBS_STATE]
         x_1 = batch[ACTION]  # (B, H, act_dim)
+        pad = batch.get(f"{ACTION}_is_pad")
+        if self.config.arc_length:
+            # reparameterize the (padded, time-indexed) target into a fixed-length
+            # arc-length path from the current state to the goal; no padding after
+            x_1 = resample_arc_length(
+                x_1, pad, self.config.horizon, self.config.position_dim
+            )
+            pad = None
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
@@ -209,7 +228,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         v = self.model(x_t, t, obs, drop)
         loss = F.mse_loss(v, x_1 - x_0, reduction="none").mean(-1)  # (B, H)
 
-        pad = batch.get(f"{ACTION}_is_pad")
         if pad is not None:
             mask = (~pad).to(loss.dtype)
             loss = (loss * mask).sum() / mask.sum().clamp(min=1.0)
@@ -227,6 +245,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         v_uncond + w * (v_cond - v_uncond).
         """
         guidance_fn = kwargs.get("guidance_fn")
+        inpaint = kwargs.get("inpaint")  # {"start": (n,p), "goal": (n,p)} normalized
         self.eval()
         obs = batch[OBS_STATE]
         n = obs.shape[0]
@@ -237,6 +256,22 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             drop = torch.zeros(2 * n, dtype=torch.bool, device=obs.device)
             drop[n:] = True
         x = torch.randn(n, self.config.horizon, self.act_dim, device=obs.device)
+
+        # endpoint inpainting: pin the path ends to start/goal along the flow.
+        # x_t at the ends follows the straight noise->data interpolant, landing
+        # exactly on the known values at t=1.
+        pin = None
+        if inpaint is not None:
+            p = inpaint["start"].shape[-1]
+            z0, z1 = x[:, 0, :p].clone(), x[:, -1, :p].clone()
+
+            def pin(x: Tensor, t: float) -> Tensor:
+                x[:, 0, :p] = (1 - t) * z0 + t * inpaint["start"]
+                x[:, -1, :p] = (1 - t) * z1 + t * inpaint["goal"]
+                return x
+
+            x = pin(x, 0.0)
+
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
             t = torch.full((obs.shape[0],), i * dt, device=obs.device)
@@ -248,6 +283,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             if guidance_fn is not None:
                 v = v - guidance_fn(x + (1 - i * dt) * v)
             x = x + dt * v
+            if pin is not None:
+                x = pin(x, (i + 1) * dt)
         return x
 
     @torch.no_grad()

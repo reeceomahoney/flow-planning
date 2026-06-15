@@ -9,7 +9,6 @@ import newton.viewer
 import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.utils.constants import OBS_STATE
 
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.paths import latest_run_dir
@@ -17,6 +16,7 @@ from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
 )
+from flow_planning.trajectory import Planner
 
 
 @dataclass
@@ -34,7 +34,9 @@ class Config:
     goal_weight: float = 1.0  # classifier-free goal conditioning weight
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
-    n_action_steps: int = 10  # >0 overrides the policy's replan interval
+    replan_every: int = 10  # frames between replans (receding horizon)
+    lookahead: float = 0.15  # pure-pursuit lookahead distance (physical units)
+    inpaint: bool = True  # pin the plan endpoints to current state and goal
     viewer: str = "none"  # "none", "rerun", or "opengl"
     seed: int = 0
 
@@ -64,13 +66,11 @@ def main(cfg: Config):
     policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
     policy.to(device)
-    if cfg.n_action_steps > 0:
-        policy.config.n_action_steps = cfg.n_action_steps
     policy.config.goal_guidance_weight = cfg.goal_weight
 
     stats = LeRobotDataset(cfg.repo_id).meta.stats
     assert stats is not None
-    preprocessor, postprocessor = make_flow_matching_pre_post_processors(
+    preprocessor, _ = make_flow_matching_pre_post_processors(
         policy.config, dataset_stats=stats
     )
 
@@ -91,6 +91,19 @@ def main(cfg: Config):
             device=device,
         )
 
+    planner = Planner(
+        policy,
+        preprocessor,
+        env,
+        action_mean=stats["action"]["mean"],
+        action_std=stats["action"]["std"],
+        lookahead=cfg.lookahead,
+        replan_every=cfg.replan_every,
+        guidance_fn=guidance_fn,
+        inpaint=cfg.inpaint,
+        device=device,
+    )
+
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
     total_succ = total_fail = total = 0
@@ -98,22 +111,18 @@ def main(cfg: Config):
     for ep in episodes:
         if not viewer.is_running():
             break
-        policy.reset()
+        planner.reset()
         env.reset()
         succ = np.zeros(n, dtype=bool)
         frame = 0
         while frame < frames and viewer.is_running():
             if viewer.should_step():
-                obs = torch.from_numpy(env.get_obs())
-                action = policy.select_action(
-                    preprocessor({OBS_STATE: obs}), guidance_fn=guidance_fn
-                )
-                env.apply_action(postprocessor(action).numpy().astype(np.float32))
+                obs = env.get_obs()
+                env.apply_action(planner.act(obs))
                 if live:
-                    # visualize the policy's planned path (world 0)
-                    assert policy.chunk is not None
-                    chunk = postprocessor(policy.chunk[0]).numpy().astype(np.float32)
-                    env.set_predicted_path(chunk)
+                    # visualize the current plan (world 0)
+                    assert planner.tracker.plan is not None
+                    env.set_predicted_path(planner.tracker.plan[0].cpu().numpy())
                 frame += 1
                 succ |= env.success()
                 if (succ | env.failure()).all():

@@ -530,6 +530,15 @@ class FrankaEnv:
             return np.zeros(self.cfg.world_count, dtype=bool)
         return self.obstacle_sensor.read()
 
+    # -------------------------------------------------------------- planning
+    def endpoints(self, obs):
+        """Physical (start, goal) EE xyz for inpainting/tracking.
+
+        Pins the EE path between the current EE position and the goal; suits the
+        reaching / obstacle-avoidance setting rather than multi-phase grasping.
+        """
+        return obs[:, 9:12], obs[:, -3:]
+
     # -------------------------------------------------------------- guidance
     def make_guidance(self, action_mean, action_std, scale, margin, device):
         """Cost gradient keeping planned EE positions clear of the obstacle."""
