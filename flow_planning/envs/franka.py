@@ -540,7 +540,7 @@ class FrankaEnv:
         return obs[:, 9:12], obs[:, -3:]
 
     # -------------------------------------------------------------- guidance
-    def make_guidance(self, action_mean, action_std, scale, margin, device):
+    def make_guidance(self, action_mean, action_std, scale, margin, device, smooth=0.0):
         """Cost gradient keeping planned EE positions clear of the obstacle."""
         return ObstacleGuidance(
             center=list(self.obstacle_center),
@@ -555,6 +555,7 @@ class FrankaEnv:
             margin=margin,
             device=device,
             over_top=True,
+            smooth=smooth,
         )
 
     # --------------------------------------------------------------- render

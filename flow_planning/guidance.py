@@ -38,6 +38,7 @@ class ObstacleGuidance:
         device: str,
         around: bool = False,
         over_top: bool = False,
+        smooth: float = 0.0,
         interp: int = 4,
     ):
         kw = {"dtype": torch.float32, "device": device}
@@ -53,6 +54,7 @@ class ObstacleGuidance:
         self.margin = margin
         self.around = around
         self.over_top = over_top
+        self.smooth = smooth
         self.interp = interp
 
     def path_points(self, pos: Tensor) -> Tensor:
@@ -94,5 +96,14 @@ class ObstacleGuidance:
                 z_top = self.center[..., 2] + self.half_extents[..., 2]
                 over = torch.relu(z_top + self.margin - pts[..., 2]) * band
                 cost = cost + over.square().sum()
+
+            cost = self.scale * cost
+
+            if self.smooth > 0.0:
+                # penalize discrete acceleration so neighbouring support points
+                # stay coupled and the detour rounds out instead of zigzagging
+                accel = pos[:, 2:] - 2 * pos[:, 1:-1] + pos[:, :-2]
+                cost = cost + self.smooth * accel.square().sum()
+
             (grad,) = torch.autograd.grad(cost, x)
-        return self.scale * grad
+        return grad

@@ -31,6 +31,7 @@ class Config:
     device: str = "cuda"
     guidance_scale: float = 50.0  # >0 enables obstacle guidance
     guidance_margin: float = 0.08
+    guidance_smooth: float = 3.0  # smoothness weight (accel penalty); see sweep_smooth
     goal_weight: float = 1.0  # classifier-free goal conditioning weight
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
@@ -89,6 +90,7 @@ def main(cfg: Config):
             scale=cfg.guidance_scale,
             margin=cfg.guidance_margin,
             device=device,
+            smooth=cfg.guidance_smooth,
         )
 
     planner = Planner(

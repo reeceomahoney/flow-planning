@@ -306,7 +306,7 @@ class ParticleEnv:
         return obs[:, :2], obs[:, 4:6]
 
     # -------------------------------------------------------------- guidance
-    def make_guidance(self, action_mean, action_std, scale, margin, device):
+    def make_guidance(self, action_mean, action_std, scale, margin, device, smooth=0.0):
         """Cost gradient keeping planned xy targets clear of the obstacle."""
         return ObstacleGuidance(
             center=self.obstacle_box[:, :2],
@@ -317,6 +317,7 @@ class ParticleEnv:
             margin=margin,
             device=device,
             around=True,
+            smooth=smooth,
         )
 
     # --------------------------------------------------------------- render
