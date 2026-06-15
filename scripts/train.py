@@ -143,6 +143,9 @@ def main(cfg: Config):
     policy_cfg = FlowMatchingConfig(
         input_features=input_features, output_features=output_features, device=device
     )
+    # window every sample to the episode end so each plan spans start -> goal
+    policy_cfg.traj_steps = int(max(dataset.meta.episodes["length"]))
+    print(f"traj_steps (max episode length): {policy_cfg.traj_steps}")
 
     delta_timestamps = {
         "action": [i / dataset.fps for i in policy_cfg.action_delta_indices]

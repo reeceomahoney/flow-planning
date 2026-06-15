@@ -24,15 +24,14 @@ def resample_arc_length(
     d = pos_dim or D
     valid = torch.ones(B, H, dtype=torch.bool, device=p.device) if pad is None else ~pad
 
-    # forward-fill padded points with the last valid point (the goal) so their
-    # values never leak into the interpolation
+    # forward-fill the padded tail with the last valid point so it can't skew arc length
     lv = (valid.sum(1) - 1).clamp(min=0)
     last = p.gather(1, lv.view(B, 1, 1).expand(B, 1, D))
     p = torch.where(valid.unsqueeze(-1), p, last)
 
-    seg = (p[:, 1:, :d] - p[:, :-1, :d]).norm(dim=-1)  # (B, H-1)
+    seg = (p[:, 1:, :d] - p[:, :-1, :d]).norm(dim=-1)
     zero = torch.zeros(B, 1, device=p.device, dtype=seg.dtype)
-    arclen = torch.cat([zero, seg.cumsum(-1)], dim=1)  # (B, H), plateaus past the end
+    arclen = torch.cat([zero, seg.cumsum(-1)], dim=1)  # plateaus past the end
     total = arclen[:, -1:]
     s = torch.where(
         total > 1e-8, arclen / total.clamp(min=1e-8), torch.zeros_like(arclen)
@@ -74,8 +73,8 @@ class PathTracker:
         plan, arclen = self.plan, self.arclen
         B, N, D = plan.shape
         d = self.pos_dim or D
-        dist = (plan[..., :d] - pos[:, None, :]).norm(dim=-1)  # (B, N)
-        closest = dist.argmin(1, keepdim=True)  # (B, 1)
+        dist = (plan[..., :d] - pos[:, None, :]).norm(dim=-1)
+        closest = dist.argmin(1, keepdim=True)
         s_goal = arclen.gather(1, closest) + self.lookahead
         idx = torch.searchsorted(arclen, s_goal, right=True).clamp(max=N - 1)
         return plan.gather(1, idx.view(B, 1, 1).expand(B, 1, D)).squeeze(1)

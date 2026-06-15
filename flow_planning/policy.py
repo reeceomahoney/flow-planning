@@ -2,7 +2,8 @@
 
 Normalization is handled by the processor pipeline (see
 `make_flow_matching_pre_post_processors`), not inside the policy, so `forward`
-and `select_action` operate on already-normalized tensors.
+and `predict_action_chunk` operate on already-normalized tensors. Rollout is
+plan-based via `flow_planning.trajectory.Planner`, not per-frame `select_action`.
 """
 
 import math
@@ -49,10 +50,9 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     n_obs_steps: int = 1
 
-    # action chunking
     horizon: int = 32  # support points per plan (plan resolution N)
-    n_action_steps: int = 20
-    traj_steps: int = 200  # data window in frames; must span to the episode end
+    traj_steps: int = 0  # data window in frames; train.py auto-sets to max ep length
+    position_dim: int = 0  # leading action dims for arc length/inpainting; 0 = all
 
     # architecture
     dim_model: int = 128
@@ -61,12 +61,6 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # flow matching
     num_inference_steps: int = 10
-
-    # phase parameterization (Design B): plan a fixed number of support points
-    # spaced by arc length; physical horizon is handled by the tracker at exec.
-    arc_length: bool = True  # resample action targets by arc length in training
-    position_dim: int = 0  # leading action dims used for arc length / inpainting
-    # (0 = all dims; e.g. 2 for particle xy, 3 for franka ee xyz)
 
     # classifier-free goal conditioning
     goal_dim: int = 2  # trailing obs dims holding the goal, 0 disables
@@ -106,9 +100,8 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list[int]:
-        # arc-length mode loads the full window to the goal, then resamples to
-        # `horizon` support points; legacy mode loads exactly `horizon` frames
-        return list(range(self.traj_steps if self.arc_length else self.horizon))
+        # load the full window to the goal, later resampled to `horizon` points
+        return list(range(self.traj_steps))
 
     @property
     def reward_delta_indices(self) -> None:
@@ -203,20 +196,16 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         return self.parameters()
 
     def reset(self):
-        self.chunk: Tensor | None = None
-        self.chunk_step = 0
+        pass
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         obs = batch[OBS_STATE]
-        x_1 = batch[ACTION]  # (B, H, act_dim)
-        pad = batch.get(f"{ACTION}_is_pad")
-        if self.config.arc_length:
-            # reparameterize the (padded, time-indexed) target into a fixed-length
-            # arc-length path from the current state to the goal; no padding after
-            x_1 = resample_arc_length(
-                x_1, pad, self.config.horizon, self.config.position_dim
-            )
-            pad = None
+        x_1 = resample_arc_length(
+            batch[ACTION],
+            batch.get(f"{ACTION}_is_pad"),
+            self.config.horizon,
+            self.config.position_dim,
+        )
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
@@ -226,13 +215,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 torch.rand(obs.shape[0], device=obs.device) < self.config.goal_dropout
             )
         v = self.model(x_t, t, obs, drop)
-        loss = F.mse_loss(v, x_1 - x_0, reduction="none").mean(-1)  # (B, H)
-
-        if pad is not None:
-            mask = (~pad).to(loss.dtype)
-            loss = (loss * mask).sum() / mask.sum().clamp(min=1.0)
-        else:
-            loss = loss.mean()
+        loss = F.mse_loss(v, x_1 - x_0)
         return loss, {"loss": loss.item()}
 
     @torch.no_grad()
@@ -257,9 +240,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             drop[n:] = True
         x = torch.randn(n, self.config.horizon, self.act_dim, device=obs.device)
 
-        # endpoint inpainting: pin the path ends to start/goal along the flow.
-        # x_t at the ends follows the straight noise->data interpolant, landing
-        # exactly on the known values at t=1.
+        # pin the ends along the noise->data interpolant: exact start/goal at t=1
         pin = None
         if inpaint is not None:
             p = inpaint["start"].shape[-1]
@@ -287,15 +268,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 x = pin(x, (i + 1) * dt)
         return x
 
-    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        """Return one action per call, replanning every n_action_steps frames."""
-        if self.chunk is None or self.chunk_step >= self.config.n_action_steps:
-            self.chunk = self.predict_action_chunk(batch, **kwargs)
-            self.chunk_step = 0
-        action = self.chunk[:, self.chunk_step]
-        self.chunk_step += 1
-        return action
+        # required by PreTrainedPolicy; rollout uses predict_action_chunk via Planner
+        raise NotImplementedError(
+            "Per-frame action API removed; roll out with "
+            "flow_planning.trajectory.Planner"
+        )
 
 
 def make_flow_matching_pre_post_processors(

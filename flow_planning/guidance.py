@@ -97,11 +97,10 @@ class ObstacleGuidance:
                 over = torch.relu(z_top + self.margin - pts[..., 2]) * band
                 cost = cost + over.square().sum()
 
-            cost = self.scale * cost
+            cost = self.scale * cost  # so `smooth` below is an absolute weight
 
             if self.smooth > 0.0:
-                # penalize discrete acceleration so neighbouring support points
-                # stay coupled and the detour rounds out instead of zigzagging
+                # couple neighbours so the detour rounds out instead of zigzagging
                 accel = pos[:, 2:] - 2 * pos[:, 1:-1] + pos[:, :-2]
                 cost = cost + self.smooth * accel.square().sum()
 
