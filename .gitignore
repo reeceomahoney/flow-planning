@@ -22,3 +22,4 @@ imgui.ini
 
 outputs/
 .envrc
+wandb/

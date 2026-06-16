@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 
 import wandb
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
+from flow_planning.guidance import GoalGuidance
 from flow_planning.paths import make_run_dir
 from flow_planning.policy import (
     FlowMatchingConfig,
@@ -29,7 +30,7 @@ from flow_planning.policy import (
 
 @dataclass
 class Config:
-    env: EnvConfig = field(default_factory=ParticleConfig)
+    env: EnvConfig = field(default_factory=lambda: ParticleConfig(task_time=8))
     repo_id: str = "reece-omahoney/particle"
     batch_size: int = 256
     num_iters: int = 50_000
@@ -39,6 +40,8 @@ class Config:
     out_dir: str = "outputs"
     eval_every: int = 10_000
     eval_episodes: int = 256
+    goal_scale: float = 8.0  # goal-distance attractor guidance for eval rollouts
+    goal_discount: float = 0.9  # weight decay toward earlier plan steps
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
@@ -143,6 +146,18 @@ def main(cfg: Config):
     policy = FlowMatchingPolicy(policy_cfg, dataset_stats=dataset.meta.stats).to(device)
     policy.model = cast(
         FlowTransformer, torch.compile(policy.model, mode="reduce-overhead")
+    )
+
+    # inference-time goal guidance for eval rollouts (unused by training forward)
+    stats = dataset.meta.stats
+    assert stats is not None
+    policy.guidance_fn = GoalGuidance(
+        obs_mean=stats[OBS_STATE]["mean"],
+        obs_std=stats[OBS_STATE]["std"],
+        goal_dim=policy_cfg.goal_dim,
+        scale=cfg.goal_scale,
+        device=device,
+        discount=cfg.goal_discount,
     )
 
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8

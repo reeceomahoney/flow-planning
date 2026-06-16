@@ -115,20 +115,20 @@ class FlowTransformer(nn.Module):
     """Velocity field v(x_t, t | obs) over a chunk of [state, action] steps.
 
     Each step token carries the full [pos, vel, action] vector and reads out its
-    per-step velocity. A single conditioning token holds the current observation
-    (state and goal together), fed whole rather than split across tokens or
-    inpainted. `attn_window` restricts each step token to a local neighbourhood
-    so the prior is closed under stitching.
+    per-step velocity. A single conditioning token holds the current state only
+    (goal-blind); the goal enters at sampling via value guidance. `attn_window`
+    restricts each step token to a local neighbourhood so the prior is closed
+    under stitching.
     """
 
     attn_mask: Tensor | None
 
-    def __init__(self, traj_dim: int, obs_dim: int, cfg: FlowMatchingConfig):
+    def __init__(self, traj_dim: int, state_dim: int, cfg: FlowMatchingConfig):
         super().__init__()
         d = cfg.dim_model
         self.horizon = cfg.horizon
         self.traj_in = nn.Linear(traj_dim, d)
-        self.cond_in = nn.Linear(obs_dim, d)  # current obs = [state, goal]
+        self.cond_in = nn.Linear(state_dim, d)  # current state only; goal via guidance
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
         n_tokens = self.horizon + 1
         self.pos_emb = nn.Parameter(torch.randn(n_tokens, d) * 0.02)
@@ -152,11 +152,11 @@ class FlowTransformer(nn.Module):
         else:
             self.attn_mask = None
 
-    def forward(self, x_t: Tensor, t: Tensor, obs: Tensor) -> Tensor:
-        # x_t: (B, H, traj_dim), t: (B,), obs: (B, obs_dim)
+    def forward(self, x_t: Tensor, t: Tensor, state: Tensor) -> Tensor:
+        # x_t: (B, H, traj_dim), t: (B,), state: (B, state_dim) current state
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
         a = self.traj_in(x_t) + temb[:, None]
-        c = self.cond_in(obs)[:, None] + temb[:, None]
+        c = self.cond_in(state)[:, None] + temb[:, None]
         tokens = torch.cat([a, c], dim=1) + self.pos_emb
         h = self.transformer(tokens, mask=self.attn_mask)
         return self.head(h[:, : self.horizon])
@@ -181,7 +181,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.state_dim = obs_dim - config.goal_dim
         self.traj_dim = self.state_dim + act_dim
 
-        self.model = FlowTransformer(self.traj_dim, obs_dim, config)
+        self.model = FlowTransformer(self.traj_dim, self.state_dim, config)
         self.guidance_fn = None  # optional obstacle cost, set before rollout
         self.reset()
 
@@ -203,7 +203,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
-        v = self.model(x_t, t, obs[:, 0])  # condition on the current obs
+        v = self.model(x_t, t, state[:, 0])  # condition on the current state
         # mask the padded tail (frames past the episode end)
         pad = batch.get(f"{ACTION}_is_pad")
         if pad is not None:
@@ -217,21 +217,23 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Flow-ODE integrate a [state, action] trajectory conditioned on the
-        current observation (state and goal), returning the (B, horizon, act_dim)
-        action chunk. `self.guidance_fn`, if set, maps the predicted clean
-        trajectory to a cost gradient subtracted from the velocity each step.
+        current state (goal-blind), returning the (B, horizon, act_dim) action
+        chunk. `self.guidance_fn`, if set, reads the goal from the full obs and
+        maps the predicted clean trajectory to a cost gradient subtracted from
+        the velocity each step.
         """
         self.eval()
         obs = batch[OBS_STATE]  # (B, obs_dim) current obs = [state, goal]
+        state = obs[:, : self.state_dim]
         n = obs.shape[0]
         x = torch.randn(n, self.config.horizon, self.traj_dim, device=obs.device)
 
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
             t = torch.full((n,), i * dt, device=x.device)
-            v = self.model(x, t, obs)
+            v = self.model(x, t, state)
             if self.guidance_fn is not None:
-                v = v - self.guidance_fn(x + (1 - i * dt) * v)
+                v = v - self.guidance_fn(x + (1 - i * dt) * v, obs)
             x = x + dt * v
         return x[..., self.state_dim :]  # normalized action dims
 
