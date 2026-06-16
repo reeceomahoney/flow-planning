@@ -30,9 +30,9 @@ class Config:
     repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    goal_scale: float = 8.0  # >0 enables goal-distance attractor guidance
+    goal_scale: float = 4.0  # >0 enables goal-distance attractor guidance
     goal_discount: float = 0.9  # weight decay toward earlier plan steps
-    guidance_scale: float = 50.0  # >0 enables obstacle guidance
+    guidance_scale: float = 150.0  # >0 enables obstacle guidance
     guidance_margin: float = 0.08
     guidance_smooth: float = 3.0  # smoothness weight (accel penalty); see sweep_smooth
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited

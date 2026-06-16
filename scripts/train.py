@@ -40,7 +40,7 @@ class Config:
     out_dir: str = "outputs"
     eval_every: int = 10_000
     eval_episodes: int = 256
-    goal_scale: float = 8.0  # goal-distance attractor guidance for eval rollouts
+    goal_scale: float = 4.0  # goal-distance attractor guidance for eval rollouts
     goal_discount: float = 0.9  # weight decay toward earlier plan steps
     log_every: int = 100
     wandb_project: str = "flow-planning"
