@@ -183,6 +183,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
         self.model = FlowTransformer(self.traj_dim, self.state_dim, config)
         self.guidance_fn = None  # optional obstacle cost, set before rollout
+        self.action_clip = None  # optional (low, high) normalized action bounds
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -235,7 +236,10 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             if self.guidance_fn is not None:
                 v = v - self.guidance_fn(x + (1 - i * dt) * v, obs)
             x = x + dt * v
-        return x[..., self.state_dim :]  # normalized action dims
+        acts = x[..., self.state_dim :]  # normalized action dims
+        if self.action_clip is not None:
+            acts = acts.clamp(self.action_clip[0], self.action_clip[1])
+        return acts
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:

@@ -84,6 +84,14 @@ def main(cfg: Config):
     if cfg.guidance_scale > 0:
         cfg.env.obstacle = True
     env = make_env(cfg.env, viewer)
+    arena = getattr(cfg.env, "arena_size", np.inf)
+    low = torch.as_tensor(
+        (-arena - act_mean) / act_std, dtype=torch.float32, device=device
+    )
+    high = torch.as_tensor(
+        (arena - act_mean) / act_std, dtype=torch.float32, device=device
+    )
+    policy.action_clip = (low, high)
 
     # compose inference-time guidance terms: goal attractor (+ obstacle cost)
     terms = []
@@ -122,12 +130,15 @@ def main(cfg: Config):
         policy.reset()
         env.reset()
         succ = np.zeros(n, dtype=bool)
+        acts = []
         frame = 0
         while frame < frames and viewer.is_running():
             if viewer.should_step():
                 obs = torch.from_numpy(env.get_obs())
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
-                env.apply_action(postprocessor(action).numpy().astype(np.float32))
+                phys = postprocessor(action).numpy().astype(np.float32)
+                acts.append(phys)
+                env.apply_action(phys)
                 if live and policy.last_chunk is not None:
                     path = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
                     env.set_predicted_path(path)
@@ -150,12 +161,15 @@ def main(cfg: Config):
                 f"goal dist median {np.median(goal_dist):.2f}, "
                 f"wrong side {(pos[:, 1] * goal[:, 1] < 0).mean():.2f}"
             )
+        a = np.stack(acts)  # (T, n, act_dim)
+        accel = np.linalg.norm(a[2:] - 2 * a[1:-1] + a[:-2], axis=-1)
         total_succ += int(succ.sum())
         total_fail += int(fail.sum())
         total += n
         print(
             f"batch {ep}: success {succ.mean():.3f} "
-            f"failure {fail.mean():.3f} timeout {(~succ & ~fail).mean():.3f}"
+            f"failure {fail.mean():.3f} timeout {(~succ & ~fail).mean():.3f} "
+            f"accel_p95 {np.percentile(accel, 95):.4f} "
         )
 
     if total:
