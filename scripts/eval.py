@@ -108,9 +108,8 @@ def main(cfg: Config):
                 obs = torch.from_numpy(env.get_obs())
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
                 env.apply_action(postprocessor(action).numpy().astype(np.float32))
-                if live and policy._action_queue:
-                    chunk = torch.stack(list(policy._action_queue), dim=1)
-                    path = chunk[0].cpu().numpy() * act_std + act_mean
+                if live and policy.last_chunk is not None:
+                    path = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
                     env.set_predicted_path(path)
                 frame += 1
                 succ |= env.success()

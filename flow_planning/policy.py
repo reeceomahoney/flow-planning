@@ -193,6 +193,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
     def reset(self):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self.last_chunk = None
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         # fixed-dt window: trajectory = [state, action] per step, both normalized
@@ -239,7 +240,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         """Return one action per call from the planned chunk, replanning when the
         queue empties (receding horizon)."""
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            self.last_chunk = self.predict_action_chunk(batch)  # full horizon
+            actions = self.last_chunk[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
