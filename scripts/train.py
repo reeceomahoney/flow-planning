@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 import wandb
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
-from flow_planning.guidance import GoalGuidance
+from flow_planning.guidance import GuidanceConfig, make_guidance
 from flow_planning.paths import make_run_dir
 from flow_planning.policy import (
     FlowMatchingConfig,
@@ -40,8 +40,9 @@ class Config:
     out_dir: str = "outputs"
     eval_every: int = 10_000
     eval_episodes: int = 256
-    goal_scale: float = 4.0  # goal-distance attractor guidance for eval rollouts
-    goal_discount: float = 0.9  # weight decay toward earlier plan steps
+    guidance: GuidanceConfig = field(
+        default_factory=lambda: GuidanceConfig(obstacle_scale=0.0)
+    )
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
@@ -148,17 +149,8 @@ def main(cfg: Config):
         FlowTransformer, torch.compile(policy.model, mode="reduce-overhead")
     )
 
-    # inference-time goal guidance for eval rollouts (unused by training forward)
     stats = dataset.meta.stats
     assert stats is not None
-    policy.guidance_fn = GoalGuidance(
-        obs_mean=stats[OBS_STATE]["mean"],
-        obs_std=stats[OBS_STATE]["std"],
-        goal_dim=policy_cfg.goal_dim,
-        scale=cfg.goal_scale,
-        device=device,
-        discount=cfg.goal_discount,
-    )
 
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
@@ -171,6 +163,11 @@ def main(cfg: Config):
     env = None
     if cfg.eval_every > 0:
         env = make_env(cfg.env, newton.viewer.ViewerNull())
+
+    # inference-time guidance for eval rollouts (unused by training forward)
+    policy.guidance_fn = make_guidance(
+        cfg.guidance, env, policy_cfg.goal_dim, stats[OBS_STATE], device
+    )
 
     loader = DataLoader(
         dataset,

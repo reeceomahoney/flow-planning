@@ -17,7 +17,6 @@ import warp as wp
 
 from flow_planning.envs.contact import ObstacleContactSensor
 from flow_planning.envs.env import EnvConfig
-from flow_planning.guidance import ObstacleGuidance
 
 wp.config.quiet = True
 
@@ -301,19 +300,14 @@ class ParticleEnv:
         return self.obstacle_sensor.read()
 
     # -------------------------------------------------------------- guidance
-    def make_guidance(self, action_mean, action_std, scale, margin, device, smooth=0.0):
-        """Cost gradient keeping planned xy targets clear of the obstacle."""
-        return ObstacleGuidance(
-            center=self.obstacle_box[:, :2],
-            half_extents=self.obstacle_box[:, 2:],
-            action_mean=action_mean,
-            action_std=action_std,
-            scale=scale,
-            margin=margin,
-            device=device,
-            around=True,
-            smooth=smooth,
-        )
+    @property
+    def obstacle_geometry(self):
+        """Per-world obstacle box and detour mode for ObstacleGuidance."""
+        return {
+            "center": self.obstacle_box[:, :2],
+            "half_extents": self.obstacle_box[:, 2:],
+            "around": True,
+        }
 
     # --------------------------------------------------------------- render
     def set_predicted_path(self, positions):

@@ -21,7 +21,6 @@ import warp as wp
 
 from flow_planning.envs.contact import ObstacleContactSensor
 from flow_planning.envs.env import EnvConfig
-from flow_planning.guidance import ObstacleGuidance
 from flow_planning.rotations import quat_to_rot6d, rot6d_to_quat
 
 wp.config.quiet = True
@@ -531,23 +530,18 @@ class FrankaEnv:
         return self.obstacle_sensor.read()
 
     # -------------------------------------------------------------- guidance
-    def make_guidance(self, action_mean, action_std, scale, margin, device, smooth=0.0):
-        """Cost gradient keeping planned EE positions clear of the obstacle."""
-        return ObstacleGuidance(
-            center=list(self.obstacle_center),
-            half_extents=[
+    @property
+    def obstacle_geometry(self):
+        """Obstacle box and detour mode for ObstacleGuidance."""
+        return {
+            "center": list(self.obstacle_center),
+            "half_extents": [
                 self.cfg.obstacle_width,
                 self.cfg.obstacle_thickness,
                 0.5 * self.cfg.obstacle_height,
             ],
-            action_mean=action_mean,
-            action_std=action_std,
-            scale=scale,
-            margin=margin,
-            device=device,
-            over_top=True,
-            smooth=smooth,
-        )
+            "over_top": True,
+        }
 
     # --------------------------------------------------------------- render
     def render(self):

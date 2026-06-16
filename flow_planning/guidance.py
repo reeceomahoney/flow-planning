@@ -1,7 +1,18 @@
 """Inference-time cost guidance for the flow-matching policy."""
 
+from dataclasses import dataclass
+
 import torch
 from torch import Tensor
+
+
+@dataclass
+class GuidanceConfig:
+    goal_scale: float = 4.0  # >0 enables goal-distance attractor guidance
+    goal_discount: float = 0.9  # weight decay toward earlier plan steps
+    obstacle_scale: float = 100.0  # >0 enables obstacle-avoidance guidance
+    obstacle_margin: float = 0.08
+    smooth_scale: float = 0.0  # >0 adds a plan acceleration penalty (smoothness)
 
 
 def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
@@ -10,6 +21,22 @@ def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
     outside = q.clamp(min=0.0).norm(dim=-1)
     inside = q.amax(dim=-1).clamp(max=0.0)
     return outside + inside
+
+
+class SmoothGuidance:
+    """Acceleration penalty over the planned trajectory, for smoother paths and
+    actions. Composes with the goal/obstacle terms via the same gradient sum."""
+
+    def __init__(self, scale):
+        self.scale = scale
+
+    def __call__(self, x1_hat: Tensor, obs: Tensor) -> Tensor:
+        with torch.enable_grad():
+            x = x1_hat.detach().requires_grad_(True)
+            accel = x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]
+            cost = self.scale * accel.square().sum()
+            (grad,) = torch.autograd.grad(cost, x)
+        return grad
 
 
 class GoalGuidance:
@@ -73,7 +100,6 @@ class ObstacleGuidance:
         device: str,
         around: bool = False,
         over_top: bool = False,
-        smooth: float = 0.0,
         interp: int = 4,
     ):
         kw = {"dtype": torch.float32, "device": device}
@@ -89,7 +115,6 @@ class ObstacleGuidance:
         self.margin = margin
         self.around = around
         self.over_top = over_top
-        self.smooth = smooth
         self.interp = interp
 
     def path_points(self, pos: Tensor) -> Tensor:
@@ -132,12 +157,42 @@ class ObstacleGuidance:
                 over = torch.relu(z_top + self.margin - pts[..., 2]) * band
                 cost = cost + over.square().sum()
 
-            cost = self.scale * cost  # so `smooth` below is an absolute weight
-
-            if self.smooth > 0.0:
-                # couple neighbours so the detour rounds out instead of zigzagging
-                accel = pos[:, 2:] - 2 * pos[:, 1:-1] + pos[:, :-2]
-                cost = cost + self.smooth * accel.square().sum()
-
+            cost = self.scale * cost
             (grad,) = torch.autograd.grad(cost, x)
         return grad
+
+
+def make_guidance(cfg: GuidanceConfig, env, goal_dim, obs_stats, device):
+    """Compose the enabled guidance terms into a single gradient function.
+
+    `obs_stats` is the observation `{"mean", "std"}`; `env` supplies the
+    obstacle geometry. Returns None when no term is enabled.
+    """
+    terms = []
+    if cfg.goal_scale > 0:
+        terms.append(
+            GoalGuidance(
+                obs_mean=obs_stats["mean"],
+                obs_std=obs_stats["std"],
+                goal_dim=goal_dim,
+                scale=cfg.goal_scale,
+                device=device,
+                discount=cfg.goal_discount,
+            )
+        )
+    if cfg.obstacle_scale > 0:
+        terms.append(
+            ObstacleGuidance(
+                **env.obstacle_geometry,
+                action_mean=obs_stats["mean"],
+                action_std=obs_stats["std"],
+                scale=cfg.obstacle_scale,
+                margin=cfg.obstacle_margin,
+                device=device,
+            )
+        )
+    if cfg.smooth_scale > 0:
+        terms.append(SmoothGuidance(scale=cfg.smooth_scale))
+    if not terms:
+        return None
+    return lambda x1, obs: sum(g(x1, obs) for g in terms)

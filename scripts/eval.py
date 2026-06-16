@@ -12,7 +12,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
-from flow_planning.guidance import GoalGuidance
+from flow_planning.guidance import GuidanceConfig, make_guidance
 from flow_planning.paths import latest_run_dir
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -30,11 +30,7 @@ class Config:
     repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    goal_scale: float = 4.0  # >0 enables goal-distance attractor guidance
-    goal_discount: float = 0.9  # weight decay toward earlier plan steps
-    guidance_scale: float = 150.0  # >0 enables obstacle guidance
-    guidance_margin: float = 0.08
-    guidance_smooth: float = 3.0  # smoothness weight (accel penalty); see sweep_smooth
+    guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
     viewer: str = "none"  # "none", "rerun", or "opengl"
@@ -81,7 +77,7 @@ def main(cfg: Config):
     live = cfg.viewer != "none"
     viewer = make_viewer(cfg.viewer)
 
-    if cfg.guidance_scale > 0:
+    if cfg.guidance.obstacle_scale > 0:
         cfg.env.obstacle = True
     env = make_env(cfg.env, viewer)
     arena = getattr(cfg.env, "arena_size", np.inf)
@@ -93,32 +89,9 @@ def main(cfg: Config):
     )
     policy.action_clip = (low, high)
 
-    # compose inference-time guidance terms: goal attractor (+ obstacle cost)
-    terms = []
-    if cfg.goal_scale > 0:
-        terms.append(
-            GoalGuidance(
-                obs_mean=stats[OBS_STATE]["mean"],
-                obs_std=stats[OBS_STATE]["std"],
-                goal_dim=policy.config.goal_dim,
-                scale=cfg.goal_scale,
-                device=device,
-                discount=cfg.goal_discount,
-            )
-        )
-    if cfg.guidance_scale > 0:
-        terms.append(
-            env.make_guidance(
-                action_mean=stats[OBS_STATE]["mean"],
-                action_std=stats[OBS_STATE]["std"],
-                scale=cfg.guidance_scale,
-                margin=cfg.guidance_margin,
-                device=device,
-                smooth=cfg.guidance_smooth,
-            )
-        )
-    if terms:
-        policy.guidance_fn = lambda x1, obs: sum(g(x1, obs) for g in terms)
+    policy.guidance_fn = make_guidance(
+        cfg.guidance, env, policy.config.goal_dim, stats[OBS_STATE], device
+    )
 
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
