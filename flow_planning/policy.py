@@ -57,7 +57,7 @@ class FlowMatchingConfig(PreTrainedConfig):
     dim_model: int = 128
     n_layers: int = 4
     n_heads: int = 4
-    attn_window: int = 0  # local attention half-width over step tokens; 0 = global
+    attn_window: int = 5  # local attention half-width over step tokens; 0 = global
 
     # flow matching
     num_inference_steps: int = 10
@@ -142,12 +142,12 @@ class FlowTransformer(nn.Module):
         self.head = nn.Linear(d, traj_dim)
 
         # local attention: each step token sees only +/-attn_window neighbours;
-        # the conditioning token (last) stays globally visible
+        # the conditioning token (first) stays globally visible
         if cfg.attn_window > 0:
             i = torch.arange(self.horizon)
             band = (i[:, None] - i[None, :]).abs() > cfg.attn_window
             mask = torch.zeros(n_tokens, n_tokens, dtype=torch.bool)
-            mask[: self.horizon, : self.horizon] = band
+            mask[1:, 1:] = band
             self.register_buffer("attn_mask", mask, persistent=False)
         else:
             self.attn_mask = None
@@ -157,9 +157,9 @@ class FlowTransformer(nn.Module):
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
         a = self.traj_in(x_t) + temb[:, None]
         c = self.cond_in(state)[:, None] + temb[:, None]
-        tokens = torch.cat([a, c], dim=1) + self.pos_emb
+        tokens = torch.cat([c, a], dim=1) + self.pos_emb  # obs token leads
         h = self.transformer(tokens, mask=self.attn_mask)
-        return self.head(h[:, : self.horizon])
+        return self.head(h[:, 1:])
 
 
 class FlowMatchingPolicy(PreTrainedPolicy):
