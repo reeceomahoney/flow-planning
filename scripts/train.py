@@ -10,13 +10,13 @@ import draccus
 import newton.viewer
 import numpy as np
 import torch
-import wandb
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import OBS_STATE
 from torch.utils.data import DataLoader
 
+import wandb
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.paths import make_run_dir
 from flow_planning.policy import (
@@ -39,10 +39,6 @@ class Config:
     out_dir: str = "outputs"
     eval_every: int = 10_000
     eval_episodes: int = 256
-    replan_every: int = 10  # frames between replans during eval rollout
-    lookahead: float = 0.15  # pure-pursuit lookahead (physical units)
-    inpaint: bool = True  # pin plan endpoints during eval rollout
-    attn_window: int = 0  # local attention half-width over action tokens; 0 = global
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
@@ -135,16 +131,12 @@ def main(cfg: Config):
     policy_cfg = FlowMatchingConfig(
         input_features=input_features, output_features=output_features, device=device
     )
-    # window every sample to the episode end so each plan spans start -> goal
-    policy_cfg.traj_steps = int(max(dataset.meta.episodes["length"]))
-    policy_cfg.lookahead = cfg.lookahead
-    policy_cfg.replan_every = cfg.replan_every
-    policy_cfg.inpaint = cfg.inpaint
-    policy_cfg.attn_window = cfg.attn_window
-    print(f"traj_steps (max episode length): {policy_cfg.traj_steps}")
 
     delta_timestamps = {
-        "action": [i / dataset.fps for i in policy_cfg.action_delta_indices]
+        "action": [i / dataset.fps for i in policy_cfg.action_delta_indices],
+        "observation.state": [
+            i / dataset.fps for i in policy_cfg.observation_delta_indices
+        ],
     }
     dataset = LeRobotDataset(cfg.repo_id, delta_timestamps=delta_timestamps)
 

@@ -9,7 +9,7 @@ import newton.viewer
 import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.paths import latest_run_dir
@@ -34,9 +34,6 @@ class Config:
     guidance_smooth: float = 3.0  # smoothness weight (accel penalty); see sweep_smooth
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
-    replan_every: int = 10  # frames between replans (receding horizon)
-    lookahead: float = 0.15  # pure-pursuit lookahead distance (physical units)
-    inpaint: bool = True  # pin the plan endpoints to current state and goal
     viewer: str = "none"  # "none", "rerun", or "opengl"
     seed: int = 0
 
@@ -66,16 +63,17 @@ def main(cfg: Config):
     policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
     policy.to(device)
-    policy.config.lookahead = cfg.lookahead
-    policy.config.replan_every = cfg.replan_every
-    policy.config.inpaint = cfg.inpaint
 
-    stats = LeRobotDataset(cfg.repo_id).meta.stats
+    dataset = LeRobotDataset(cfg.repo_id)
+    stats = dataset.meta.stats
     assert stats is not None
-    policy.load_stats(stats)
     preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy.config, dataset_stats=stats
     )
+
+    # action stats for unnormalizing the planned path when visualizing
+    act_mean = np.asarray(stats[ACTION]["mean"])
+    act_std = np.asarray(stats[ACTION]["std"])
 
     live = cfg.viewer != "none"
     viewer = make_viewer(cfg.viewer)
@@ -86,8 +84,8 @@ def main(cfg: Config):
 
     if cfg.guidance_scale > 0:
         policy.guidance_fn = env.make_guidance(
-            action_mean=stats["action"]["mean"],
-            action_std=stats["action"]["std"],
+            action_mean=stats[OBS_STATE]["mean"],
+            action_std=stats[OBS_STATE]["std"],
             scale=cfg.guidance_scale,
             margin=cfg.guidance_margin,
             device=device,
@@ -110,10 +108,10 @@ def main(cfg: Config):
                 obs = torch.from_numpy(env.get_obs())
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
                 env.apply_action(postprocessor(action).numpy().astype(np.float32))
-                if live:
-                    # visualize the current plan (world 0)
-                    assert policy.tracker.plan is not None
-                    env.set_predicted_path(policy.tracker.plan[0].cpu().numpy())
+                if live and policy._action_queue:
+                    chunk = torch.stack(list(policy._action_queue), dim=1)
+                    path = chunk[0].cpu().numpy() * act_std + act_mean
+                    env.set_predicted_path(path)
                 frame += 1
                 succ |= env.success()
                 if (succ | env.failure()).all():

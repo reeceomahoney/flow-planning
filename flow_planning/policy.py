@@ -3,11 +3,12 @@
 Outer normalization is handled by the processor pipeline (see
 `make_flow_matching_pre_post_processors`), so `forward` and `predict_action_chunk`
 operate on already-normalized tensors. `select_action` follows the standard
-lerobot API: it plans a chunk and pure-pursuit-tracks it one action per call,
-using stat buffers only to bridge the obs and action normalization frames.
+lerobot API: it plans a [state, action] chunk and executes the action dims one
+step per call, replanning every `replan_every` steps (receding horizon).
 """
 
 import math
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -41,37 +42,25 @@ from lerobot.utils.constants import (
 )
 from torch import Tensor
 
-from flow_planning.trajectory import PathTracker, resample_arc_length
-
 
 @PreTrainedConfig.register_subclass("flow_matching")
 @dataclass
 class FlowMatchingConfig(PreTrainedConfig):
     """Config for the flow-matching transformer policy."""
 
-    n_obs_steps: int = 1
-
-    horizon: int = 32  # support points per plan (plan resolution N)
-    traj_steps: int = 0  # data window in frames; train.py auto-sets to max ep length
-    position_dim: int = 0  # leading action dims for arc length/inpainting; 0 = all
-    obs_pos_start: int = 0  # index of the current position within the observation
-
-    # rollout (select_action): replan, inpaint endpoints, pure-pursuit track
-    lookahead: float = 0.15  # pursuit lookahead in physical units
-    replan_every: int = 10  # frames between replans
-    inpaint: bool = True  # pin plan endpoints to current state and goal
+    # dimensions
+    horizon: int = 50
+    n_action_steps: int = 10
+    goal_dim: int = 2  # trailing obs dims holding the goal, 0 disables
 
     # architecture
     dim_model: int = 128
     n_layers: int = 4
     n_heads: int = 4
+    attn_window: int = 0  # local attention half-width over step tokens; 0 = global
 
     # flow matching
     num_inference_steps: int = 10
-
-    # the goal enters only via endpoint inpainting; these dims locate it in the obs
-    goal_dim: int = 2  # trailing obs dims holding the goal, 0 disables
-    attn_window: int = 0  # local attention half-width over action tokens; 0 = global
 
     # training
     optimizer_lr: float = 1e-4
@@ -101,13 +90,12 @@ class FlowMatchingConfig(PreTrainedConfig):
             raise ValueError("Flow matching policy requires an action output.")
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list[int]:
+        return list(range(self.horizon))
 
     @property
     def action_delta_indices(self) -> list[int]:
-        # load the full window to the goal, later resampled to `horizon` points
-        return list(range(self.traj_steps))
+        return list(range(self.horizon))
 
     @property
     def reward_delta_indices(self) -> None:
@@ -124,25 +112,25 @@ def sinusoidal_embedding(t: Tensor, dim: int) -> Tensor:
 
 
 class FlowTransformer(nn.Module):
-    """Velocity field v(x_t, t | obs) over a chunk of normalized actions.
+    """Velocity field v(x_t, t | obs) over a chunk of [state, action] steps.
 
-    The `horizon` noisy-action tokens and the state token, each fused with a
-    time embedding, attend to each other; the action tokens read out the
-    per-step velocity. There is no goal token: the goal enters only via
-    endpoint inpainting, and `attn_window` restricts each action token to a
-    local neighbourhood so the prior is closed under stitching.
+    Each step token carries the full [pos, vel, action] vector and reads out its
+    per-step velocity. A single conditioning token holds the current observation
+    (state and goal together), fed whole rather than split across tokens or
+    inpainted. `attn_window` restricts each step token to a local neighbourhood
+    so the prior is closed under stitching.
     """
 
-    def __init__(self, obs_dim: int, act_dim: int, cfg: FlowMatchingConfig):
+    attn_mask: Tensor | None
+
+    def __init__(self, traj_dim: int, obs_dim: int, cfg: FlowMatchingConfig):
         super().__init__()
         d = cfg.dim_model
         self.horizon = cfg.horizon
-        self.goal_dim = cfg.goal_dim
-        self.act_in = nn.Linear(act_dim, d)
-        # the state token never sees the goal value; the goal enters via inpainting
-        self.obs_in = nn.Linear(obs_dim - self.goal_dim, d)
-        n_tokens = self.horizon + 1
+        self.traj_in = nn.Linear(traj_dim, d)
+        self.cond_in = nn.Linear(obs_dim, d)  # current obs = [state, goal]
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
+        n_tokens = self.horizon + 1
         self.pos_emb = nn.Parameter(torch.randn(n_tokens, d) * 0.02)
 
         layer = nn.TransformerEncoderLayer(
@@ -151,10 +139,10 @@ class FlowTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(
             layer, cfg.n_layers, enable_nested_tensor=False
         )
-        self.head = nn.Linear(d, act_dim)
+        self.head = nn.Linear(d, traj_dim)
 
-        # local attention: each action token attends only +/-attn_window neighbours;
-        # the state/goal tokens stay global. A local prior is closed under stitching.
+        # local attention: each step token sees only +/-attn_window neighbours;
+        # the conditioning token (last) stays globally visible
         if cfg.attn_window > 0:
             i = torch.arange(self.horizon)
             band = (i[:, None] - i[None, :]).abs() > cfg.attn_window
@@ -165,12 +153,11 @@ class FlowTransformer(nn.Module):
             self.attn_mask = None
 
     def forward(self, x_t: Tensor, t: Tensor, obs: Tensor) -> Tensor:
-        # x_t: (B, H, act_dim), t: (B,), obs: (B, obs_dim)
+        # x_t: (B, H, traj_dim), t: (B,), obs: (B, obs_dim)
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
-        a = self.act_in(x_t) + temb[:, None]
-        state = obs[:, : -self.goal_dim] if self.goal_dim > 0 else obs
-        o = self.obs_in(state)[:, None] + temb[:, None]
-        tokens = torch.cat([a, o], dim=1) + self.pos_emb
+        a = self.traj_in(x_t) + temb[:, None]
+        c = self.cond_in(obs)[:, None] + temb[:, None]
+        tokens = torch.cat([a, c], dim=1) + self.pos_emb
         h = self.transformer(tokens, mask=self.attn_mask)
         return self.head(h[:, : self.horizon])
 
@@ -179,10 +166,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     config_class = FlowMatchingConfig
     name = "flow_matching"
     config: FlowMatchingConfig
-    obs_mean: Tensor
-    obs_std: Tensor
-    action_mean: Tensor
-    action_std: Tensor
 
     def __init__(self, config: FlowMatchingConfig, dataset_stats=None, **kwargs):
         super().__init__(config)
@@ -194,21 +177,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         obs_dim = config.robot_state_feature.shape[0]
         act_dim = config.action_feature.shape[0]
         self.act_dim = act_dim
-        self.pos_dim = config.position_dim or act_dim
+        # trajectory = [state, action] per step; state is the non-goal obs (pos+vel)
+        self.state_dim = obs_dim - config.goal_dim
+        self.traj_dim = self.state_dim + act_dim
 
-        self.model = FlowTransformer(obs_dim, act_dim, config)
-
-        # stats bridge the obs and action normalization frames inside
-        # select_action; not persisted (reloaded from the dataset at eval)
-        self.register_buffer("obs_mean", torch.zeros(obs_dim), persistent=False)
-        self.register_buffer("obs_std", torch.ones(obs_dim), persistent=False)
-        self.register_buffer("action_mean", torch.zeros(act_dim), persistent=False)
-        self.register_buffer("action_std", torch.ones(act_dim), persistent=False)
-        if dataset_stats is not None:
-            self.load_stats(dataset_stats)
-
+        self.model = FlowTransformer(self.traj_dim, obs_dim, config)
         self.guidance_fn = None  # optional obstacle cost, set before rollout
-        self.tracker = PathTracker(self.pos_dim, config.lookahead)
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -217,104 +191,57 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> Iterator[nn.Parameter]:  # ty: ignore[invalid-method-override]
         return self.parameters()
 
-    def load_stats(self, stats: dict[str, Any]) -> None:
-        def to_buf(v):
-            return torch.as_tensor(v, dtype=torch.float32, device=self.obs_mean.device)
-
-        self.obs_mean.copy_(to_buf(stats[OBS_STATE]["mean"]))
-        self.obs_std.copy_(to_buf(stats[OBS_STATE]["std"]))
-        self.action_mean.copy_(to_buf(stats[ACTION]["mean"]))
-        self.action_std.copy_(to_buf(stats[ACTION]["std"]))
-
     def reset(self):
-        self.step = 0
-        self.tracker.plan = None
+        self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        obs = batch[OBS_STATE]
-        x_1 = resample_arc_length(
-            batch[ACTION],
-            batch.get(f"{ACTION}_is_pad"),
-            self.config.horizon,
-            self.config.position_dim,
-        )
+        # fixed-dt window: trajectory = [state, action] per step, both normalized
+        obs = batch[OBS_STATE]  # (B, H, obs_dim)
+        state = obs[..., : self.state_dim]
+        x_1 = torch.cat([state, batch[ACTION]], dim=-1)
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
-        v = self.model(x_t, t, obs)
-        loss = F.mse_loss(v, x_1 - x_0)
+        v = self.model(x_t, t, obs[:, 0])  # condition on the current obs
+        # mask the padded tail (frames past the episode end)
+        pad = batch.get(f"{ACTION}_is_pad")
+        if pad is not None:
+            keep = (~pad)[..., None]
+            n = keep.sum().clamp(min=1) * self.traj_dim
+            loss = (((v - (x_1 - x_0)) * keep) ** 2).sum() / n
+        else:
+            loss = F.mse_loss(v, x_1 - x_0)
         return loss, {"loss": loss.item()}
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        """Flow-ODE integrate a full (B, horizon, act_dim) action chunk.
-
-        `guidance_fn`, if given, maps the predicted clean chunk to a cost
-        gradient that is subtracted from the velocity at each step.
+        """Flow-ODE integrate a [state, action] trajectory conditioned on the
+        current observation (state and goal), returning the (B, horizon, act_dim)
+        action chunk. `self.guidance_fn`, if set, maps the predicted clean
+        trajectory to a cost gradient subtracted from the velocity each step.
         """
-        guidance_fn = kwargs.get("guidance_fn")
-        inpaint = kwargs.get("inpaint")  # {"start": (n,p), "goal": (n,p)} normalized
         self.eval()
-        obs = batch[OBS_STATE]
+        obs = batch[OBS_STATE]  # (B, obs_dim) current obs = [state, goal]
         n = obs.shape[0]
-        x = torch.randn(n, self.config.horizon, self.act_dim, device=obs.device)
-
-        # pin the ends along the noise->data interpolant: exact start/goal at t=1
-        pin = None
-        if inpaint is not None:
-            p = inpaint["start"].shape[-1]
-            z0, z1 = x[:, 0, :p].clone(), x[:, -1, :p].clone()
-
-            def pin(x: Tensor, t: float) -> Tensor:
-                x[:, 0, :p] = (1 - t) * z0 + t * inpaint["start"]
-                x[:, -1, :p] = (1 - t) * z1 + t * inpaint["goal"]
-                return x
-
-            x = pin(x, 0.0)
+        x = torch.randn(n, self.config.horizon, self.traj_dim, device=obs.device)
 
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
-            t = torch.full((n,), i * dt, device=obs.device)
+            t = torch.full((n,), i * dt, device=x.device)
             v = self.model(x, t, obs)
-            if guidance_fn is not None:
-                v = v - guidance_fn(x + (1 - i * dt) * v)
+            if self.guidance_fn is not None:
+                v = v - self.guidance_fn(x + (1 - i * dt) * v)
             x = x + dt * v
-            if pin is not None:
-                x = pin(x, (i + 1) * dt)
-        return x
-
-    def physical_slice(self, obs: Tensor, lo: int, n: int) -> Tensor:
-        """Unnormalize obs[:, lo:lo+n] back to physical units."""
-        sl = slice(lo, lo + n)
-        return obs[:, sl] * self.obs_std[sl] + self.obs_mean[sl]
-
-    @torch.no_grad()
-    def replan(self, obs: Tensor) -> None:
-        inpaint = None
-        if self.config.inpaint:
-            p, g = self.pos_dim, self.config.goal_dim
-            start = self.physical_slice(obs, self.config.obs_pos_start, p)
-            goal = self.physical_slice(obs, obs.shape[-1] - g, g)
-            inpaint = {
-                "start": (start - self.action_mean[:p]) / self.action_std[:p],
-                "goal": (goal - self.action_mean[:g]) / self.action_std[:g],
-            }
-        plan = self.predict_action_chunk(
-            {OBS_STATE: obs}, inpaint=inpaint, guidance_fn=self.guidance_fn
-        )
-        self.tracker.set_plan(plan * self.action_std + self.action_mean)
+        return x[..., self.state_dim :]  # normalized action dims
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        """Plan + pure-pursuit one action per call, replanning periodically."""
-        obs = batch[OBS_STATE]
-        if self.tracker.plan is None or self.step % self.config.replan_every == 0:
-            self.replan(obs)
-        self.step += 1
-        self.tracker.lookahead = self.config.lookahead
-        pos = self.physical_slice(obs, self.config.obs_pos_start, self.pos_dim)
-        target = self.tracker.target(pos)  # physical action
-        return (target - self.action_mean) / self.action_std
+        """Return one action per call from the planned chunk, replanning when the
+        queue empties (receding horizon)."""
+        if len(self._action_queue) == 0:
+            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            self._action_queue.extend(actions.transpose(0, 1))
+        return self._action_queue.popleft()
 
 
 def make_flow_matching_pre_post_processors(
