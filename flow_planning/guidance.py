@@ -141,7 +141,7 @@ class ObstacleGuidance:
                 # one detour side per path, else points dither around x=0
                 xrel = (pts[..., 0] - self.center[..., 0]).detach()
                 side = torch.sign((xrel * band).sum(-1, keepdim=True))
-                side = torch.where(side == 0, torch.ones_like(side), side)
+                side[side == 0] = 1.0
                 out = torch.relu(
                     self.half_extents[..., 0]
                     + self.margin

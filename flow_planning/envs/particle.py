@@ -16,7 +16,7 @@ import numpy as np
 import warp as wp
 
 from flow_planning.envs.contact import ObstacleContactSensor
-from flow_planning.envs.env import EnvConfig
+from flow_planning.envs.env import EnvConfig, world_offset
 
 wp.config.quiet = True
 
@@ -340,8 +340,7 @@ class ParticleEnv:
         wp.synchronize()
 
     def log_goal(self):
-        offsets = getattr(self.viewer, "world_offsets", None)
-        off = offsets.numpy() if offsets is not None else 0.0
+        off = world_offset(self.viewer)
         n = len(self.goal_pos)
         z = np.full((n, 1), self.cfg.ball_radius, np.float32)
         goal = np.concatenate([self.goal_pos, z], axis=1) + off
@@ -354,8 +353,7 @@ class ParticleEnv:
     def log_predicted_path(self):
         if self.predicted_path is None:
             return
-        offsets = getattr(self.viewer, "world_offsets", None)
-        off = offsets.numpy()[0] if offsets is not None else 0.0
+        off = world_offset(self.viewer, first=True)
         pts = (self.predicted_path + off).astype(np.float32)
         n = len(pts)
         radii = wp.full(n, 0.01, dtype=wp.float32)

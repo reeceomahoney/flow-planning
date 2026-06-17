@@ -149,7 +149,7 @@ def main(cfg: Config):
         total += n
         print(
             f"batch {ep}: success {succ.mean():.3f} "
-            f"failure {fail.mean():.3f} timeout {(~succ & ~fail).mean():.3f} "
+            f"failure {fail.mean():.3f} timeout {stuck.mean():.3f} "
             f"accel_p95 {accel_p95:.4f} "
         )
 

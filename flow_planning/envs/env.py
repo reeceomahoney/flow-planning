@@ -16,6 +16,13 @@ class EnvConfig(draccus.ChoiceRegistry):
         return self.get_choice_name(self.__class__)
 
 
+def world_offset(viewer, first=False):
+    o = getattr(viewer, "world_offsets", None)
+    if o is None:
+        return 0.0
+    return o.numpy()[0] if first else o.numpy()
+
+
 def make_env(cfg: EnvConfig, viewer):
     from flow_planning.envs.franka import FrankaConfig, FrankaEnv
     from flow_planning.envs.particle import ParticleConfig, ParticleEnv

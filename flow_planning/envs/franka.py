@@ -20,7 +20,7 @@ import numpy as np
 import warp as wp
 
 from flow_planning.envs.contact import ObstacleContactSensor
-from flow_planning.envs.env import EnvConfig
+from flow_planning.envs.env import EnvConfig, world_offset
 from flow_planning.rotations import quat_to_rot6d, rot6d_to_quat
 
 wp.config.quiet = True
@@ -251,14 +251,12 @@ class FrankaEnv:
         builder.joint_armature[:9] = [0.3] * 4 + [0.11] * 3 + [0.15] * 2
 
         # gravity compensation so position control tracks tightly
-        gravcomp_dof = builder.custom_attributes["mujoco:jnt_actgravcomp"]
-        gravcomp_dof.values = gravcomp_dof.values or {}
-        for dof in range(7):
-            gravcomp_dof.values[dof] = True
-        gravcomp_body = builder.custom_attributes["mujoco:gravcomp"]
-        gravcomp_body.values = gravcomp_body.values or {}
-        for body in range(2, 14):
-            gravcomp_body.values[body] = 1.0
+        builder.custom_attributes["mujoco:jnt_actgravcomp"].values = {
+            dof: True for dof in range(7)
+        }
+        builder.custom_attributes["mujoco:gravcomp"].values = {
+            body: 1.0 for body in range(2, 14)
+        }
 
         shape_cfg = newton.ModelBuilder.ShapeConfig(margin=0.0, density=1000.0)
         shape_cfg.ke, shape_cfg.kd, shape_cfg.kf, shape_cfg.mu = 5e4, 5e2, 1e3, 0.75
@@ -476,8 +474,8 @@ class FrankaEnv:
         n = self.cfg.world_count
         a = np.ascontiguousarray(np.asarray(ee_action, np.float32).reshape(n, 10))
         pos = np.ascontiguousarray(a[:, :3])
-        quat = np.ascontiguousarray(rot6d_to_quat(a[:, 3:9]))
-        fingers = np.ascontiguousarray(np.repeat(a[:, 9:10], 2, axis=1))
+        quat = rot6d_to_quat(a[:, 3:9])
+        fingers = np.repeat(a[:, 9:10], 2, axis=1)
 
         wp.copy(self.ee_pos_target, wp.array(pos, dtype=wp.vec3))
         wp.copy(self.ee_rot_target, wp.array(quat, dtype=wp.vec4))
@@ -554,8 +552,7 @@ class FrankaEnv:
         wp.synchronize()
 
     def log_goal(self):
-        offsets = getattr(self.viewer, "world_offsets", None)
-        off = offsets.numpy() if offsets is not None else 0.0
+        off = world_offset(self.viewer)
         n = len(self.goal_pos)
         goal = wp.array((self.goal_pos + off).astype(np.float32), dtype=wp.vec3)
         radii = wp.full(n, 0.02, dtype=wp.float32)
@@ -565,8 +562,7 @@ class FrankaEnv:
     def log_predicted_ee(self):
         if self.predicted_ee is None:
             return
-        offsets = getattr(self.viewer, "world_offsets", None)
-        off = offsets.numpy()[0] if offsets is not None else 0.0
+        off = world_offset(self.viewer, first=True)
         pts = (self.predicted_ee + off).astype(np.float32)
         n = len(pts)
         radii = wp.full(n, 0.01, dtype=wp.float32)
