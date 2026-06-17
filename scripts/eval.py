@@ -136,13 +136,14 @@ def main(cfg: Config):
             )
         a = np.stack(acts)  # (T, n, act_dim)
         accel = np.linalg.norm(a[2:] - 2 * a[1:-1] + a[:-2], axis=-1)
+        accel_p95 = np.percentile(accel, 95) if accel.size else float("nan")
         total_succ += int(succ.sum())
         total_fail += int(fail.sum())
         total += n
         print(
             f"batch {ep}: success {succ.mean():.3f} "
             f"failure {fail.mean():.3f} timeout {(~succ & ~fail).mean():.3f} "
-            f"accel_p95 {np.percentile(accel, 95):.4f} "
+            f"accel_p95 {accel_p95:.4f} "
         )
 
     if total:
