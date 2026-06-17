@@ -25,7 +25,6 @@ from flow_planning.policy import (
     FlowMatchingPolicy,
     FlowTransformer,
     make_flow_matching_pre_post_processors,
-    mirror_goal_stats,
 )
 
 
@@ -41,7 +40,6 @@ class Config:
     out_dir: str = "outputs"
     eval_every: int = 10_000
     eval_episodes: int = 256
-    # all guidance off: goal reaching is handled by classifier-free guidance
     guidance: GuidanceConfig = field(
         default_factory=lambda: GuidanceConfig(
             goal_scale=0.0, obstacle_scale=0.0, smooth_scale=0.0
@@ -139,8 +137,9 @@ def main(cfg: Config):
     policy_cfg = FlowMatchingConfig(
         input_features=input_features, output_features=output_features, device=device
     )
-    # goal frame delta must reach the end of the longest episode from any start
-    policy_cfg.goal_offset = max(dataset.meta.episodes["length"])
+    # plan the full trajectory: horizon spans the longest episode; shorter
+    # episodes pad their tail with the goal frame (absorbing).
+    policy_cfg.horizon = max(dataset.meta.episodes["length"])
 
     delta_timestamps = {
         "action": [i / dataset.fps for i in policy_cfg.action_delta_indices],
@@ -151,8 +150,6 @@ def main(cfg: Config):
     dataset = LeRobotDataset(cfg.repo_id, delta_timestamps=delta_timestamps)
     stats = dataset.meta.stats
     assert stats is not None
-    # goal conditioning shares the position normalization frame
-    mirror_goal_stats(stats, policy_cfg.goal_dim)
 
     policy = FlowMatchingPolicy(policy_cfg, dataset_stats=stats).to(device)
     policy.model = cast(

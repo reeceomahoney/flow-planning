@@ -57,15 +57,10 @@ class FlowMatchingConfig(PreTrainedConfig):
     dim_model: int = 128
     n_layers: int = 4
     n_heads: int = 4
-    attn_window: int = 5  # local attention half-width over step tokens; 0 = global
+    attn_window: int = 0  # local attention half-width over step tokens; 0 = global
 
     # flow matching
     num_inference_steps: int = 10
-
-    # classifier-free goal guidance
-    goal_offset: int = 1000  # delta to the goal frame; clamps to the episode end
-    cfg_dropout_prob: float = 0.2  # train-time prob of dropping the goal to null
-    cfg_guidance_weight: float = 2.0  # inference w; 1 = conditional, 0 = unconditional
 
     # training
     optimizer_lr: float = 1e-4
@@ -96,8 +91,7 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list[int]:
-        # chunk window plus one far frame that clamps to the episode end (the goal)
-        return list(range(self.horizon)) + [self.goal_offset]
+        return list(range(self.horizon))
 
     @property
     def action_delta_indices(self) -> list[int]:
@@ -121,10 +115,11 @@ class FlowTransformer(nn.Module):
     """Velocity field v(x_t, t | state, goal) over a chunk of [state, action] steps.
 
     Each step token carries the full [pos, vel, action] vector and reads out its
-    per-step velocity. A single conditioning token holds the current state plus a
-    goal embedding; the goal is dropped to a learned null token at train time so
-    inference can use classifier-free guidance. `attn_window` restricts each step
-    token to a local neighbourhood so the prior stays closed under stitching.
+    per-step velocity. The current state is prepended as a token and the goal
+    appended as a token, so they act as the trajectory's boundary conditions.
+    `attn_window` restricts each token to a local neighbourhood (so the prior
+    stays closed under stitching); the state token then anchors the early steps
+    and the goal token the late steps.
     """
 
     attn_mask: Tensor | None
@@ -134,11 +129,10 @@ class FlowTransformer(nn.Module):
         d = cfg.dim_model
         self.horizon = cfg.horizon
         self.traj_in = nn.Linear(traj_dim, d)
-        self.cond_in = nn.Linear(state_dim, d)  # current state
-        self.goal_in = nn.Linear(cfg.goal_dim, d)
-        self.null_goal = nn.Parameter(torch.randn(d) * 0.02)  # CFG null token
+        self.state_in = nn.Linear(state_dim, d)  # leading state token
+        self.goal_in = nn.Linear(cfg.goal_dim, d)  # trailing goal token
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
-        n_tokens = self.horizon + 1
+        n_tokens = self.horizon + 2  # state token + steps + goal token
         self.pos_emb = nn.Parameter(torch.randn(n_tokens, d) * 0.02)
 
         layer = nn.TransformerEncoderLayer(
@@ -149,29 +143,24 @@ class FlowTransformer(nn.Module):
         )
         self.head = nn.Linear(d, traj_dim)
 
-        # local attention: each step token sees only +/-attn_window neighbours;
-        # the conditioning token (first) stays globally visible
+        # local attention: every token (incl. state/goal) sees only +/-attn_window
+        # neighbours by position, so state anchors the start and goal the end
         if cfg.attn_window > 0:
-            i = torch.arange(self.horizon)
+            i = torch.arange(n_tokens)
             band = (i[:, None] - i[None, :]).abs() > cfg.attn_window
-            mask = torch.zeros(n_tokens, n_tokens, dtype=torch.bool)
-            mask[1:, 1:] = band
-            self.register_buffer("attn_mask", mask, persistent=False)
+            self.register_buffer("attn_mask", band, persistent=False)
         else:
             self.attn_mask = None
 
-    def forward(
-        self, x_t: Tensor, t: Tensor, state: Tensor, goal: Tensor, goal_keep: Tensor
-    ) -> Tensor:
+    def forward(self, x_t: Tensor, t: Tensor, state: Tensor, goal: Tensor) -> Tensor:
         # x_t: (B, H, traj_dim), t: (B,), state/goal: (B, state_dim)/(B, goal_dim).
-        # goal_keep: (B,) bool, False rows use the null goal (CFG dropout).
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
         a = self.traj_in(x_t) + temb[:, None]
-        g = torch.where(goal_keep[:, None], self.goal_in(goal), self.null_goal)
-        c = (self.cond_in(state) + g)[:, None] + temb[:, None]
-        tokens = torch.cat([c, a], dim=1) + self.pos_emb  # cond token leads
+        s = (self.state_in(state) + temb)[:, None]
+        g = (self.goal_in(goal) + temb)[:, None]
+        tokens = torch.cat([s, a, g], dim=1) + self.pos_emb  # state | steps | goal
         h = self.transformer(tokens, mask=self.attn_mask)
-        return self.head(h[:, 1:])
+        return self.head(h[:, 1:-1])
 
 
 class FlowMatchingPolicy(PreTrainedPolicy):
@@ -208,43 +197,28 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
 
-    def sample_goal(self, obs: Tensor) -> tuple[Tensor, Tensor]:
-        """Hindsight goal: the leading goal_dim (position) of the episode-end
-        state (the trailing frame, clamped to the episode end). `goal_keep` drops
-        the goal to null with prob `cfg_dropout_prob` for classifier-free guidance."""
-        b = obs.shape[0]
-        goal = obs[:, -1, : self.config.goal_dim]
-        keep = torch.rand(b, device=obs.device) >= self.config.cfg_dropout_prob
-        return goal, keep
-
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        # fixed-dt window: trajectory = [state, action] per step, both normalized
-        obs = batch[OBS_STATE]  # (B, H + 1, obs_dim); trailing frame = goal
-        win = obs[:, : self.config.horizon]  # chunk window
-        state = win[..., : self.state_dim]
+        # full-trajectory window: [state, action] per step, both normalized. The
+        # tail past the episode end clamps to the goal frame (pos=goal, vel~0,
+        # action=goal target), so training on it teaches the absorbing goal.
+        # ponytail: assumes lerobot pads delta frames by clamping to the episode end.
+        obs = batch[OBS_STATE]  # (B, H, obs_dim); trailing dims = goal
+        state = obs[..., : self.state_dim]
         x_1 = torch.cat([state, batch[ACTION]], dim=-1)
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
-        goal, keep = self.sample_goal(obs)
-        v = self.model(x_t, t, state[:, 0], goal, keep)  # condition on state + goal
-        # mask the padded tail (frames past the episode end)
-        pad = batch.get(f"{ACTION}_is_pad")
-        if pad is not None:
-            keep = (~pad)[..., None]
-            n = keep.sum().clamp(min=1) * self.traj_dim
-            loss = (((v - (x_1 - x_0)) * keep) ** 2).sum() / n
-        else:
-            loss = F.mse_loss(v, x_1 - x_0)
+        goal = obs[:, 0, -self.config.goal_dim :]  # commanded goal, already in obs
+        v = self.model(x_t, t, state[:, 0], goal)  # condition on state + goal
+        loss = F.mse_loss(v, x_1 - x_0)
         return loss, {"loss": loss.item()}
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        """Flow-ODE integrate a [state, action] trajectory conditioned on the
-        current state and the goal via classifier-free guidance, returning the
-        (B, horizon, act_dim) action chunk. The goal is read from the trailing
-        obs dims (normalized in the position frame; see mirror_goal_stats). Any
-        `self.guidance_fn` cost gradient is additionally subtracted each step.
+        """Flow-ODE integrate a full [state, action] trajectory conditioned on the
+        current state (leading token) and the goal (trailing token), returning the
+        (B, horizon, act_dim) action chunk. The goal is read from the trailing obs
+        dims. Any `self.guidance_fn` cost gradient is subtracted each step.
         """
         self.eval()
         obs = batch[OBS_STATE]  # (B, obs_dim) current obs = [state, goal]
@@ -252,18 +226,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         n = obs.shape[0]
         x = torch.randn(n, self.config.horizon, self.traj_dim, device=obs.device)
 
-        goal = obs[:, -self.config.goal_dim :]  # position frame; see mirror_goal_stats
-        keep = torch.ones(n, dtype=torch.bool, device=obs.device)
-        drop = torch.zeros(n, dtype=torch.bool, device=obs.device)
-        w = self.config.cfg_guidance_weight
+        goal = obs[:, -self.config.goal_dim :]
 
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
             t = torch.full((n,), i * dt, device=x.device)
-            # clone: cudagraphs reuses one output buffer across the two calls
-            v_cond = self.model(x, t, state, goal, keep).clone()
-            v_uncond = self.model(x, t, state, goal, drop).clone()
-            v = v_uncond + w * (v_cond - v_uncond)
+            v = self.model(x, t, state, goal)
             if self.guidance_fn is not None:
                 v = v - self.guidance_fn(x + (1 - i * dt) * v, obs)
             x = x + dt * v
@@ -281,14 +249,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             actions = self.last_chunk[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
-
-
-def mirror_goal_stats(stats: dict[str, dict[str, Any]], goal_dim: int) -> None:
-    """Normalize the goal dims with the position stats in place, so the eval goal
-    lands in the frame the CFG goal is conditioned in. Call before the processors."""
-    s = stats[OBS_STATE]
-    for k in ("mean", "std"):
-        s[k][-goal_dim:] = s[k][:goal_dim]
 
 
 def make_flow_matching_pre_post_processors(

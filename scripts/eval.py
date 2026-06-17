@@ -17,7 +17,6 @@ from flow_planning.paths import latest_run_dir
 from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
-    mirror_goal_stats,
 )
 
 
@@ -71,8 +70,6 @@ def main(cfg: Config):
     dataset = LeRobotDataset(cfg.repo_id)
     stats = dataset.meta.stats
     assert stats is not None
-    # goal conditioning shares the position normalization frame (matches training)
-    mirror_goal_stats(stats, policy.config.goal_dim)
     preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy.config, dataset_stats=stats
     )
