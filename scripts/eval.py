@@ -17,6 +17,7 @@ from flow_planning.paths import latest_run_dir
 from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
+    mirror_goal_stats,
 )
 
 
@@ -30,7 +31,11 @@ class Config:
     repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
+    guidance: GuidanceConfig = field(
+        default_factory=lambda: GuidanceConfig(
+            goal_scale=0.0, obstacle_scale=0.0, smooth_scale=0.0
+        )
+    )
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
     viewer: str = "none"  # "none", "rerun", or "opengl"
@@ -66,6 +71,8 @@ def main(cfg: Config):
     dataset = LeRobotDataset(cfg.repo_id)
     stats = dataset.meta.stats
     assert stats is not None
+    # goal conditioning shares the position normalization frame (matches training)
+    mirror_goal_stats(stats, policy.config.goal_dim)
     preprocessor, postprocessor = make_flow_matching_pre_post_processors(
         policy.config, dataset_stats=stats
     )
