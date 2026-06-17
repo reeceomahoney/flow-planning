@@ -201,6 +201,7 @@ class ParticleEnv:
             self.start_pos = self.sample()
             self.goal_pos = self.sample()
         self.task_time = 0.0
+        self.boundary_hit = np.zeros(n, dtype=bool)
         if self.obstacle_sensor is not None:
             self.obstacle_sensor.reset()
 
@@ -258,6 +259,7 @@ class ParticleEnv:
         self.model.collide(self.state_0, self.contacts)
         if self.obstacle_sensor is not None:
             self.obstacle_sensor.update(self.contacts, self.state_0.body_q)
+        self.update_boundary()
         for _ in range(self.cfg.sim_substeps):
             self.state_0.clear_forces()
             wp.launch(
@@ -278,6 +280,13 @@ class ParticleEnv:
             )
             self.state_0, self.state_1 = self.state_1, self.state_0
 
+    def update_boundary(self):
+        """Latch per-world bool when the ball reaches a wall."""
+        n = self.cfg.world_count
+        q = self.state_0.body_q.numpy().reshape(n, self.num_bodies_per_world, 7)
+        lim = self.cfg.arena_size - self.cfg.ball_radius
+        self.boundary_hit |= (np.abs(q[:, 0, :2]) >= lim).any(axis=1)
+
     # ----------------------------------------------------------- observation
     def get_obs(self):
         # ball xy pos (2), xy vel (2), goal xy (2)
@@ -288,18 +297,24 @@ class ParticleEnv:
         return np.concatenate([pos, vel, self.goal_pos], axis=1).astype(np.float32)
 
     def success(self):
-        """Per-world bool: ball within success_dist of the goal, obstacle untouched."""
+        """Per-world bool: ball within success_dist of the goal, no failure."""
         obs = self.get_obs()
         dist = np.linalg.norm(obs[:, :2] - self.goal_pos, axis=1)
         return (dist < self.cfg.success_dist) & ~self.failure()
 
     def failure(self):
-        """Per-world bool: ball has touched the obstacle this episode."""
-        if self.obstacle_sensor is None:
-            return np.zeros(self.cfg.world_count, dtype=bool)
-        return self.obstacle_sensor.read()
+        """Per-world bool: ball has touched the boundary or obstacle this episode."""
+        fail = self.boundary_hit.copy()
+        if self.obstacle_sensor is not None:
+            fail |= self.obstacle_sensor.read()
+        return fail
 
     # -------------------------------------------------------------- guidance
+    @property
+    def boundary_geometry(self):
+        """Inner arena half-extent (wall minus ball radius) for BoundaryGuidance."""
+        return {"half_extent": self.cfg.arena_size - self.cfg.ball_radius, "dims": 2}
+
     @property
     def obstacle_geometry(self):
         """Per-world obstacle box and detour mode for ObstacleGuidance."""
