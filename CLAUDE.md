@@ -15,6 +15,5 @@
 - Prefer the `flow` cluster over the local GPU for any real compute — training,
   eval, sweeps, recording. First check `sky status flow`: if nothing is running
   (cluster idle), this is the preferred method. Put the command in `run:` of
-  `configs/sky.yaml` and launch with `./scripts/launch_sky.sh flow` (sweeps live
-  in `scripts/sweep.sh`, which `run:` can call). `outputs/` is gitignored, so
-  the cluster uses its own checkpoints, not the local ones.
+  `configs/sky.yaml` and launch with `./scripts/launch_sky.sh flow`. `outputs/`
+  is gitignored, so the cluster uses its own checkpoints, not the local ones.
