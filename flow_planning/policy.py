@@ -230,6 +230,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
         goal = obs[:, -self.config.goal_dim :]
 
+        if self.guidance_fn is not None:
+            self.guidance_fn.reset()
+
         dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
             t = torch.full((n,), i * dt, device=x.device)

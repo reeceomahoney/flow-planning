@@ -12,7 +12,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
-from flow_planning.guidance import GuidanceConfig, make_guidance
+from flow_planning.guidance import Guidance, GuidanceConfig
 from flow_planning.paths import latest_run_dir
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -32,7 +32,7 @@ class Config:
     device: str = "cuda"
     guidance: GuidanceConfig = field(
         default_factory=lambda: GuidanceConfig(
-            goal_scale=0.0, obstacle_scale=20.0, smooth_scale=0.0
+            goal_scale=0.0, obstacle_scale=100.0, smooth_scale=0.5
         )
     )
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
@@ -93,7 +93,7 @@ def main(cfg: Config):
     )
     policy.action_clip = (low, high)
 
-    policy.guidance_fn = make_guidance(
+    policy.guidance_fn = Guidance(
         cfg.guidance, env, policy.config.goal_dim, stats[OBS_STATE], device
     )
 

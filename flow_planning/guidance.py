@@ -10,9 +10,9 @@ from torch import Tensor
 class GuidanceConfig:
     goal_scale: float = 8.0  # >0 enables goal-distance attractor guidance
     goal_discount: float = 0.9  # weight decay toward earlier plan steps
-    obstacle_scale: float = 200.0  # >0 enables obstacle-avoidance guidance
+    obstacle_scale: float = 100.0  # >0 enables obstacle-avoidance guidance
     obstacle_margin: float = 0.08
-    smooth_scale: float = 0.0  # >0 adds a plan acceleration penalty (smoothness)
+    smooth_scale: float = 0.5  # >0 adds a plan acceleration penalty (smoothness)
 
 
 def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
@@ -116,6 +116,10 @@ class ObstacleGuidance:
         self.around = around
         self.over_top = over_top
         self.interp = interp
+        self.side = None  # detour side, committed once per rollout
+
+    def reset(self):
+        self.side = None
 
     def path_points(self, pos: Tensor) -> Tensor:
         """Interpolate `interp` points per segment along the path, plus the end."""
@@ -138,10 +142,14 @@ class ObstacleGuidance:
             q = (pts - self.center).abs()
             if self.around:
                 band = q[..., 1] < self.half_extents[..., 1] + self.margin
-                # one detour side per path, else points dither around x=0
-                xrel = (pts[..., 0] - self.center[..., 0]).detach()
-                side = torch.sign((xrel * band).sum(-1, keepdim=True))
-                side[side == 0] = 1.0
+                # commit the detour side once per rollout: recomputing it each ODE
+                # step lets the still-noisy early path flip sides and wobble
+                if self.side is None:
+                    xrel = (pts[..., 0] - self.center[..., 0]).detach()
+                    side = torch.sign((xrel * band).sum(-1, keepdim=True))
+                    side[side == 0] = 1.0
+                    self.side = side
+                side = self.side
                 out = torch.relu(
                     self.half_extents[..., 0]
                     + self.margin
@@ -162,37 +170,41 @@ class ObstacleGuidance:
         return grad
 
 
-def make_guidance(cfg: GuidanceConfig, env, goal_dim, obs_stats, device):
-    """Compose the enabled guidance terms into a single gradient function.
+class Guidance:
+    """Sum of the enabled guidance terms, with a per-rollout reset for stateful
+    terms. `obs_stats` is the observation `{"mean", "std"}`; `env` supplies the
+    obstacle geometry. With no term enabled the sum is a harmless zero."""
 
-    `obs_stats` is the observation `{"mean", "std"}`; `env` supplies the
-    obstacle geometry. Returns None when no term is enabled.
-    """
-    terms = []
-    if cfg.goal_scale > 0:
-        terms.append(
-            GoalGuidance(
-                obs_mean=obs_stats["mean"],
-                obs_std=obs_stats["std"],
-                goal_dim=goal_dim,
-                scale=cfg.goal_scale,
-                device=device,
-                discount=cfg.goal_discount,
+    def __init__(self, cfg, env, goal_dim, obs_stats, device):
+        self.terms = []
+        if cfg.goal_scale > 0:
+            self.terms.append(
+                GoalGuidance(
+                    obs_mean=obs_stats["mean"],
+                    obs_std=obs_stats["std"],
+                    goal_dim=goal_dim,
+                    scale=cfg.goal_scale,
+                    device=device,
+                    discount=cfg.goal_discount,
+                )
             )
-        )
-    if cfg.obstacle_scale > 0:
-        terms.append(
-            ObstacleGuidance(
-                **env.obstacle_geometry,
-                action_mean=obs_stats["mean"],
-                action_std=obs_stats["std"],
-                scale=cfg.obstacle_scale,
-                margin=cfg.obstacle_margin,
-                device=device,
+        if cfg.obstacle_scale > 0:
+            self.terms.append(
+                ObstacleGuidance(
+                    **env.obstacle_geometry,
+                    action_mean=obs_stats["mean"],
+                    action_std=obs_stats["std"],
+                    scale=cfg.obstacle_scale,
+                    margin=cfg.obstacle_margin,
+                    device=device,
+                )
             )
-        )
-    if cfg.smooth_scale > 0:
-        terms.append(SmoothGuidance(scale=cfg.smooth_scale))
-    if not terms:
-        return None
-    return lambda x1, obs: sum(g(x1, obs) for g in terms)
+        if cfg.smooth_scale > 0:
+            self.terms.append(SmoothGuidance(scale=cfg.smooth_scale))
+
+    def __call__(self, x1, obs):
+        return sum(g(x1, obs) for g in self.terms)
+
+    def reset(self):
+        for g in self.terms:
+            getattr(g, "reset", lambda: None)()

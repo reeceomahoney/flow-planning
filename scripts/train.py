@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 import wandb
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
-from flow_planning.guidance import GuidanceConfig, make_guidance
+from flow_planning.guidance import Guidance, GuidanceConfig
 from flow_planning.paths import make_run_dir
 from flow_planning.policy import (
     FlowMatchingConfig,
@@ -164,7 +164,7 @@ def main(cfg: Config):
         env = make_env(cfg.env, newton.viewer.ViewerNull())
 
     # inference-time guidance for eval rollouts (unused by training forward)
-    policy.guidance_fn = make_guidance(
+    policy.guidance_fn = Guidance(
         cfg.guidance, env, policy_cfg.goal_dim, stats[OBS_STATE], device
     )
 
