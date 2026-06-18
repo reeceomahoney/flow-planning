@@ -143,11 +143,13 @@ class FlowTransformer(nn.Module):
         )
         self.head = nn.Linear(d, traj_dim)
 
-        # local attention: every token (incl. state/goal) sees only +/-attn_window
-        # neighbours by position, so state anchors the start and goal the end
+        # local attention: step tokens see only +/-attn_window neighbours, but
+        # state (col 0) and goal (col -1) are global registers
         if cfg.attn_window > 0:
             i = torch.arange(n_tokens)
             band = (i[:, None] - i[None, :]).abs() > cfg.attn_window
+            band[:, 0] = False
+            band[:, -1] = False
             self.register_buffer("attn_mask", band, persistent=False)
         else:
             self.attn_mask = None
