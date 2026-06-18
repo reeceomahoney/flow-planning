@@ -13,7 +13,7 @@ import torch
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 from torch.utils.data import DataLoader
 
 import wandb
@@ -48,11 +48,6 @@ class Config:
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
-
-
-def cycle(loader):
-    while True:
-        yield from loader
 
 
 class EMA:
@@ -173,16 +168,18 @@ def main(cfg: Config):
         cfg.guidance, env, policy_cfg.goal_dim, stats[OBS_STATE], device
     )
 
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=8,
-        drop_last=True,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )
+    # dataset is tiny, just materialize it in VRAM for fast training
+    mat_loader = DataLoader(dataset, batch_size=512, num_workers=8, shuffle=False)
+    obs_all, act_all = [], []
+    for b in mat_loader:
+        obs_all.append(b[OBS_STATE])
+        act_all.append(b[ACTION])
+    obs_all = torch.cat(obs_all).to(device)
+    act_all = torch.cat(act_all).to(device)
+    n_samples = obs_all.shape[0]
+    mb = (obs_all.nbytes + act_all.nbytes) / 1e6
+    print(f"Materialized {n_samples} windows ({mb:.0f} MB) in VRAM", flush=True)
+
     optimizer = torch.optim.AdamW(
         policy.get_optim_params(),
         lr=policy_cfg.optimizer_lr,
@@ -200,10 +197,10 @@ def main(cfg: Config):
     ema = EMA(policy.model, cfg.ema_decay)
 
     policy.train()
-    data_iter = cycle(loader)
     last_log_time = time.perf_counter()
     for it in range(cfg.num_iters):
-        batch = preprocessor(next(data_iter))
+        idx = torch.randint(0, n_samples, (cfg.batch_size,), device=device)
+        batch = preprocessor({OBS_STATE: obs_all[idx], ACTION: act_all[idx]})
         with amp:
             loss, _ = policy.forward(batch)
 
