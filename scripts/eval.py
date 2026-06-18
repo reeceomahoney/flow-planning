@@ -100,6 +100,7 @@ def main(cfg: Config):
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
     total_succ = total_fail = total = 0
+    path_ratios = []  # per-world path-length / straight-line ratio (>1 = wandering)
     episodes = range(cfg.episodes) if cfg.episodes > 0 else itertools.count()
     for ep in episodes:
         if not viewer.is_running():
@@ -108,10 +109,12 @@ def main(cfg: Config):
         env.reset()
         succ = np.zeros(n, dtype=bool)
         acts = []
+        positions = []
         frame = 0
         while frame < frames and viewer.is_running():
             if viewer.should_step():
                 obs = torch.from_numpy(env.get_obs())
+                positions.append(obs[:, :2].numpy().copy())
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
                 phys = postprocessor(action).numpy().astype(np.float32)
                 acts.append(phys)
@@ -141,20 +144,29 @@ def main(cfg: Config):
         a = np.stack(acts)  # (T, n, act_dim)
         accel = np.linalg.norm(a[2:] - 2 * a[1:-1] + a[:-2], axis=-1)
         accel_p95 = np.percentile(accel, 95) if accel.size else float("nan")
+        # path length vs straight-line start->goal: >1 means the ball wandered
+        p = np.stack(positions)  # (T, n, 2)
+        goal_xy = env.get_obs()[:, 4:6]
+        path_len = np.linalg.norm(np.diff(p, axis=0), axis=-1).sum(0)  # (n,)
+        straight = np.linalg.norm(p[0] - goal_xy, axis=-1) + 1e-6
+        ratio = path_len / straight
+        path_ratios.append(ratio)
         total_succ += int(succ.sum())
         total_fail += int(fail.sum())
         total += n
         print(
             f"batch {ep}: success {succ.mean():.3f} "
             f"failure {fail.mean():.3f} timeout {stuck.mean():.3f} "
-            f"accel_p95 {accel_p95:.4f} "
+            f"accel_p95 {accel_p95:.4f} path_ratio_med {np.median(ratio):.2f} "
         )
 
     if total:
+        pr = np.concatenate(path_ratios)
         print(
             f"overall: success {total_succ / total:.3f} "
             f"failure {total_fail / total:.3f} "
             f"timeout {(total - total_succ - total_fail) / total:.3f} "
+            f"path_ratio med {np.median(pr):.2f} p95 {np.percentile(pr, 95):.2f} "
             f"({total} episodes)"
         )
     viewer.close()
