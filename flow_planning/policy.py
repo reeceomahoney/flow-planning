@@ -57,7 +57,7 @@ class FlowMatchingConfig(PreTrainedConfig):
     dim_model: int = 128
     n_layers: int = 4
     n_heads: int = 4
-    attn_window: int = 0  # local attention half-width over step tokens; 0 = global
+    attn_window: int = 5  # local attention half-width over step tokens; 0 = global
 
     # flow matching
     num_inference_steps: int = 10
