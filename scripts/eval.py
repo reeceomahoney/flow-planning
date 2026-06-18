@@ -32,7 +32,7 @@ class Config:
     device: str = "cuda"
     guidance: GuidanceConfig = field(
         default_factory=lambda: GuidanceConfig(
-            goal_scale=0.0, obstacle_scale=0.0, smooth_scale=0.0
+            goal_scale=0.0, obstacle_scale=20.0, smooth_scale=0.0
         )
     )
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
