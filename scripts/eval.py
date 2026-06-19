@@ -32,10 +32,11 @@ class Config:
     device: str = "cuda"
     guidance: GuidanceConfig = field(
         default_factory=lambda: GuidanceConfig(
-            goal_scale=0.0, obstacle_scale=100.0, smooth_scale=0.5
+            goal_scale=0.0, obstacle_scale=20.0, smooth_scale=0.5
         )
     )
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
+    n_action_steps: int = 75  # >0 overrides the checkpoint's replan interval
     episode_seconds: float = 20.0
     viewer: str = "none"  # "none", "rerun", or "opengl"
     seed: int = 0
@@ -65,6 +66,8 @@ def main(cfg: Config):
     print(f"Loading checkpoint: {checkpoint}")
     policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
+    if cfg.n_action_steps > 0:
+        policy.config.n_action_steps = cfg.n_action_steps
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)

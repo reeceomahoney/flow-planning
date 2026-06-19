@@ -50,7 +50,7 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # dimensions
     horizon: int = 50
-    n_action_steps: int = 10
+    n_action_steps: int = 75  # replan interval; ~75 best (see replan sweep)
     goal_dim: int = 2  # trailing obs dims holding the goal
 
     # architecture
@@ -198,6 +198,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def reset(self):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
+        if self.guidance_fn is not None:
+            self.guidance_fn.reset()
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         # full-trajectory window: [state, action] per step, both normalized. The
@@ -226,14 +228,10 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         obs = batch[OBS_STATE]  # (B, obs_dim) current obs = [state, goal]
         state = obs[:, : self.state_dim]
         n = obs.shape[0]
-        x = torch.randn(n, self.config.horizon, self.traj_dim, device=obs.device)
-
         goal = obs[:, -self.config.goal_dim :]
 
-        if self.guidance_fn is not None:
-            self.guidance_fn.reset()
-
         dt = 1.0 / self.config.num_inference_steps
+        x = torch.randn(n, self.config.horizon, self.traj_dim, device=obs.device)
         for i in range(self.config.num_inference_steps):
             t = torch.full((n,), i * dt, device=x.device)
             v = self.model(x, t, state, goal)
