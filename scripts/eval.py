@@ -30,13 +30,8 @@ class Config:
     repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    guidance: GuidanceConfig = field(
-        default_factory=lambda: GuidanceConfig(
-            goal_scale=0.0, obstacle_scale=20.0, smooth_scale=0.5
-        )
-    )
+    guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
-    n_action_steps: int = 75  # >0 overrides the checkpoint's replan interval
     episode_seconds: float = 20.0
     viewer: str = "none"  # "none", "rerun", or "opengl"
     seed: int = 0
@@ -66,8 +61,6 @@ def main(cfg: Config):
     print(f"Loading checkpoint: {checkpoint}")
     policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
-    if cfg.n_action_steps > 0:
-        policy.config.n_action_steps = cfg.n_action_steps
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -103,6 +96,7 @@ def main(cfg: Config):
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
     total_succ = total_fail = total = 0
+    accels = []  # per-step action accel magnitudes (smoothness proxy)
     path_ratios = []  # per-world path-length / straight-line ratio (>1 = wandering)
     episodes = range(cfg.episodes) if cfg.episodes > 0 else itertools.count()
     for ep in episodes:
@@ -146,6 +140,7 @@ def main(cfg: Config):
             )
         a = np.stack(acts)  # (T, n, act_dim)
         accel = np.linalg.norm(a[2:] - 2 * a[1:-1] + a[:-2], axis=-1)
+        accels.append(accel.ravel())
         accel_p95 = np.percentile(accel, 95) if accel.size else float("nan")
         # path length vs straight-line start->goal: >1 means the ball wandered
         p = np.stack(positions)  # (T, n, 2)
@@ -165,10 +160,13 @@ def main(cfg: Config):
 
     if total:
         pr = np.concatenate(path_ratios)
+        ac = np.concatenate(accels)
         print(
             f"overall: success {total_succ / total:.3f} "
             f"failure {total_fail / total:.3f} "
             f"timeout {(total - total_succ - total_fail) / total:.3f} "
+            f"accel_p95 {np.percentile(ac, 95):.4f} "
+            f"p99 {np.percentile(ac, 99):.4f} max {ac.max():.3f} "
             f"path_ratio med {np.median(pr):.2f} p95 {np.percentile(pr, 95):.2f} "
             f"({total} episodes)"
         )

@@ -41,9 +41,7 @@ class Config:
     eval_every: int = 10_000
     eval_episodes: int = 256
     guidance: GuidanceConfig = field(
-        default_factory=lambda: GuidanceConfig(
-            goal_scale=0.0, obstacle_scale=0.0, smooth_scale=0.0
-        )
+        default_factory=lambda: GuidanceConfig(obstacle_scale=0.0, smooth_scale=0.0)
     )
     log_every: int = 100
     wandb_project: str = "flow-planning"

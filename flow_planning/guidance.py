@@ -8,9 +8,7 @@ from torch import Tensor
 
 @dataclass
 class GuidanceConfig:
-    goal_scale: float = 0.0  # >0 enables goal-distance attractor guidance
-    goal_discount: float = 0.9  # weight decay toward earlier plan steps
-    obstacle_scale: float = 20.0  # >0 enables obstacle-avoidance guidance
+    obstacle_scale: float = 15.0  # >0 enables obstacle-avoidance guidance
     obstacle_margin: float = 0.08
     smooth_scale: float = 0.5  # >0 adds a plan acceleration penalty (smoothness)
 
@@ -35,41 +33,6 @@ class SmoothGuidance:
             x = x1_hat.detach().requires_grad_(True)
             accel = x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]
             cost = self.scale * accel.square().sum()
-            (grad,) = torch.autograd.grad(cost, x)
-        return grad
-
-
-class GoalGuidance:
-    """Attractor pulling the planned positions toward the goal: a value gradient
-    on -||pos - goal||^2. Positions are the leading `goal_dim` trajectory dims
-    (the state position); the goal is read live from the conditioning obs. Steps
-    are time-discounted so the prior shapes the path and the value sets the end.
-
-    `obs_mean`/`obs_std` are the full observation stats: the leading `goal_dim`
-    entries normalize the positions, the trailing `goal_dim` entries the goal.
-    """
-
-    def __init__(self, obs_mean, obs_std, goal_dim, scale, device, discount=0.9):
-        kw = {"dtype": torch.float32, "device": device}
-        m = torch.as_tensor(obs_mean, **kw)
-        s = torch.as_tensor(obs_std, **kw)
-        self.pos_mean, self.pos_std = m[:goal_dim], s[:goal_dim]
-        self.goal_mean, self.goal_std = m[-goal_dim:], s[-goal_dim:]
-        self.goal_dim = goal_dim
-        self.scale = scale
-        self.discount = discount
-
-    def __call__(self, x1_hat: Tensor, obs: Tensor) -> Tensor:
-        d = self.goal_dim
-        # goal into the position normalization frame so pos and goal are comparable
-        goal = obs[:, -d:] * self.goal_std + self.goal_mean
-        goal = ((goal - self.pos_mean) / self.pos_std)[:, None]  # (B, 1, d)
-        h = x1_hat.shape[1]
-        w = self.discount ** torch.arange(h - 1, -1, -1, device=x1_hat.device)
-        with torch.enable_grad():
-            x = x1_hat.detach().requires_grad_(True)
-            err = (x[..., :d] - goal) ** 2
-            cost = self.scale * (w[None, :, None] * err).sum()
             (grad,) = torch.autograd.grad(cost, x)
         return grad
 
@@ -177,17 +140,6 @@ class Guidance:
 
     def __init__(self, cfg, env, goal_dim, obs_stats, device):
         self.terms = []
-        if cfg.goal_scale > 0:
-            self.terms.append(
-                GoalGuidance(
-                    obs_mean=obs_stats["mean"],
-                    obs_std=obs_stats["std"],
-                    goal_dim=goal_dim,
-                    scale=cfg.goal_scale,
-                    device=device,
-                    discount=cfg.goal_discount,
-                )
-            )
         if cfg.obstacle_scale > 0:
             self.terms.append(
                 ObstacleGuidance(

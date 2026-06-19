@@ -43,6 +43,26 @@ from lerobot.utils.constants import (
 from torch import Tensor
 
 
+def even_spacing(acts: Tensor, uniform: float) -> Tensor:
+    """Reparametrize the planned action path toward equal arc-length spacing."""
+    if uniform <= 0:
+        return acts
+    b, h, c = acts.shape
+    seg = (acts[:, 1:] - acts[:, :-1]).norm(dim=-1)  # (B, H-1)
+    cum = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(-1)], dim=1)  # (B, H)
+    total = cum[:, -1:]
+    u = torch.linspace(0, 1, h, device=acts.device, dtype=acts.dtype)
+    tgt = (1 - uniform) * cum + uniform * u[None, :] * total  # (B, H) arc lengths
+    hi = torch.searchsorted(cum, tgt).clamp(1, h - 1)
+    lo = hi - 1
+    c_lo, c_hi = torch.gather(cum, 1, lo), torch.gather(cum, 1, hi)
+    w = ((tgt - c_lo) / (c_hi - c_lo).clamp_min(1e-9)).unsqueeze(-1)
+    g_lo = lo.unsqueeze(-1).expand(-1, -1, c)
+    g_hi = hi.unsqueeze(-1).expand(-1, -1, c)
+    p_lo, p_hi = torch.gather(acts, 1, g_lo), torch.gather(acts, 1, g_hi)
+    return p_lo + w * (p_hi - p_lo)
+
+
 @PreTrainedConfig.register_subclass("flow_matching")
 @dataclass
 class FlowMatchingConfig(PreTrainedConfig):
@@ -50,7 +70,7 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # dimensions
     horizon: int = 50
-    n_action_steps: int = 75  # replan interval; ~75 best (see replan sweep)
+    n_action_steps: int = 40  # replan interval; ~40 best with uniform spacing
     goal_dim: int = 2  # trailing obs dims holding the goal
 
     # architecture
@@ -61,6 +81,8 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # flow matching
     num_inference_steps: int = 10
+    action_lpf: float = 0.3  # EMA alpha on executed actions; <1 smooths seam jumps
+    spacing_uniform: float = 1.0  # arc-length resample of the plan; 0=raw, 1=uniform
 
     # training
     optimizer_lr: float = 1e-4
@@ -198,6 +220,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def reset(self):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
+        self.lpf_state = None  # EMA state for the executed-action low-pass
         if self.guidance_fn is not None:
             self.guidance_fn.reset()
 
@@ -239,6 +262,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 v = v - self.guidance_fn(x + (1 - i * dt) * v, obs)
             x = x + dt * v
         acts = x[..., self.state_dim :]  # normalized action dims
+        acts = even_spacing(acts, self.config.spacing_uniform)
         if self.action_clip is not None:
             acts = acts.clamp(self.action_clip[0], self.action_clip[1])
         return acts
@@ -251,7 +275,18 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             self.last_chunk = self.predict_action_chunk(batch)  # full horizon
             actions = self.last_chunk[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+        action = self._action_queue.popleft()
+        # low-pass the executed action stream to smooth replan-seam jumps; EMA in
+        # normalized space == filtering physical actions (unnormalize is affine)
+        a = self.config.action_lpf
+        if a < 1.0:
+            self.lpf_state = (
+                action
+                if self.lpf_state is None
+                else a * action + (1 - a) * self.lpf_state
+            )
+            action = self.lpf_state
+        return action
 
 
 def make_flow_matching_pre_post_processors(
