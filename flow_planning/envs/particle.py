@@ -40,6 +40,10 @@ class ParticleConfig(EnvConfig):
     obstacle_thickness: float = 0.05
     obstacle_random: bool = False  # randomize per-world obstacle size and position
 
+    # bend scripted demos into random perpendicular half-sine arcs (record-blind)
+    bend_frac: float = 1.0  # fraction of worlds bent
+    bend_amp: float = 0.3  # peak detour as a fraction of the start->goal distance
+
 
 @wp.kernel(enable_backward=False)
 def pd_force_kernel(
@@ -201,6 +205,7 @@ class ParticleEnv:
             self.start_pos = self.sample()
             self.goal_pos = self.sample()
         self.task_time = 0.0
+        self.bend = self.sample_bend()
         self.boundary_hit = np.zeros(n, dtype=bool)
         if self.obstacle_sensor is not None:
             self.obstacle_sensor.reset()
@@ -219,6 +224,16 @@ class ParticleEnv:
         )
 
         self.set_target(self.start_pos)
+
+    def sample_bend(self):
+        """Per-world perpendicular detour vector (n, 2); zero where not bent."""
+        n, eps = self.cfg.world_count, 1e-6
+        seg = self.goal_pos - self.start_pos
+        seg_len = np.linalg.norm(seg, axis=1, keepdims=True)
+        perp = np.stack([-seg[:, 1], seg[:, 0]], axis=1) / np.clip(seg_len, eps, None)
+        amp = self.rng.uniform(-1.0, 1.0, (n, 1)) * self.cfg.bend_amp * seg_len
+        do = self.rng.uniform(0.0, 1.0, (n, 1)) < self.cfg.bend_frac
+        return (do * amp * perp).astype(np.float32)
 
     # ------------------------------------------------------------------ step
     def set_target(self, xy):
@@ -239,7 +254,10 @@ class ParticleEnv:
         """Scripted demo: ramp the target from start to goal, then hold to settle."""
         self.task_time += self.frame_dt
         t = min(1.0, self.task_time / (0.75 * self.cfg.task_time))
-        self.set_target(self.start_pos * (1.0 - t) + self.goal_pos * t)
+        target = self.start_pos * (1.0 - t) + self.goal_pos * t
+        target = target + self.bend * np.sin(np.pi * t)  # sin -> 0 at endpoints
+        lim = self.cfg.arena_size - self.cfg.ball_radius
+        self.set_target(np.clip(target, -lim, lim))
         self.simulate()
         self.sim_time += self.frame_dt
 

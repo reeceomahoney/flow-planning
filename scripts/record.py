@@ -32,16 +32,19 @@ def collect(cfg: Config, env):
         repo_id=cfg.repo_id, fps=cfg.env.fps, features=features, use_videos=False
     )
 
-    # one pick-and-place per world = one episode; all worlds reset together
     buffers = [[] for _ in range(cfg.env.world_count)]
     collected = 0
-    successes = 0
+    attempted = 0
     pbar = tqdm(total=cfg.episodes, desc="Collecting episodes")
     while collected < cfg.episodes:
         new_episode, success = env.step()
         if new_episode and buffers[0]:
-            remaining = cfg.episodes - collected
-            for w, buf in enumerate(buffers[:remaining]):
+            attempted += cfg.env.world_count
+            for w, buf in enumerate(buffers):
+                if collected >= cfg.episodes:
+                    break
+                if not success[w]:
+                    continue
                 for state, action in buf:
                     dataset.add_frame(
                         {
@@ -52,10 +55,8 @@ def collect(cfg: Config, env):
                         }
                     )
                 dataset.save_episode()
-            n = min(remaining, cfg.env.world_count)
-            successes += int(success[:n].sum())
-            collected += n
-            pbar.update(n)
+                collected += 1
+                pbar.update(1)
             buffers = [[] for _ in range(cfg.env.world_count)]
             continue
 
@@ -66,7 +67,7 @@ def collect(cfg: Config, env):
     pbar.close()
     dataset.finalize()
     print(f"Saved {dataset.meta.total_episodes} episodes to {dataset.root}")
-    print(f"Demo success rate: {successes / collected:.1%}")
+    print(f"Demo success rate: {collected / attempted:.1%}")
 
 
 @draccus.wrap()
