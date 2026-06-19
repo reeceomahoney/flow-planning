@@ -41,7 +41,7 @@ class ParticleConfig(EnvConfig):
     obstacle_random: bool = False  # randomize per-world obstacle size and position
 
     # bend scripted demos into random perpendicular half-sine arcs (record-blind)
-    bend_frac: float = 1.0  # fraction of worlds bent
+    bend_frac: float = 0.5  # fraction of worlds bent (keep straight demos too)
     bend_amp: float = 0.3  # peak detour as a fraction of the start->goal distance
 
 

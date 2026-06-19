@@ -8,9 +8,9 @@ from torch import Tensor
 
 @dataclass
 class GuidanceConfig:
-    goal_scale: float = 8.0  # >0 enables goal-distance attractor guidance
+    goal_scale: float = 0.0  # >0 enables goal-distance attractor guidance
     goal_discount: float = 0.9  # weight decay toward earlier plan steps
-    obstacle_scale: float = 100.0  # >0 enables obstacle-avoidance guidance
+    obstacle_scale: float = 20.0  # >0 enables obstacle-avoidance guidance
     obstacle_margin: float = 0.08
     smooth_scale: float = 0.5  # >0 adds a plan acceleration penalty (smoothness)
 
