@@ -13,11 +13,11 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.guidance import Guidance, GuidanceConfig
-from flow_planning.paths import latest_run_dir
 from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
 )
+from flow_planning.utils import latest_run_dir
 
 
 @dataclass

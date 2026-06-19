@@ -21,7 +21,7 @@ import warp as wp
 
 from flow_planning.envs.contact import ObstacleContactSensor
 from flow_planning.envs.env import EnvConfig, world_offset
-from flow_planning.rotations import quat_to_rot6d, rot6d_to_quat
+from flow_planning.utils import quat_to_rot6d, rot6d_to_quat
 
 wp.config.quiet = True
 

@@ -19,13 +19,13 @@ from torch.utils.data import DataLoader
 import wandb
 from flow_planning.envs import EnvConfig, ParticleConfig, make_env
 from flow_planning.guidance import Guidance, GuidanceConfig
-from flow_planning.paths import make_run_dir
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
     FlowTransformer,
     make_flow_matching_pre_post_processors,
 )
+from flow_planning.utils import make_run_dir
 
 
 @dataclass
