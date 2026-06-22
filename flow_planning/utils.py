@@ -2,11 +2,34 @@
 
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
+import newton.viewer
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 from torch import Tensor
+
+
+def make_viewer(name: str, rrd: str = ""):
+    if rrd:
+        import newton._src.viewer.viewer_rerun as vr
+
+        vr.is_jupyter_notebook = lambda: True  # ty: ignore[invalid-assignment]
+        return newton.viewer.ViewerRerun(record_to_rrd=rrd)
+    if name == "none":
+        return newton.viewer.ViewerNull()
+    if name == "opengl":
+        return newton.viewer.ViewerGL()
+    if name == "rerun":
+        web_port = 9090
+        viewer = newton.viewer.ViewerRerun(web_port=web_port)
+        if viewer._grpc_server_uri is not None:
+            grpc_uri = quote(viewer._grpc_server_uri, safe="")
+            print(f"Rerun viewer: http://localhost:{web_port}/?url={grpc_uri}")
+        return viewer
+    raise ValueError(f"Unknown viewer: {name}")
+
 
 # --------------------------------------------------------------- run-dir paths
 # runs live under <base>/<env>/<date>/<time>

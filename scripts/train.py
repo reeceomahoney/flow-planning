@@ -17,7 +17,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from torch.utils.data import DataLoader
 
 import wandb
-from flow_planning.envs import EnvConfig, ParticleConfig, make_env
+from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import Guidance, GuidanceConfig
 from flow_planning.policy import (
     FlowMatchingConfig,
@@ -30,8 +30,8 @@ from flow_planning.utils import make_run_dir
 
 @dataclass
 class Config:
-    env: EnvConfig = field(default_factory=lambda: ParticleConfig(task_time=8))
-    repo_id: str = "reece-omahoney/particle"
+    env: EnvConfig = field(default_factory=FrankaConfig)
+    repo_id: str = "reece-omahoney/franka"
     batch_size: int = 256
     num_iters: int = 50_000
     warmup_iters: int = 500

@@ -1,20 +1,22 @@
 from dataclasses import dataclass, field
 
 import draccus
-import newton.viewer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
-from flow_planning.envs import EnvConfig, ParticleConfig, make_env
+from flow_planning.envs import EnvConfig, FrankaConfig, make_env
+from flow_planning.utils import make_viewer
 
 
 @dataclass
 class Config:
-    env: EnvConfig = field(default_factory=ParticleConfig)
+    env: EnvConfig = field(default_factory=FrankaConfig)
     record: bool = True
     episodes: int = 256
-    repo_id: str = "reece-omahoney/particle"
-    task: str = "Move the particle to the target position"
+    repo_id: str = "reece-omahoney/franka"
+    task: str = "Pick up the cube and place it at the target"
+    viewer: str = "opengl"  # "none", "rerun", or "opengl"; playback only
+    rrd: str = ""  # record a rerun .rrd to this path (view locally: `rerun <rrd>`)
 
 
 def collect(cfg: Config, env):
@@ -73,15 +75,17 @@ def collect(cfg: Config, env):
 @draccus.wrap()
 def main(cfg: Config):
     if cfg.record:
-        env = make_env(cfg.env, newton.viewer.ViewerNull())
+        env = make_env(cfg.env, make_viewer("none"))
         collect(cfg, env)
         return
 
-    viewer = newton.viewer.ViewerGL()
+    viewer = make_viewer(cfg.viewer, cfg.rrd)
     env = make_env(cfg.env, viewer)
-    while viewer.is_running():
+    done = 0
+    while viewer.is_running() and done < cfg.episodes:
         if viewer.should_step():
-            env.step()
+            new_episode, _ = env.step()
+            done += int(new_episode)
         env.render()
     viewer.close()
 
