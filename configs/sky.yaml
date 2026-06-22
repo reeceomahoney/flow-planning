@@ -19,7 +19,7 @@ setup: |
 
 run: |
   cd ~/sky_workdir
-  # rm -rf /home/sky/.cache/huggingface/lerobot/reece-omahoney/particle
+  # rm -rf /home/sky/.cache/huggingface/lerobot/reece-omahoney/franka
   # uv run scripts/record.py
   uv run scripts/train.py
 
