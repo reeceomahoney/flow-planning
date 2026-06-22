@@ -8,8 +8,7 @@ from torch import Tensor
 
 @dataclass
 class GuidanceConfig:
-    obstacle_scale: float = 15.0  # >0 enables obstacle-avoidance guidance
-    obstacle_margin: float = 0.08
+    # obstacle scale/margin are env-specific, so they live on the env config
     smooth_scale: float = 0.5  # >0 adds a plan acceleration penalty (smoothness)
 
 
@@ -61,6 +60,7 @@ class ObstacleGuidance:
         scale: float,
         margin: float,
         device: str,
+        pos_start: int = 0,
         around: bool = False,
         over_top: bool = False,
         interp: int = 4,
@@ -72,6 +72,9 @@ class ObstacleGuidance:
             self.center = self.center.unsqueeze(1)
             self.half_extents = self.half_extents.unsqueeze(1)
         d = self.center.shape[-1]
+        # the avoided position is the leading d action dims (EE/target position);
+        # actions sit after the state in the trajectory, hence pos_start
+        self.pos_start = pos_start
         self.mean = torch.as_tensor(action_mean, **kw)[:d]
         self.std = torch.as_tensor(action_std, **kw)[:d]
         self.scale = scale
@@ -97,7 +100,7 @@ class ObstacleGuidance:
         d = self.center.shape[-1]
         with torch.enable_grad():
             x = x1_hat.detach().requires_grad_(True)
-            pos = x[..., :d] * self.std + self.mean
+            pos = x[..., self.pos_start : self.pos_start + d] * self.std + self.mean
             pts = self.path_points(pos)
             sdf = box_sdf(pts, self.center, self.half_extents)
             cost = torch.relu(self.margin - sdf).square().sum()
@@ -135,20 +138,23 @@ class ObstacleGuidance:
 
 class Guidance:
     """Sum of the enabled guidance terms, with a per-rollout reset for stateful
-    terms. `obs_stats` is the observation `{"mean", "std"}`; `env` supplies the
-    obstacle geometry. With no term enabled the sum is a harmless zero."""
+    terms. `action_stats` is the action `{"mean", "std"}` (the obstacle term acts
+    on the action's leading position dims, which start at `state_dim` in the
+    trajectory); `env` supplies the obstacle geometry. With no term enabled the
+    sum is a harmless zero."""
 
-    def __init__(self, cfg, env, goal_dim, obs_stats, device):
+    def __init__(self, cfg, env, state_dim, action_stats, device):
         self.terms = []
-        if cfg.obstacle_scale > 0:
+        if env.cfg.obstacle and env.cfg.obstacle_scale > 0:
             self.terms.append(
                 ObstacleGuidance(
                     **env.obstacle_geometry,
-                    action_mean=obs_stats["mean"],
-                    action_std=obs_stats["std"],
-                    scale=cfg.obstacle_scale,
-                    margin=cfg.obstacle_margin,
+                    action_mean=action_stats["mean"],
+                    action_std=action_stats["std"],
+                    scale=env.cfg.obstacle_scale,
+                    margin=env.cfg.obstacle_margin,
                     device=device,
+                    pos_start=state_dim,
                 )
             )
         if cfg.smooth_scale > 0:

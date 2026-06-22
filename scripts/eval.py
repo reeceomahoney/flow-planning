@@ -57,8 +57,6 @@ def main(cfg: Config):
     live = cfg.viewer != "none" or bool(cfg.rrd)
     viewer = make_viewer(cfg.viewer, cfg.rrd)
 
-    if cfg.guidance.obstacle_scale > 0:
-        cfg.env.obstacle = True
     env = make_env(cfg.env, viewer)
     arena = getattr(cfg.env, "arena_size", None)
     if arena is not None:  # particle: clamp actions to the arena
@@ -71,7 +69,7 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     policy.guidance_fn = Guidance(
-        cfg.guidance, env, policy.config.goal_dim, stats[OBS_STATE], device
+        cfg.guidance, env, policy.state_dim, stats[ACTION], device
     )
 
     n = cfg.env.world_count

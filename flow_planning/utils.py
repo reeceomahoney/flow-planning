@@ -16,7 +16,7 @@ def make_viewer(name: str, rrd: str = ""):
         import newton._src.viewer.viewer_rerun as vr
 
         vr.is_jupyter_notebook = lambda: True  # ty: ignore[invalid-assignment]
-        return newton.viewer.ViewerRerun(record_to_rrd=rrd)
+        return newton.viewer.ViewerRerun(record_to_rrd=rrd, keep_historical_data=True)
     if name == "none":
         return newton.viewer.ViewerNull()
     if name == "opengl":

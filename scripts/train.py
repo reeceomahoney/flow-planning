@@ -41,7 +41,7 @@ class Config:
     eval_every: int = 10_000
     eval_episodes: int = 256
     guidance: GuidanceConfig = field(
-        default_factory=lambda: GuidanceConfig(obstacle_scale=0.0, smooth_scale=0.0)
+        default_factory=lambda: GuidanceConfig(smooth_scale=0.0)
     )
     log_every: int = 100
     wandb_project: str = "flow-planning"
@@ -132,6 +132,7 @@ def main(cfg: Config):
         output_features=output_features,
         device=device,
         goal_dim=cfg.env.goal_dim,
+        spacing_uniform=cfg.env.spacing_uniform,
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
@@ -166,7 +167,7 @@ def main(cfg: Config):
 
     # inference-time guidance for eval rollouts (unused by training forward)
     policy.guidance_fn = Guidance(
-        cfg.guidance, env, policy_cfg.goal_dim, stats[OBS_STATE], device
+        cfg.guidance, env, policy.state_dim, stats[ACTION], device
     )
 
     # dataset is tiny, just materialize it in VRAM for fast training

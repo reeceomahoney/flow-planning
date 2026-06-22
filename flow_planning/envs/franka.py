@@ -70,6 +70,9 @@ class FrankaConfig(EnvConfig):
     obstacle_thickness: float = 0.01
 
     goal_dim: int = 3  # goal xyz
+    spacing_uniform: float = 0.0  # arc-length resampling wrecks grasp/release dwell
+    obstacle_scale: float = 60.0  # tall barrier needs a stronger push than particle
+    obstacle_margin: float = 0.15  # and more clearance to lift the cube over the top
 
 
 @wp.kernel(enable_backward=False)
