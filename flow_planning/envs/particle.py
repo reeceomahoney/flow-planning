@@ -44,6 +44,8 @@ class ParticleConfig(EnvConfig):
     bend_frac: float = 0.5  # fraction of worlds bent (keep straight demos too)
     bend_amp: float = 0.3  # peak detour as a fraction of the start->goal distance
 
+    goal_dim: int = 2  # goal xy
+
 
 @wp.kernel(enable_backward=False)
 def pd_force_kernel(

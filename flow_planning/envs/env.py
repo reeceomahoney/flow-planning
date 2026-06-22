@@ -10,6 +10,7 @@ class EnvConfig(draccus.ChoiceRegistry):
     world_count: int = 256
     fps: int = 50
     obstacle: bool = False  # add a barrier between start and goal
+    goal_dim: int = 2  # trailing obs dims holding the goal
 
     @property
     def type(self) -> str:

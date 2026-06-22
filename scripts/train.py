@@ -128,7 +128,10 @@ def main(cfg: Config):
     input_features = {k: v for k, v in features.items() if k not in output_features}
 
     policy_cfg = FlowMatchingConfig(
-        input_features=input_features, output_features=output_features, device=device
+        input_features=input_features,
+        output_features=output_features,
+        device=device,
+        goal_dim=cfg.env.goal_dim,
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).

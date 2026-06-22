@@ -53,7 +53,7 @@ class FlowMatchingConfig(PreTrainedConfig):
     # dimensions
     horizon: int = 50
     n_action_steps: int = 40  # replan interval; ~40 best with uniform spacing
-    goal_dim: int = 2  # trailing obs dims holding the goal
+    goal_dim: int = field(kw_only=True)  # trailing obs dims; set from env.goal_dim
 
     # architecture
     dim_model: int = 128

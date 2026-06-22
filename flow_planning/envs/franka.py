@@ -69,6 +69,8 @@ class FrankaConfig(EnvConfig):
     obstacle_width: float = 0.15
     obstacle_thickness: float = 0.01
 
+    goal_dim: int = 3  # goal xyz
+
 
 @wp.kernel(enable_backward=False)
 def set_target_pose_kernel(
