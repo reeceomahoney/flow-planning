@@ -63,6 +63,8 @@ class FrankaConfig(EnvConfig):
     table_height: float = 0.1
     jitter: float = 0.1  # +/- xy range for cube/goal sampling
     success_dist: float = 0.05  # cube-to-goal distance for success (m)
+    lift_min: float = 0.1
+    lift_max: float = 0.5
 
     # barrier bisecting cube start and goal
     obstacle_height: float = 0.2
@@ -81,7 +83,7 @@ def set_target_pose_kernel(
     t: float,
     drop_off_pos: wp.array(dtype=wp.vec3),
     off_approach: wp.vec3,
-    off_lift: wp.vec3,
+    off_lift: wp.array(dtype=wp.vec3),
     off_retract: wp.vec3,
     home_pos: wp.vec3,
     task_init_body_q: wp.array(dtype=wp.transform),
@@ -120,7 +122,7 @@ def set_target_pose_kernel(
         ee_quat_target = ee_quat_prev
         t_gripper = t
     elif task == TaskType.LIFT.value:
-        ee_pos_target = ee_pos_prev + off_lift
+        ee_pos_target = ee_pos_prev + off_lift[tid]
         ee_quat_target = ee_quat_prev
         t_gripper = 1.0
     elif task == TaskType.MOVE_TO_DROP_OFF.value:
@@ -164,7 +166,7 @@ class FrankaEnv:
         top = wp.vec3(0.0, -0.5, h)
         self.robot_base_pos = wp.vec3(top[0] - 0.5, top[1], top[2])
         self.off_approach = wp.vec3(0.0, 0.0, 1.0 * self.cube_size)
-        self.off_lift = wp.vec3(0.0, 0.0, 4.0 * self.cube_size)
+        self.off_lift = wp.zeros(cfg.world_count, dtype=wp.vec3)  # per-world, see reset
         self.off_retract = wp.vec3(0.0, 0.0, 2.0 * self.cube_size)
         cube_z = top[2] + 0.5 * self.cube_size
         self.cube_center = np.array([top[0], top[1] + 0.15, cube_z], np.float32)
@@ -373,6 +375,11 @@ class FrankaEnv:
         n = self.cfg.world_count
         cube_start = self.sample(self.cube_center)
         self.goal_pos = self.sample(self.goal_center)
+
+        # random per-world lift height
+        lift = np.zeros((n, 3), np.float32)
+        lift[:, 2] = self.rng.uniform(self.cfg.lift_min, self.cfg.lift_max, n)
+        wp.copy(self.off_lift, wp.array(lift, dtype=wp.vec3))
 
         # random cube yaw (xyzw quaternion)
         theta = self.rng.uniform(-0.9 * np.pi, 0.9 * np.pi, n)
