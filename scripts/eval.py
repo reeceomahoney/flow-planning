@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import Guidance, GuidanceConfig
+from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
@@ -70,8 +71,14 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     policy.guidance_fn = Guidance(
-        cfg.guidance, env, policy.state_dim, stats[ACTION], device
+        cfg.guidance,
+        env,
+        policy.state_dim,
+        stats[ACTION],
+        device,
+        obs_stats=stats[OBS_STATE],
     )
+    chain = build_franka_chain(device)[0]
 
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
@@ -95,7 +102,9 @@ def main(cfg: Config):
                 acts.append(phys)
                 env.apply_action(phys)
                 if live and policy.last_chunk is not None:
-                    path = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
+                    chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
+                    q = torch.from_numpy(chunk[:, :7]).float().to(device)
+                    path = ee_positions(chain, q).cpu().numpy()
                     env.set_predicted_path(path)
                 frame += 1
                 pbar.update(1)

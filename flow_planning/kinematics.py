@@ -1,0 +1,52 @@
+"""Franka kinematics from the sim's URDF, via pytorch_kinematics / volumetric.
+
+Both the per-link collision SDF (obstacle guidance) and forward kinematics (EE
+path visualization) come from one shared pk chain built from the same URDF the
+sim loads. Validated to match newton's eval_fk to floating-point precision.
+"""
+
+import re
+
+import torch
+from torch import Tensor
+
+EE_FRAME = "fr3_hand_tcp"
+
+
+def build_franka_chain(device: str):
+    """Differentiable franka kinematic chain from the sim's URDF. Returns
+    (chain, njoints). The fingers' visual geometry is stripped (the hand mesh
+    covers the gripper); collision STLs serve as the link meshes for the SDF."""
+    import newton.utils
+    import pytorch_kinematics as pk
+
+    asset = newton.utils.download_asset("franka_emika_panda")
+    urdf = (asset / "urdf/fr3_franka_hand.urdf").read_text()
+    for link in ("fr3_leftfinger", "fr3_rightfinger"):
+        m = re.search(rf'(<link name="{link}">)(.*?)(</link>)', urdf, re.S)
+        assert m is not None, f"link {link} not found in URDF"
+        body = re.sub(r"<visual[^>]*>.*?</visual>", "", m.group(2), flags=re.S)
+        urdf = urdf[: m.start()] + m.group(1) + body + m.group(3) + urdf[m.end() :]
+    urdf = urdf.replace("package://franka_emika_panda/", "")
+    # RobotSDF reads link "visual" geometry; point it at the collision STLs
+    urdf = urdf.replace("/visual/", "/collision/").replace(".dae", ".stl")
+    chain = pk.build_chain_from_urdf(urdf.encode())
+    chain = chain.to(dtype=torch.float32, device=device)
+    return chain, len(chain.get_joint_parameter_names()), str(asset) + "/"
+
+
+def build_franka_robot_sdf(device: str):
+    """Per-link signed-distance field for the franka. Returns (RobotSDF,
+    njoints). Query points are in the robot base frame."""
+    import pytorch_volumetric as pv
+
+    chain, njoints, path_prefix = build_franka_chain(device)
+    return pv.RobotSDF(chain, path_prefix=path_prefix), njoints
+
+
+def ee_positions(chain, q: Tensor) -> Tensor:
+    """q: (B, n_arm) arm joint angles -> (B, 3) EE position in the base frame."""
+    njoints = len(chain.get_joint_parameter_names())
+    pad = q.new_zeros(q.shape[0], njoints - q.shape[1])
+    fk = chain.forward_kinematics(torch.cat([q, pad], dim=1))
+    return fk[EE_FRAME].get_matrix()[:, :3, 3]

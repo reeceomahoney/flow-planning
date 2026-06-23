@@ -167,7 +167,12 @@ def main(cfg: Config):
 
     # inference-time guidance for eval rollouts (unused by training forward)
     policy.guidance_fn = Guidance(
-        cfg.guidance, env, policy.state_dim, stats[ACTION], device
+        cfg.guidance,
+        env,
+        policy.state_dim,
+        stats[ACTION],
+        device,
+        obs_stats=stats[OBS_STATE],
     )
 
     # dataset is tiny, just materialize it in VRAM for fast training

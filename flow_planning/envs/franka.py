@@ -21,7 +21,7 @@ import warp as wp
 
 from flow_planning.envs.contact import ObstacleContactSensor
 from flow_planning.envs.env import EnvConfig, world_offset
-from flow_planning.utils import quat_to_rot6d, rot6d_to_quat
+from flow_planning.utils import quat_to_rot6d
 
 wp.config.quiet = True
 
@@ -40,7 +40,7 @@ class TaskType(enum.IntEnum):
 
 # home arm + finger configuration (fr3_franka_hand)
 HOME_Q = [
-    -3.6802115e-03,
+    2.9e-01,
     2.3901723e-02,
     3.6804110e-03,
     -2.3683236e00,
@@ -75,6 +75,9 @@ class FrankaConfig(EnvConfig):
     spacing_uniform: float = 0.0  # arc-length resampling wrecks grasp/release dwell
     obstacle_scale: float = 60.0  # tall barrier needs a stronger push than particle
     obstacle_margin: float = 0.15  # and more clearance to lift the cube over the top
+    arm_scale: float = 50.0  # whole-arm SDF guidance strength (0 disables)
+    arm_margin: float = 0.04  # link clearance from the obstacle box
+    arm_stride: int = 1  # guide every Nth plan timestep (1 = all; >1 is faster)
 
 
 @wp.kernel(enable_backward=False)
@@ -477,27 +480,17 @@ class FrankaEnv:
         """Store the planned EE path (steps, 3+) for visualization."""
         self.predicted_ee = np.ascontiguousarray(positions, np.float32)[:, :3]
 
-    def apply_action(self, ee_action):
-        """Drive the sim with EE-pose actions, (world_count, 10).
-
-        Each action is EE position (3) + 6D rotation (6) + gripper (1); IK maps
-        the target pose to arm joint targets, the gripper sets both fingers.
-        """
+    def apply_action(self, action):
+        """Drive the sim with joint-target actions, (world_count, 8): 7 arm joint
+        targets + gripper. Executed directly (no IK), so the planned arm posture
+        runs verbatim and whole-arm obstacle guidance steers the elbow/wrist. The
+        EE pose stays in the observation (FK), so it is still available to guidance."""
         n = self.cfg.world_count
-        a = np.ascontiguousarray(np.asarray(ee_action, np.float32).reshape(n, 10))
-        pos = np.ascontiguousarray(a[:, :3])
-        quat = rot6d_to_quat(a[:, 3:9])
-        fingers = np.repeat(a[:, 9:10], 2, axis=1)
-
-        wp.copy(self.ee_pos_target, wp.array(pos, dtype=wp.vec3))
-        wp.copy(self.ee_rot_target, wp.array(quat, dtype=wp.vec4))
-        self.pos_obj.set_target_positions(self.ee_pos_target)
-        self.rot_obj.set_target_rotations(self.ee_rot_target)
-        jq = self.joint_q_ik
-        self.ik_solver.step(jq, jq, iterations=self.cfg.ik_iters)
-
+        a = np.ascontiguousarray(np.asarray(action, np.float32).reshape(n, 8))
+        arm = np.ascontiguousarray(a[:, :7])
+        fingers = np.repeat(a[:, 7:8], 2, axis=1)
         jt = self.control.joint_target_pos.reshape((n, -1))
-        wp.copy(dest=jt[:, :7], src=jq[:, :7])
+        wp.copy(dest=jt[:, :7], src=wp.array(arm, dtype=wp.float32))
         wp.copy(dest=jt[:, 7:9], src=wp.array(fingers, dtype=wp.float32))
         self.simulate()
         self.sim_time += self.frame_dt
@@ -519,11 +512,10 @@ class FrankaEnv:
         return obs.astype(np.float32)
 
     def record_frame(self):
-        # action: EE target pos (3) + 6D rotation (6) + gripper (1)
-        pos = self.ee_pos_target.numpy()
-        rot6d = quat_to_rot6d(self.ee_rot_target.numpy())
-        grip = self.gripper_target.numpy()[:, :1]
-        action = np.concatenate([pos, rot6d, grip], axis=1).astype(np.float32)
+        # action: 7 arm joint targets + gripper (1), executed directly by apply_action
+        n = self.cfg.world_count
+        jt = self.control.joint_target_pos.numpy().reshape(n, -1)
+        action = np.concatenate([jt[:, :7], jt[:, 7:8]], axis=1).astype(np.float32)
         return self.get_obs(), action
 
     def success(self):

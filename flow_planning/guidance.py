@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from flow_planning.kinematics import build_franka_robot_sdf
+
 
 @dataclass
 class GuidanceConfig:
@@ -136,6 +138,74 @@ class ObstacleGuidance:
         return grad
 
 
+class ArmObstacleGuidance:
+    """Whole-arm collision cost using per-link mesh SDFs (pytorch_volumetric).
+
+    The planned joint-target action dims are run through the robot's
+    differentiable per-link signed-distance field; points sampled throughout the
+    obstacle box are pushed outside the robot surface (+margin), so the gradient
+    moves the actual link geometry off the obstacle. Unlike a uniform-margin
+    skeleton this resolves per-link thickness, letting the thin gripper reach the
+    cube while the bulky forearm keeps clearance. The horizon is subsampled by
+    `stride` for speed; query points live in the robot base frame."""
+
+    def __init__(
+        self,
+        robot_sdf,
+        njoints,
+        center,
+        half_extents,
+        base_pos,
+        joint_mean,
+        joint_std,
+        scale: float,
+        margin: float,
+        device: str,
+        joint_start: int,
+        n_arm: int = 7,
+        stride: int = 8,
+        grid=(5, 3, 5),
+    ):
+        kw = {"dtype": torch.float32, "device": device}
+        self.robot_sdf = robot_sdf
+        self.njoints = njoints
+        self.n_arm = n_arm
+        self.scale = scale
+        self.margin = margin
+        self.joint_start = joint_start
+        self.stride = stride
+        self.mean = torch.as_tensor(joint_mean, **kw)
+        self.std = torch.as_tensor(joint_std, **kw)
+        # obstacle-box sample points, expressed in the robot base frame
+        c = torch.as_tensor(center, **kw)
+        h = torch.as_tensor(half_extents, **kw)
+        axes = [
+            torch.linspace(-1.0, 1.0, g, dtype=torch.float32, device=device)
+            for g in grid
+        ]
+        mesh = torch.stack(torch.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+        self.box_base = (c + mesh * h - torch.as_tensor(base_pos, **kw)).contiguous()
+
+    def reset(self):
+        pass
+
+    def __call__(self, x1_hat: Tensor, obs: Tensor | None = None) -> Tensor:
+        with torch.enable_grad():
+            x = x1_hat.detach().requires_grad_(True)
+            s = self.joint_start
+            q = x[..., s : s + self.n_arm] * self.std + self.mean  # (B, H, n_arm)
+            q = q[:, :: self.stride]  # subsample horizon for speed
+            m = q.shape[0] * q.shape[1]
+            pad = x.new_zeros(m, self.njoints - self.n_arm)  # finger joints unused
+            self.robot_sdf.set_joint_configuration(
+                torch.cat([q.reshape(m, self.n_arm), pad], dim=1)
+            )
+            vals, _ = self.robot_sdf(self.box_base)  # (m, N) box-point -> robot dist
+            cost = self.scale * torch.relu(self.margin - vals).square().sum()
+            (grad,) = torch.autograd.grad(cost, x)
+        return grad
+
+
 class Guidance:
     """Sum of the enabled guidance terms, with a per-rollout reset for stateful
     terms. `action_stats` is the action `{"mean", "std"}` (the obstacle term acts
@@ -143,12 +213,36 @@ class Guidance:
     trajectory); `env` supplies the obstacle geometry. With no term enabled the
     sum is a harmless zero."""
 
-    def __init__(self, cfg, env, state_dim, action_stats, device):
+    def __init__(self, cfg, env, state_dim, action_stats, device, obs_stats=None):
         self.terms = []
-        if env.cfg.obstacle and env.cfg.obstacle_scale > 0:
+        geom = env.obstacle_geometry if env.cfg.obstacle else None
+        arm = hasattr(env.cfg, "ee_index")
+        # franka: whole-arm term on the executed joint-target action dims via SDF
+        if geom and arm and env.cfg.arm_scale > 0:
+            robot_sdf, njoints = build_franka_robot_sdf(device)
+            n_arm = 7
+            self.terms.append(
+                ArmObstacleGuidance(
+                    robot_sdf,
+                    njoints,
+                    center=geom["center"],
+                    half_extents=geom["half_extents"],
+                    base_pos=list(env.robot_base_pos),
+                    joint_mean=action_stats["mean"][:n_arm],
+                    joint_std=action_stats["std"][:n_arm],
+                    scale=env.cfg.arm_scale,
+                    margin=env.cfg.arm_margin,
+                    device=device,
+                    joint_start=state_dim,
+                    n_arm=n_arm,
+                    stride=env.cfg.arm_stride,
+                )
+            )
+        # particle: EE-position term pushes the planned end-effector path off it
+        elif geom and not arm and env.cfg.obstacle_scale > 0:
             self.terms.append(
                 ObstacleGuidance(
-                    **env.obstacle_geometry,
+                    **geom,
                     action_mean=action_stats["mean"],
                     action_std=action_stats["std"],
                     scale=env.cfg.obstacle_scale,
