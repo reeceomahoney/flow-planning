@@ -37,11 +37,13 @@ def collect(cfg: Config, env):
     buffers = [[] for _ in range(cfg.env.world_count)]
     collected = 0
     attempted = 0
+    successful = 0
     pbar = tqdm(total=cfg.episodes, desc="Collecting episodes")
     while collected < cfg.episodes:
         new_episode, success = env.step()
         if new_episode and buffers[0]:
             attempted += cfg.env.world_count
+            successful += int(success.sum())  # count whole batch, not just saved
             for w, buf in enumerate(buffers):
                 if collected >= cfg.episodes:
                     break
@@ -69,7 +71,7 @@ def collect(cfg: Config, env):
     pbar.close()
     dataset.finalize()
     print(f"Saved {dataset.meta.total_episodes} episodes to {dataset.root}")
-    print(f"Demo success rate: {collected / attempted:.1%}")
+    print(f"Demo success rate: {successful / attempted:.1%}")
 
 
 @draccus.wrap()

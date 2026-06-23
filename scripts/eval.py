@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
+from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import Guidance, GuidanceConfig
@@ -85,6 +86,7 @@ def main(cfg: Config):
         succ = np.zeros(n, dtype=bool)
         acts = []
         frame = 0
+        pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
         while frame < frames and viewer.is_running():
             if viewer.should_step():
                 obs = torch.from_numpy(env.get_obs())
@@ -96,11 +98,13 @@ def main(cfg: Config):
                     path = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
                     env.set_predicted_path(path)
                 frame += 1
+                pbar.update(1)
                 succ |= env.success()
                 if (succ | env.failure()).all():
                     break
             if live:
                 env.render()
+        pbar.close()
         if not viewer.is_running():
             break
         fail = env.failure()
