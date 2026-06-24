@@ -33,9 +33,7 @@ class TaskType(enum.IntEnum):
     LIFT = 3
     MOVE_TO_DROP_OFF = 4
     REFINE_DROP_OFF = 5
-    RELEASE = 6
-    RETRACT = 7
-    HOME = 8
+    RELEASE = 6  # last phase; no return-to-home (the empty arm hit the wall)
 
 
 # home arm + finger configuration (fr3_franka_hand)
@@ -71,13 +69,16 @@ class FrankaConfig(EnvConfig):
     obstacle_width: float = 0.15
     obstacle_thickness: float = 0.01
 
+    grasp_symmetry: bool = True  # randomize grasp yaw over the cube's 90° symmetry
     goal_dim: int = 3  # goal xyz
     spacing_uniform: float = 0.0  # arc-length resampling wrecks grasp/release dwell
     obstacle_scale: float = 60.0  # tall barrier needs a stronger push than particle
     obstacle_margin: float = 0.15  # and more clearance to lift the cube over the top
-    arm_scale: float = 50.0  # whole-arm SDF guidance strength (0 disables)
-    arm_margin: float = 0.04  # link clearance from the obstacle box
-    arm_stride: int = 1  # guide every Nth plan timestep (1 = all; >1 is faster)
+    arm_scale: float = 50.0  # geometry-aware FK clearance (gripper+arm), 0 disables
+    arm_margin: float = 0.05  # link/gripper clearance from the obstacle box
+    arm_stride: int = 2  # guide every Nth plan timestep (1 = all; >1 is faster)
+    ee_scale: float = 100.0  # task-space EE-position over-top guidance (0 disables)
+    ee_margin: float = 0.12  # EE clearance from the wall (cube hangs below the EE)
 
 
 @wp.kernel(enable_backward=False)
@@ -87,8 +88,8 @@ def set_target_pose_kernel(
     drop_off_pos: wp.array(dtype=wp.vec3),
     off_approach: wp.vec3,
     off_lift: wp.array(dtype=wp.vec3),
-    off_retract: wp.vec3,
-    home_pos: wp.vec3,
+    grasp_offset: wp.array(dtype=wp.float32),
+    place_offset: wp.array(dtype=wp.float32),
     task_init_body_q: wp.array(dtype=wp.transform),
     body_q: wp.array(dtype=wp.transform),
     ee_index: int,
@@ -113,10 +114,15 @@ def set_target_pose_kernel(
     drop = drop_off_pos[tid]
     ee_quat_target = ee_quat_down
     t_gripper = float(0.0)
+    # place orientation: down + a random yaw (cube 90° symmetry), for wrist diversity
+    q_place = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), place_offset[tid])
+    ee_quat_place = q_place * ee_quat_down
 
     if task == TaskType.APPROACH.value:
+        # rotate the grasp over the cube's 90° symmetry: same grasp, varied wrist
+        q_off = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), grasp_offset[tid])
         ee_pos_target = obj_pos + off_approach
-        ee_quat_target = ee_quat_down * wp.quat_inverse(obj_quat)
+        ee_quat_target = ee_quat_down * wp.quat_inverse(q_off * obj_quat)
     elif task == TaskType.REFINE_APPROACH.value:
         ee_pos_target = obj_pos
         ee_quat_target = ee_quat_prev
@@ -130,17 +136,16 @@ def set_target_pose_kernel(
         t_gripper = 1.0
     elif task == TaskType.MOVE_TO_DROP_OFF.value:
         ee_pos_target = drop + off_approach
+        ee_quat_target = ee_quat_place
         t_gripper = 1.0
     elif task == TaskType.REFINE_DROP_OFF.value:
         ee_pos_target = drop
+        ee_quat_target = ee_quat_place
         t_gripper = 1.0
-    elif task == TaskType.RELEASE.value:
+    else:  # RELEASE
         ee_pos_target = drop
+        ee_quat_target = ee_quat_place
         t_gripper = 1.0 - t
-    elif task == TaskType.RETRACT.value:
-        ee_pos_target = drop + off_retract
-    else:  # HOME
-        ee_pos_target = home_pos
 
     ee_pos_out[tid] = ee_pos_prev * (1.0 - t) + ee_pos_target * t
     q = wp.quat_slerp(ee_quat_prev, ee_quat_target, t)
@@ -153,6 +158,7 @@ def set_target_pose_kernel(
 
 class FrankaEnv:
     TASKS = list(TaskType)
+    ee_state_index = 9  # EE position start in the obs/state vector (after 9 joints)
 
     def __init__(self, cfg: FrankaConfig, viewer):
         self.cfg = cfg
@@ -170,7 +176,6 @@ class FrankaEnv:
         self.robot_base_pos = wp.vec3(top[0] - 0.5, top[1], top[2])
         self.off_approach = wp.vec3(0.0, 0.0, 1.0 * self.cube_size)
         self.off_lift = wp.zeros(cfg.world_count, dtype=wp.vec3)  # per-world, see reset
-        self.off_retract = wp.vec3(0.0, 0.0, 2.0 * self.cube_size)
         cube_z = top[2] + 0.5 * self.cube_size
         self.cube_center = np.array([top[0], top[1] + 0.15, cube_z], np.float32)
         self.goal_center = np.array([top[0], top[1] - 0.15, cube_z], np.float32)
@@ -362,6 +367,8 @@ class FrankaEnv:
         self.ee_pos_target = wp.zeros(n, dtype=wp.vec3)
         self.ee_rot_target = wp.full(n, wp.vec4(0.0, 0.0, 0.0, 1.0), dtype=wp.vec4)
         self.gripper_target = wp.zeros((n, 2), dtype=wp.float32)
+        self.grasp_offset = wp.zeros(n, dtype=wp.float32)  # per-episode grasp-yaw aug
+        self.place_offset = wp.zeros(n, dtype=wp.float32)  # per-episode place-yaw aug
         self.goal_wp = wp.zeros(n, dtype=wp.vec3)
         self.task_idx = 0
         self.task_time = 0.0
@@ -377,6 +384,7 @@ class FrankaEnv:
     def reset(self):
         n = self.cfg.world_count
         cube_start = self.sample(self.cube_center)
+        self.cube_pos_prev = cube_start.copy()  # for the stationarity check
         self.goal_pos = self.sample(self.goal_center)
 
         # random per-world lift height
@@ -389,6 +397,15 @@ class FrankaEnv:
         quat = np.zeros((n, 4), np.float32)
         quat[:, 2] = np.sin(theta / 2)
         quat[:, 3] = np.cos(theta / 2)
+
+        # symmetry aug: random 90° grasp/place yaw; bad ones drop via record's filter
+        def sym(k):
+            o = self.rng.choice([0.0, 0.5, 1.0, 1.5], n) * np.pi
+            o = o if self.cfg.grasp_symmetry else np.zeros(n)
+            wp.copy(k, wp.array(o.astype(np.float32), dtype=wp.float32))
+
+        sym(self.grasp_offset)
+        sym(self.place_offset)
 
         jq = np.zeros((n, self.coords_per_world), np.float32)
         jq[:, :9] = HOME_Q
@@ -423,8 +440,8 @@ class FrankaEnv:
                 self.goal_wp,
                 self.off_approach,
                 self.off_lift,
-                self.off_retract,
-                self.home_ee_pos,
+                self.grasp_offset,
+                self.place_offset,
                 self.task_init_body_q,
                 self.state_0.body_q,
                 self.cfg.ee_index,
@@ -443,6 +460,8 @@ class FrankaEnv:
         wp.copy(dest=jt[:, 7:9], src=self.gripper_target[:, :2])
 
     def simulate(self):
+        n = self.cfg.world_count
+        self.cube_pos_prev = self.state_0.joint_q.numpy().reshape(n, -1)[:, 9:12].copy()
         self.model.collide(self.state_0, self.contacts)
         if self.obstacle_sensor is not None:
             self.obstacle_sensor.update(self.contacts, self.state_0.body_q)
@@ -519,11 +538,16 @@ class FrankaEnv:
         return self.get_obs(), action
 
     def success(self):
-        """Per-world bool: cube within success_dist of the goal, obstacle untouched."""
+        """Per-world bool: cube at goal, released, stationary, obstacle untouched."""
         n = self.cfg.world_count
-        cube_pos = self.state_0.joint_q.numpy().reshape(n, -1)[:, 9:12]
+        jq = self.state_0.joint_q.numpy().reshape(n, -1)
+        cube_pos = jq[:, 9:12]
         dist = np.linalg.norm(cube_pos - self.goal_pos, axis=1)
-        return (dist < self.cfg.success_dist) & ~self.failure()
+        speed = np.linalg.norm(cube_pos - self.cube_pos_prev, axis=1) / self.frame_dt
+        released = jq[:, 7] > 0.035  # first finger joint open
+        return (
+            (dist < self.cfg.success_dist) & released & (speed < 0.05) & ~self.failure()
+        )
 
     def failure(self):
         """Per-world bool: robot or cube has touched the obstacle this episode."""
