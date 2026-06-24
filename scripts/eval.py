@@ -1,6 +1,7 @@
 """Roll out the trained policy: headless batched eval or interactive viewer."""
 
 import itertools
+import time
 from dataclasses import dataclass, field
 
 import draccus
@@ -79,10 +80,12 @@ def main(cfg: Config):
         obs_stats=stats[OBS_STATE],
     )
     chain = build_franka_chain(device)[0]
+    base_pos = np.asarray(env.robot_base_pos, np.float32)  # base frame -> world
 
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
     total_succ = total_fail = total = 0
+    plan_t, n_plan = 0.0, 0  # planning latency (only the frames that replan)
     accels = []  # per-step action accel magnitudes (smoothness proxy)
     episodes = range(cfg.episodes) if cfg.episodes > 0 else itertools.count()
     for ep in episodes:
@@ -97,14 +100,24 @@ def main(cfg: Config):
         while frame < frames and viewer.is_running():
             if viewer.should_step():
                 obs = torch.from_numpy(env.get_obs())
+                replanning = len(policy._action_queue) == 0
+                if replanning:
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                    t0 = time.perf_counter()
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
+                if replanning:
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                    plan_t += time.perf_counter() - t0
+                    n_plan += 1
                 phys = postprocessor(action).numpy().astype(np.float32)
                 acts.append(phys)
                 env.apply_action(phys)
                 if live and policy.last_chunk is not None:
                     chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
                     q = torch.from_numpy(chunk[:, :7]).float().to(device)
-                    path = ee_positions(chain, q).cpu().numpy()
+                    path = ee_positions(chain, q).cpu().numpy() + base_pos
                     env.set_predicted_path(path)
                 frame += 1
                 pbar.update(1)
@@ -141,6 +154,8 @@ def main(cfg: Config):
             f"p99 {np.percentile(ac, 99):.4f} max {ac.max():.3f} "
             f"({total} episodes)"
         )
+    if n_plan:
+        print(f"plan latency: {1e3 * plan_t / n_plan:.1f} ms/replan ({n_plan} replans)")
     viewer.close()
 
 
