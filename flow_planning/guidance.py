@@ -1,17 +1,9 @@
 """Inference-time cost guidance for the flow-matching policy."""
 
-from dataclasses import dataclass
-
 import torch
 from torch import Tensor
 
 from flow_planning.kinematics import build_franka_robot_sdf
-
-
-@dataclass
-class GuidanceConfig:
-    # obstacle scale/margin are env-specific, so they live on the env config
-    smooth_scale: float = 0.5  # >0 adds a plan acceleration penalty (smoothness)
 
 
 def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
@@ -20,22 +12,6 @@ def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
     outside = q.clamp(min=0.0).norm(dim=-1)
     inside = q.amax(dim=-1).clamp(max=0.0)
     return outside + inside
-
-
-class SmoothGuidance:
-    """Acceleration penalty over the planned trajectory, for smoother paths and
-    actions. Composes with the goal/obstacle terms via the same gradient sum."""
-
-    def __init__(self, scale):
-        self.scale = scale
-
-    def __call__(self, x1_hat: Tensor, obs: Tensor) -> Tensor:
-        with torch.enable_grad():
-            x = x1_hat.detach().requires_grad_(True)
-            accel = x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]
-            cost = self.scale * accel.square().sum()
-            (grad,) = torch.autograd.grad(cost, x)
-        return grad
 
 
 class ObstacleGuidance:
@@ -213,7 +189,7 @@ class Guidance:
     trajectory); `env` supplies the obstacle geometry. With no term enabled the
     sum is a harmless zero."""
 
-    def __init__(self, cfg, env, state_dim, action_stats, device, obs_stats=None):
+    def __init__(self, env, state_dim, action_stats, device, obs_stats=None):
         self.terms = []
         geom = env.obstacle_geometry if env.cfg.obstacle else None
         arm = hasattr(env.cfg, "ee_index")
@@ -251,8 +227,6 @@ class Guidance:
                     pos_start=state_dim,
                 )
             )
-        if cfg.smooth_scale > 0:
-            self.terms.append(SmoothGuidance(scale=cfg.smooth_scale))
 
     def __call__(self, x1, obs):
         return sum(g(x1, obs) for g in self.terms)

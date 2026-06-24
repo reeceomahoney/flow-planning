@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
-from flow_planning.guidance import Guidance, GuidanceConfig
+from flow_planning.guidance import Guidance
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
@@ -40,9 +40,6 @@ class Config:
     out_dir: str = "outputs"
     eval_every: int = 10_000
     eval_episodes: int = 256
-    guidance: GuidanceConfig = field(
-        default_factory=lambda: GuidanceConfig(smooth_scale=0.0)
-    )
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
@@ -167,7 +164,6 @@ def main(cfg: Config):
 
     # inference-time guidance for eval rollouts (unused by training forward)
     policy.guidance_fn = Guidance(
-        cfg.guidance,
         env,
         policy.state_dim,
         stats[ACTION],

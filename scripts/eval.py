@@ -12,7 +12,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
-from flow_planning.guidance import Guidance, GuidanceConfig
+from flow_planning.guidance import Guidance
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -27,7 +27,6 @@ class Config:
     repo_id: str = "reece-omahoney/franka"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    guidance: GuidanceConfig = field(default_factory=GuidanceConfig)
     episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
     viewer: str = "none"  # "none", "rerun", or "opengl"
@@ -72,7 +71,6 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     policy.guidance_fn = Guidance(
-        cfg.guidance,
         env,
         policy.state_dim,
         stats[ACTION],
