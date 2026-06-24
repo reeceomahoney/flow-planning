@@ -35,15 +35,6 @@ def build_franka_chain(device: str):
     return chain, len(chain.get_joint_parameter_names()), str(asset) + "/"
 
 
-def build_franka_robot_sdf(device: str):
-    """Per-link signed-distance field for the franka. Returns (RobotSDF,
-    njoints). Query points are in the robot base frame."""
-    import pytorch_volumetric as pv
-
-    chain, njoints, path_prefix = build_franka_chain(device)
-    return pv.RobotSDF(chain, path_prefix=path_prefix), njoints
-
-
 def ee_positions(chain, q: Tensor) -> Tensor:
     """q: (B, n_arm) arm joint angles -> (B, 3) EE position in the base frame."""
     njoints = len(chain.get_joint_parameter_names())

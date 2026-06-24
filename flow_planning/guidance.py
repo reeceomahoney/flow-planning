@@ -1,9 +1,11 @@
 """Inference-time cost guidance for the flow-matching policy."""
 
+import os
+
 import torch
 from torch import Tensor
 
-from flow_planning.kinematics import build_franka_robot_sdf
+from flow_planning.kinematics import build_franka_chain
 
 
 def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
@@ -15,26 +17,19 @@ def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
 
 
 class ObstacleGuidance:
-    """Collision-cost gradient on a normalized action chunk.
+    """Push the trajectory position at `pos_start` off the obstacle box.
 
-    The leading `len(center)` action dims are unnormalized into positions and
-    pushed off the obstacle by a squared hinge on its box SDF. The cost is
-    evaluated on points interpolated along the path so segments crossing a thin
-    obstacle between waypoints are also penalized. A thin obstacle's SDF
-    gradient points off its broad face, which stalls a crossing path against it
-    instead of routing it past an edge, so points inside the blocked band can
-    additionally be pushed past the nearest free edge: `around` routes them
-    beyond the obstacle's x extent, `over_top` lifts them above it. The
-    returned gradient lives in the policy's normalized action space.
-    `center`/`half_extents` are one box (d,) or per-batch boxes (B, d).
+    `around`/`over_top` route past a thin wall's edge (a plain push-off stalls
+    against its broad face). `pos_mean`/`pos_std` + `pos_start` pick the dims:
+    action EE, or state EE/cube to compose in task space.
     """
 
     def __init__(
         self,
         center,
         half_extents,
-        action_mean,
-        action_std,
+        pos_mean,
+        pos_std,
         scale: float,
         margin: float,
         device: str,
@@ -50,11 +45,9 @@ class ObstacleGuidance:
             self.center = self.center.unsqueeze(1)
             self.half_extents = self.half_extents.unsqueeze(1)
         d = self.center.shape[-1]
-        # the avoided position is the leading d action dims (EE/target position);
-        # actions sit after the state in the trajectory, hence pos_start
         self.pos_start = pos_start
-        self.mean = torch.as_tensor(action_mean, **kw)[:d]
-        self.std = torch.as_tensor(action_std, **kw)[:d]
+        self.mean = torch.as_tensor(pos_mean, **kw)[:d]
+        self.std = torch.as_tensor(pos_std, **kw)[:d]
         self.scale = scale
         self.margin = margin
         self.around = around
@@ -115,19 +108,32 @@ class ObstacleGuidance:
 
 
 class ArmObstacleGuidance:
-    """Whole-arm collision cost using per-link mesh SDFs (pytorch_volumetric).
+    """Push FK arm/gripper collision points off the obstacle box.
 
-    The planned joint-target action dims are run through the robot's
-    differentiable per-link signed-distance field; points sampled throughout the
-    obstacle box are pushed outside the robot surface (+margin), so the gradient
-    moves the actual link geometry off the obstacle. Unlike a uniform-margin
-    skeleton this resolves per-link thickness, letting the thin gripper reach the
-    cube while the bulky forearm keeps clearance. The horizon is subsampled by
-    `stride` for speed; query points live in the robot base frame."""
+    Points carry each frame's full transform, so a wrist roll moves the
+    fingertips and the gradient reaches the wrist — clearance a single-point EE
+    cost can't express. Routing is left to the EE-position term.
+    """
+
+    # body-frame collision points (m); fingertips offset along the hand y so a
+    # wrist roll moves them relative to the wall
+    SAMPLES = {
+        "link5": [[0.0, 0.0, 0.0]],
+        "link6": [[0.0, 0.0, 0.0]],
+        "link7": [[0.0, 0.0, 0.0]],
+        "hand": [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.10],
+            [0.0, 0.04, 0.10],
+            [0.0, -0.04, 0.10],
+            [0.0, 0.04, 0.06],
+            [0.0, -0.04, 0.06],
+        ],
+    }
 
     def __init__(
         self,
-        robot_sdf,
+        chain,
         njoints,
         center,
         half_extents,
@@ -139,11 +145,10 @@ class ArmObstacleGuidance:
         device: str,
         joint_start: int,
         n_arm: int = 7,
-        stride: int = 8,
-        grid=(5, 3, 5),
+        stride: int = 2,
     ):
         kw = {"dtype": torch.float32, "device": device}
-        self.robot_sdf = robot_sdf
+        self.chain = chain
         self.njoints = njoints
         self.n_arm = n_arm
         self.scale = scale
@@ -152,18 +157,33 @@ class ArmObstacleGuidance:
         self.stride = stride
         self.mean = torch.as_tensor(joint_mean, **kw)
         self.std = torch.as_tensor(joint_std, **kw)
-        # obstacle-box sample points, expressed in the robot base frame
-        c = torch.as_tensor(center, **kw)
-        h = torch.as_tensor(half_extents, **kw)
-        axes = [
-            torch.linspace(-1.0, 1.0, g, dtype=torch.float32, device=device)
-            for g in grid
-        ]
-        mesh = torch.stack(torch.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
-        self.box_base = (c + mesh * h - torch.as_tensor(base_pos, **kw)).contiguous()
+        # obstacle box in the robot base frame (FK frames are base-relative)
+        self.center = torch.as_tensor(center, **kw) - torch.as_tensor(base_pos, **kw)
+        self.half_extents = torch.as_tensor(half_extents, **kw)
+        # resolve each SAMPLES key to a real frame and stash its body-frame points
+        names = chain.get_frame_names(exclude_fixed=False)
+        self.frames, self.offsets = [], []
+        for key, pts in self.SAMPLES.items():
+            match = next((n for n in names if key in n and "tcp" not in n), None)
+            assert match is not None, f"no frame matches {key}"
+            self.frames.append(match)
+            self.offsets.append(torch.as_tensor(pts, **kw))
+        self.frame_indices = chain.get_frame_indices(*self.frames)
 
     def reset(self):
         pass
+
+    def collision_points(self, q: Tensor) -> Tensor:
+        """FK the (m, n_arm) configs and place the body-fixed points: (m, K, 3)."""
+        m = q.shape[0]
+        th = torch.cat([q, q.new_zeros(m, self.njoints - self.n_arm)], dim=1)
+        tf = self.chain.forward_kinematics(th, self.frame_indices)
+        pts = []
+        for name, off in zip(self.frames, self.offsets):
+            mat = tf[name].get_matrix()  # (m, 4, 4)
+            r, t = mat[:, :3, :3], mat[:, :3, 3]
+            pts.append(torch.einsum("mij,kj->mki", r, off) + t[:, None, :])
+        return torch.cat(pts, dim=1)
 
     def __call__(self, x1_hat: Tensor, obs: Tensor | None = None) -> Tensor:
         with torch.enable_grad():
@@ -171,14 +191,17 @@ class ArmObstacleGuidance:
             s = self.joint_start
             q = x[..., s : s + self.n_arm] * self.std + self.mean  # (B, H, n_arm)
             q = q[:, :: self.stride]  # subsample horizon for speed
-            m = q.shape[0] * q.shape[1]
-            pad = x.new_zeros(m, self.njoints - self.n_arm)  # finger joints unused
-            self.robot_sdf.set_joint_configuration(
-                torch.cat([q.reshape(m, self.n_arm), pad], dim=1)
-            )
-            vals, _ = self.robot_sdf(self.box_base)  # (m, N) box-point -> robot dist
-            cost = self.scale * torch.relu(self.margin - vals).square().sum()
+            pts = self.collision_points(q.reshape(-1, self.n_arm))  # (m, K, 3)
+            sdf = box_sdf(pts, self.center, self.half_extents)
+            cost = self.scale * torch.relu(self.margin - sdf).square().sum()
             (grad,) = torch.autograd.grad(cost, x)
+        if os.environ.get("GUIDANCE_DEBUG"):
+            pen = (sdf < self.margin).float().mean().item()
+            print(
+                f"[arm] grad={grad.norm().item():.4f} "
+                f"sdf_min={sdf.min().item():.3f} pen_frac={pen:.3f}",
+                flush=True,
+            )
         return grad
 
 
@@ -193,13 +216,13 @@ class Guidance:
         self.terms = []
         geom = env.obstacle_geometry if env.cfg.obstacle else None
         arm = hasattr(env.cfg, "ee_index")
-        # franka: whole-arm term on the executed joint-target action dims via SDF
+        # franka: FK arm/gripper clearance (wrist DOF) + EE-position routing
         if geom and arm and env.cfg.arm_scale > 0:
-            robot_sdf, njoints = build_franka_robot_sdf(device)
+            chain, njoints, _ = build_franka_chain(device)
             n_arm = 7
             self.terms.append(
                 ArmObstacleGuidance(
-                    robot_sdf,
+                    chain,
                     njoints,
                     center=geom["center"],
                     half_extents=geom["half_extents"],
@@ -214,13 +237,29 @@ class Guidance:
                     stride=env.cfg.arm_stride,
                 )
             )
+        # franka: over-top routing on the EE position (in the state dims)
+        if geom and arm and obs_stats is not None and env.cfg.ee_scale > 0:
+            ee = env.ee_state_index
+            self.terms.append(
+                ObstacleGuidance(
+                    center=geom["center"],
+                    half_extents=geom["half_extents"],
+                    pos_mean=obs_stats["mean"][ee:],
+                    pos_std=obs_stats["std"][ee:],
+                    scale=env.cfg.ee_scale,
+                    margin=env.cfg.ee_margin,
+                    device=device,
+                    pos_start=ee,
+                    over_top=geom.get("over_top", False),
+                )
+            )
         # particle: EE-position term pushes the planned end-effector path off it
         elif geom and not arm and env.cfg.obstacle_scale > 0:
             self.terms.append(
                 ObstacleGuidance(
                     **geom,
-                    action_mean=action_stats["mean"],
-                    action_std=action_stats["std"],
+                    pos_mean=action_stats["mean"],
+                    pos_std=action_stats["std"],
                     scale=env.cfg.obstacle_scale,
                     margin=env.cfg.obstacle_margin,
                     device=device,
