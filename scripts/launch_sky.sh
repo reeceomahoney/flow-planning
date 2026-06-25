@@ -5,5 +5,5 @@ set -euo pipefail
 if [[ $# -gt 0 ]]; then
   sky exec "$1" configs/sky.yaml --env HF_TOKEN --env WANDB_API_KEY "${@:2}"
 else
-  sky launch configs/sky.yaml -y --env HF_TOKEN --env WANDB_API_KEY
+  sky launch configs/sky.yaml -c flow -y --env HF_TOKEN --env WANDB_API_KEY
 fi
