@@ -241,7 +241,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             t = torch.full((n,), i * dt, device=x.device)
             v = self.model(x, t, state, goal)
             if self.guidance_fn is not None:
-                v = v - self.guidance_fn(x + (1 - i * dt) * v, obs)
+                v = v - self.guidance_fn(x, v, t, obs)
             x = x + dt * v
         acts = x[..., self.state_dim :]  # normalized action dims
         acts = even_spacing(acts, self.config.spacing_uniform)

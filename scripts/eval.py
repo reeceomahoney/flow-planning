@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import Guidance
+from flow_planning.guidance_net import LearnedGuidance
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -32,6 +33,8 @@ class Config:
     viewer: str = "none"  # "none", "rerun", or "opengl"
     rrd: str = ""  # record a rerun .rrd to this path (view locally: `rerun <rrd>`)
     seed: int = 0
+    learned_guidance_ckpt: str = ""  # use GuidanceNet instead of hand-crafted cost
+    learned_guidance_scale: float = 1.0
 
 
 @draccus.wrap()
@@ -70,13 +73,24 @@ def main(cfg: Config):
         )
         policy.action_clip = (low, high)
 
-    policy.guidance_fn = Guidance(
-        env,
-        policy.state_dim,
-        stats[ACTION],
-        device,
-        obs_stats=stats[OBS_STATE],
-    )
+    if cfg.learned_guidance_ckpt:
+        geom = env.obstacle_geometry
+        policy.guidance_fn = LearnedGuidance(
+            cfg.learned_guidance_ckpt,
+            geom["center"] + geom["half_extents"],
+            stats[OBS_STATE],
+            env.ee_state_index,
+            device,
+            cfg.learned_guidance_scale,
+        )
+    else:
+        policy.guidance_fn = Guidance(
+            env,
+            policy.state_dim,
+            stats[ACTION],
+            device,
+            obs_stats=stats[OBS_STATE],
+        )
     chain = build_franka_chain(device)[0]
     base_pos = np.asarray(env.robot_base_pos, np.float32)  # base frame -> world
 

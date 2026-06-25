@@ -267,8 +267,9 @@ class Guidance:
                 )
             )
 
-    def __call__(self, x1, obs):
-        return sum(g(x1, obs) for g in self.terms)
+    def __call__(self, x, v, t, obs):
+        x1_hat = x + (1 - t.view(-1, 1, 1)) * v
+        return sum(g(x1_hat, obs) for g in self.terms)
 
     def reset(self):
         for g in self.terms:
