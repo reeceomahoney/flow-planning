@@ -411,7 +411,7 @@ class FrankaEnv:
             wp.copy(k, wp.array(o.astype(np.float32), dtype=wp.float32))
 
         sym(self.grasp_offset)
-        # place orientation stays straight-down: no place-yaw aug
+        sym(self.place_offset)
 
         jq = np.zeros((n, self.coords_per_world), np.float32)
         jq[:, :9] = HOME_Q
