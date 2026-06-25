@@ -28,13 +28,13 @@ class Config:
     repo_id: str = "reece-omahoney/franka"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
+    episodes: int = 1  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 20.0
     viewer: str = "none"  # "none", "rerun", or "opengl"
     rrd: str = ""  # record a rerun .rrd to this path (view locally: `rerun <rrd>`)
     seed: int = 0
-    learned_guidance_ckpt: str = ""  # use GuidanceNet instead of hand-crafted cost
-    learned_guidance_scale: float = 1.0
+    learned_guidance_ckpt: str = "outputs/guidance_net.pt"
+    learned_guidance_scale: float = 35.0
 
 
 @draccus.wrap()
