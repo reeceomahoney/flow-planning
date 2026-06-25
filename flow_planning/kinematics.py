@@ -19,6 +19,10 @@ def build_franka_chain(device: str):
     covers the gripper); collision STLs serve as the link meshes for the SDF."""
     import newton.utils
     import pytorch_kinematics as pk
+    from pytorch_kinematics.urdf_parser_py.xml_reflection import core as xml_core
+
+    # silence stderr spam for vendor URDF extensions the parser ignores anyway
+    xml_core.on_error = lambda msg: None  # ty: ignore[invalid-assignment]
 
     asset = newton.utils.download_asset("franka_emika_panda")
     urdf = (asset / "urdf/fr3_franka_hand.urdf").read_text()
