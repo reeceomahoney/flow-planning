@@ -78,24 +78,34 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
     env.rng = np.random.default_rng(0)
     n = env.cfg.world_count
     successes = 0
+    stage_sum = 0  # avg furthest pick-place stage reached, as a dense reward
     total = 0
 
     for _ in range(math.ceil(n_episodes / n)):
         env.reset()
         policy.reset()
+        max_stage = np.zeros(n, int)
         for _ in range(env.episode_frames):
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
             env.apply_action(postprocessor(action).numpy().astype(np.float32))
+            max_stage = np.maximum(max_stage, env.stage())
         successes += int(env.success().sum())
+        stage_sum += int(max_stage.sum())
         total += n
     policy.train()
 
     sr = successes / total
+    reward = stage_sum / total
     wandb.log(
-        {"eval/success_rate": sr, "eval/time": time.perf_counter() - t0}, step=step
+        {
+            "eval/success_rate": sr,
+            "eval/reward": reward,
+            "eval/time": time.perf_counter() - t0,
+        },
+        step=step,
     )
-    print(f"step {step}  eval success rate {sr:.1%}", flush=True)
+    print(f"step {step}  eval success rate {sr:.1%}  reward {reward:.2f}", flush=True)
 
 
 def save_policy(policy, out_dir):

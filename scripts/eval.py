@@ -85,6 +85,8 @@ def main(cfg: Config):
     total_succ = total_fail = total = 0
     plan_t, n_plan = 0.0, 0  # planning latency (only the frames that replan)
     accels = []  # per-step action accel magnitudes (smoothness proxy)
+    stages = getattr(env, "STAGES", None)  # franka pick-place stage ladder
+    stage_hist = np.zeros(len(stages) if stages else 0, int)
     episodes = range(cfg.episodes) if cfg.episodes > 0 else itertools.count()
     for ep in episodes:
         if not viewer.is_running():
@@ -92,6 +94,7 @@ def main(cfg: Config):
         policy.reset()
         env.reset()
         succ = np.zeros(n, dtype=bool)
+        max_stage = np.zeros(n, int)
         acts = []
         frame = 0
         pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
@@ -120,6 +123,8 @@ def main(cfg: Config):
                 frame += 1
                 pbar.update(1)
                 succ |= env.success()
+                if stages is not None:
+                    max_stage = np.maximum(max_stage, env.stage())
                 if (succ | env.failure()).all():
                     break
             if live:
@@ -141,6 +146,13 @@ def main(cfg: Config):
             f"failure {fail.mean():.3f} timeout {stuck.mean():.3f} "
             f"accel_p95 {accel_p95:.4f} "
         )
+        if stages is not None:
+            counts = np.bincount(max_stage, minlength=len(stages))
+            stage_hist += counts
+            print(
+                "  stage: "
+                + "  ".join(f"{name} {c / n:.2f}" for name, c in zip(stages, counts))
+            )
 
     if total:
         ac = np.concatenate(accels)
@@ -151,6 +163,16 @@ def main(cfg: Config):
             f"accel_p95 {np.percentile(ac, 95):.4f} "
             f"p99 {np.percentile(ac, 99):.4f} max {ac.max():.3f} "
             f"({total} episodes)"
+        )
+    if stages is not None and total:
+        reward = sum(i * c for i, c in enumerate(stage_hist)) / total
+        print(f"overall reward (avg furthest stage reached): {reward:.2f}")
+        print("overall stage (furthest reached, fraction of episodes):")
+        print(
+            "  "
+            + "  ".join(
+                f"{name} {c / total:.3f}" for name, c in zip(stages, stage_hist)
+            )
         )
     if n_plan:
         print(f"plan latency: {1e3 * plan_t / n_plan:.1f} ms/replan ({n_plan} replans)")

@@ -33,7 +33,8 @@ class TaskType(enum.IntEnum):
     LIFT = 3
     MOVE_TO_DROP_OFF = 4
     REFINE_DROP_OFF = 5
-    RELEASE = 6  # last phase; no return-to-home (the empty arm hit the wall)
+    RELEASE = 6
+    RETRACT = 7
 
 
 # home arm + finger configuration (fr3_franka_hand)
@@ -90,6 +91,7 @@ def set_target_pose_kernel(
     off_lift: wp.array(dtype=wp.vec3),
     grasp_offset: wp.array(dtype=wp.float32),
     place_offset: wp.array(dtype=wp.float32),
+    off_retract: wp.vec3,
     task_init_body_q: wp.array(dtype=wp.transform),
     body_q: wp.array(dtype=wp.transform),
     ee_index: int,
@@ -142,10 +144,12 @@ def set_target_pose_kernel(
         ee_pos_target = drop
         ee_quat_target = ee_quat_place
         t_gripper = 1.0
-    else:  # RELEASE
+    elif task == TaskType.RELEASE.value:
         ee_pos_target = drop
         ee_quat_target = ee_quat_place
         t_gripper = 1.0 - t
+    else:
+        ee_pos_target = drop + off_retract
 
     ee_pos_out[tid] = ee_pos_prev * (1.0 - t) + ee_pos_target * t
     q = wp.quat_slerp(ee_quat_prev, ee_quat_target, t)
@@ -176,6 +180,7 @@ class FrankaEnv:
         self.robot_base_pos = wp.vec3(top[0] - 0.5, top[1], top[2])
         self.off_approach = wp.vec3(0.0, 0.0, 1.0 * self.cube_size)
         self.off_lift = wp.zeros(cfg.world_count, dtype=wp.vec3)  # per-world, see reset
+        self.off_retract = wp.vec3(0.0, 0.0, 2.0 * self.cube_size)
         cube_z = top[2] + 0.5 * self.cube_size
         self.cube_center = np.array([top[0], top[1] + 0.15, cube_z], np.float32)
         self.goal_center = np.array([top[0], top[1] - 0.15, cube_z], np.float32)
@@ -385,6 +390,7 @@ class FrankaEnv:
         n = self.cfg.world_count
         cube_start = self.sample(self.cube_center)
         self.cube_pos_prev = cube_start.copy()  # for the stationarity check
+        self.cube_start_z = cube_start[:, 2].copy()  # for the lift/grasp stage check
         self.goal_pos = self.sample(self.goal_center)
 
         # random per-world lift height
@@ -405,7 +411,7 @@ class FrankaEnv:
             wp.copy(k, wp.array(o.astype(np.float32), dtype=wp.float32))
 
         sym(self.grasp_offset)
-        sym(self.place_offset)
+        # place orientation stays straight-down: no place-yaw aug
 
         jq = np.zeros((n, self.coords_per_world), np.float32)
         jq[:, :9] = HOME_Q
@@ -442,6 +448,7 @@ class FrankaEnv:
                 self.off_lift,
                 self.grasp_offset,
                 self.place_offset,
+                self.off_retract,
                 self.task_init_body_q,
                 self.state_0.body_q,
                 self.cfg.ee_index,
@@ -548,6 +555,26 @@ class FrankaEnv:
         return (
             (dist < self.cfg.success_dist) & released & (speed < 0.05) & ~self.failure()
         )
+
+    STAGES = ["none", "grasped", "over_goal", "placed", "released"]
+
+    def stage(self):
+        """Per-world int: furthest pick-place stage reached, to localize failures."""
+        n = self.cfg.world_count
+        jq = self.state_0.joint_q.numpy().reshape(n, -1)
+        cube = jq[:, 9:12]
+        d3 = np.linalg.norm(cube - self.goal_pos, axis=1)
+        dxy = np.linalg.norm(cube[:, :2] - self.goal_pos[:, :2], axis=1)
+        lifted = cube[:, 2] > self.cube_start_z + 0.05
+        released = jq[:, 7] > 0.035
+        speed = np.linalg.norm(cube - self.cube_pos_prev, axis=1) / self.frame_dt
+        sd = self.cfg.success_dist
+        s = np.zeros(n, dtype=np.int64)
+        s[lifted] = 1
+        s[lifted & (dxy < 2 * sd)] = 2
+        s[d3 < sd] = 3
+        s[(d3 < sd) & released & (speed < 0.05)] = 4
+        return s
 
     def failure(self):
         """Per-world bool: robot or cube has touched the obstacle this episode."""
