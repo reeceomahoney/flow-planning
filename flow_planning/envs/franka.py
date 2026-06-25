@@ -303,6 +303,7 @@ class FrankaEnv:
 
     def build_scene(self, franka: newton.ModelBuilder):
         scene = newton.ModelBuilder()
+        newton.solvers.SolverMuJoCo.register_custom_attributes(scene)
         for world_id in range(self.cfg.world_count):
             scene.begin_world()
             scene.add_builder(franka)
@@ -317,7 +318,7 @@ class FrankaEnv:
         body = scene.add_body(
             xform=wp.transform(wp.vec3(*self.cube_center), wp.quat_identity())
         )
-        scene.add_shape_box(
+        sid = scene.add_shape_box(
             body=body,
             hx=half,
             hy=half,
@@ -326,6 +327,10 @@ class FrankaEnv:
             label=f"world_{world_id}/cube",
             color=[0.8, 0.2, 0.2],
         )
+        # condim 6 enables torsional friction so the cube can't spin in the gripper
+        condim = scene.custom_attributes["mujoco:condim"].values
+        assert condim is not None
+        condim[sid] = 6
 
     # -------------------------------------------------------------------- ik
     def setup_ik(self):
