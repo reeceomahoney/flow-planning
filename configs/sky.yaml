@@ -1,4 +1,4 @@
-name: distal-train
+name: flow-planning
 
 resources:
   infra: ssh/ori
@@ -22,4 +22,6 @@ run: |
   # rm -rf /home/sky/.cache/huggingface/lerobot/reece-omahoney/franka
   # uv run scripts/record.py
   uv run scripts/train.py
+  # uv run scripts/train_guidance.py
+  # uv run scripts/eval.py --env.type franka --env.obstacle true
 

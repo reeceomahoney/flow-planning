@@ -40,10 +40,11 @@ def make_run_dir(base: str, env_name: str) -> Path:
 
 
 def latest_run_dir(base: str, env_name: str) -> Path:
-    runs = sorted(p for p in (Path(base) / env_name).glob("*/*") if p.is_dir())
+    # sort by mtime, not name: clock/tz skew makes timestamp names unreliable
+    runs = [p for p in (Path(base) / env_name).glob("*/*") if p.is_dir()]
     if not runs:
         raise FileNotFoundError(f"No runs found under {base}/{env_name}")
-    return runs[-1]
+    return max(runs, key=lambda p: p.stat().st_mtime)
 
 
 # ------------------------------------------------------------- 6D rotations

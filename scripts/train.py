@@ -85,7 +85,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
         env.reset()
         policy.reset()
         max_stage = np.zeros(n, int)
-        for _ in range(env.episode_frames):
+        for _ in range(int(1.5 * env.episode_frames)):
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
             env.apply_action(postprocessor(action).numpy().astype(np.float32))
