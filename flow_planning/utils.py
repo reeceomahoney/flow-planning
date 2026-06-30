@@ -1,4 +1,4 @@
-"""Small shared helpers: run-dir paths, 6D-rotation conversions, plan spacing."""
+"""Small shared helpers: run-dir paths, 6D-rotation conversions."""
 
 from datetime import datetime
 from pathlib import Path
@@ -6,9 +6,7 @@ from urllib.parse import quote
 
 import newton.viewer
 import numpy as np
-import torch
 from scipy.spatial.transform import Rotation
-from torch import Tensor
 
 
 def make_viewer(name: str, rrd: str = ""):
@@ -69,26 +67,3 @@ def rot6d_to_quat(d):
     b3 = np.cross(b1, b2)
     R = np.stack([b1, b2, b3], axis=2)
     return Rotation.from_matrix(R).as_quat().astype(np.float32)
-
-
-# --------------------------------------------------------------- plan spacing
-
-
-def even_spacing(acts: Tensor, uniform: float) -> Tensor:
-    """Reparametrize the planned action path toward equal arc-length spacing."""
-    if uniform <= 0:
-        return acts
-    b, h, c = acts.shape
-    seg = (acts[:, 1:] - acts[:, :-1]).norm(dim=-1)  # (B, H-1)
-    cum = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(-1)], dim=1)  # (B, H)
-    total = cum[:, -1:]
-    u = torch.linspace(0, 1, h, device=acts.device, dtype=acts.dtype)
-    tgt = (1 - uniform) * cum + uniform * u[None, :] * total  # (B, H) arc lengths
-    hi = torch.searchsorted(cum, tgt).clamp(1, h - 1)
-    lo = hi - 1
-    c_lo, c_hi = torch.gather(cum, 1, lo), torch.gather(cum, 1, hi)
-    w = ((tgt - c_lo) / (c_hi - c_lo).clamp_min(1e-9)).unsqueeze(-1)
-    g_lo = lo.unsqueeze(-1).expand(-1, -1, c)
-    g_hi = hi.unsqueeze(-1).expand(-1, -1, c)
-    p_lo, p_hi = torch.gather(acts, 1, g_lo), torch.gather(acts, 1, g_hi)
-    return p_lo + w * (p_hi - p_lo)

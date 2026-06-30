@@ -67,7 +67,6 @@ def main(cfg: Config):
         output_features=output_features,
         device=device,
         goal_dim=cfg.env.goal_dim,
-        spacing_uniform=cfg.env.spacing_uniform,
     )
     policy_cfg.horizon = max(dataset.meta.episodes["length"])
     delta = {

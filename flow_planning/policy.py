@@ -42,8 +42,6 @@ from lerobot.utils.constants import (
 )
 from torch import Tensor
 
-from flow_planning.utils import even_spacing
-
 
 @PreTrainedConfig.register_subclass("flow_matching")
 @dataclass
@@ -52,7 +50,7 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # dimensions
     horizon: int = 50
-    n_action_steps: int = 40  # replan interval; ~40 best with uniform spacing
+    n_action_steps: int = 40  # replan interval (receding horizon)
     goal_dim: int = field(kw_only=True)  # trailing obs dims; set from env.goal_dim
 
     # architecture
@@ -64,7 +62,6 @@ class FlowMatchingConfig(PreTrainedConfig):
     # flow matching
     num_inference_steps: int = 10
     action_lpf: float = 0.3  # EMA alpha on executed actions; <1 smooths seam jumps
-    spacing_uniform: float = 1.0  # arc-length resample of the plan; 0=raw, 1=uniform
 
     # training
     optimizer_lr: float = 1e-4
@@ -244,7 +241,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 v = v - self.guidance_fn(x, v, t, obs)
             x = x + dt * v
         acts = x[..., self.state_dim :]  # normalized action dims
-        acts = even_spacing(acts, self.config.spacing_uniform)
         if self.action_clip is not None:
             acts = acts.clamp(self.action_clip[0], self.action_clip[1])
         return acts

@@ -72,7 +72,6 @@ class FrankaConfig(EnvConfig):
 
     grasp_symmetry: bool = True  # randomize grasp yaw over the cube's 90° symmetry
     goal_dim: int = 3  # goal xyz
-    spacing_uniform: float = 0.0  # arc-length resampling wrecks grasp/release dwell
     obstacle_scale: float = 60.0  # tall barrier needs a stronger push than particle
     obstacle_margin: float = 0.15  # and more clearance to lift the cube over the top
     arm_scale: float = 50.0  # geometry-aware FK clearance (gripper+arm), 0 disables

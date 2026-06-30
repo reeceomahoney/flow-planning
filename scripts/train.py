@@ -141,7 +141,6 @@ def main(cfg: Config):
         output_features=output_features,
         device=device,
         goal_dim=cfg.env.goal_dim,
-        spacing_uniform=cfg.env.spacing_uniform,
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).

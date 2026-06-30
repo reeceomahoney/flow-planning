@@ -11,7 +11,6 @@ class EnvConfig(draccus.ChoiceRegistry):
     fps: int = 50
     obstacle: bool = False  # add a barrier between start and goal
     goal_dim: int = 2  # trailing obs dims holding the goal
-    spacing_uniform: float = 1.0  # arc-length resample of the plan at inference
     obstacle_scale: float = 15.0  # obstacle-avoidance guidance strength
     obstacle_margin: float = 0.08  # obstacle-avoidance guidance clearance
 
