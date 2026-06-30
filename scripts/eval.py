@@ -35,6 +35,8 @@ class Config:
     seed: int = 0
     learned_guidance_ckpt: str = "outputs/guidance_net.pt"
     learned_guidance_scale: float = 35.0
+    n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
+    num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
 
 
 @draccus.wrap()
@@ -46,6 +48,10 @@ def main(cfg: Config):
     print(f"Loading checkpoint: {checkpoint}")
     policy = FlowMatchingPolicy.from_pretrained(checkpoint)
     policy.config.device = device
+    if cfg.n_action_steps > 0:
+        policy.config.n_action_steps = cfg.n_action_steps
+    if cfg.num_inference_steps > 0:
+        policy.config.num_inference_steps = cfg.num_inference_steps
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -75,13 +81,23 @@ def main(cfg: Config):
 
     if cfg.learned_guidance_ckpt:
         geom = env.obstacle_geometry
+        if hasattr(env, "ee_state_index"):  # franka: 3D box, EE-relative
+            box, pos_index, pos_dims = (
+                geom["center"] + geom["half_extents"],
+                env.ee_state_index,
+                3,
+            )
+        else:  # particle: representative 2D bar, ball pos at obs[0:2]
+            c, h = np.asarray(geom["center"]), np.asarray(geom["half_extents"])
+            box, pos_index, pos_dims = np.concatenate([c[0], h[0]]), 0, 2
         policy.guidance_fn = LearnedGuidance(
             cfg.learned_guidance_ckpt,
-            geom["center"] + geom["half_extents"],
+            box,
             stats[OBS_STATE],
-            env.ee_state_index,
+            pos_index,
             device,
             cfg.learned_guidance_scale,
+            pos_dims=pos_dims,
         )
     else:
         policy.guidance_fn = Guidance(
@@ -91,8 +107,10 @@ def main(cfg: Config):
             device,
             obs_stats=stats[OBS_STATE],
         )
-    chain = build_franka_chain(device)[0]
-    base_pos = np.asarray(env.robot_base_pos, np.float32)  # base frame -> world
+    arm = hasattr(env, "ee_state_index")  # franka: planned path needs EE FK
+    if arm:
+        chain = build_franka_chain(device)[0]
+        base_pos = np.asarray(env.robot_base_pos, np.float32)  # base frame -> world
 
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
@@ -131,8 +149,11 @@ def main(cfg: Config):
                 env.apply_action(phys)
                 if live and policy.last_chunk is not None:
                     chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
-                    q = torch.from_numpy(chunk[:, :7]).float().to(device)
-                    path = ee_positions(chain, q).cpu().numpy() + base_pos
+                    if arm:
+                        q = torch.from_numpy(chunk[:, :7]).float().to(device)
+                        path = ee_positions(chain, q).cpu().numpy() + base_pos
+                    else:
+                        path = chunk[:, :2]  # particle: action is the xy target
                     env.set_predicted_path(path)
                 frame += 1
                 pbar.update(1)

@@ -19,12 +19,14 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 from torch.utils.data import DataLoader
 
-from flow_planning.envs import EnvConfig, FrankaConfig, make_env
+from flow_planning.envs import EnvConfig, FrankaConfig, ParticleConfig, make_env
+from flow_planning.guidance import box_sdf
 from flow_planning.guidance_net import (
     FrankaCollision,
     GuidanceNet,
     normalize_box,
     sample_boxes,
+    sample_boxes_2d,
 )
 from flow_planning.policy import (
     FlowMatchingConfig,
@@ -41,8 +43,9 @@ class Config:
     device: str = "cuda"
     n_pairs: int = 200_000  # (window, box) pairs to label
     label_stride: int = 3  # subsample timesteps when checking collision
+    margin: float = 0.02  # collision-label inflation (thin safety buffer, not a band)
     batch_size: int = 512
-    num_iters: int = 4_000  # tiny net on 200k pairs; acc plateaus early
+    num_iters: int = 6_000  # more steps: per-step labels are far more numerous
     out: str = "outputs/guidance_net.pt"
     seed: int = 0
 
@@ -77,10 +80,7 @@ def main(cfg: Config):
     stats = dataset.meta.stats
     assert stats is not None
 
-    print("building env + labeler (newton sim, ~1 min)...", flush=True)
-    env = make_env(cfg.env, newton.viewer.ViewerNull())
-    geom = env.obstacle_geometry
-    labeler = FrankaCollision(device, list(env.robot_base_pos), env.cube_size)
+    particle = isinstance(cfg.env, ParticleConfig)
     preprocessor, _ = make_flow_matching_pre_post_processors(policy_cfg, stats)
 
     # materialize windows in VRAM (dataset is tiny)
@@ -93,29 +93,50 @@ def main(cfg: Config):
     traj_dim = state_dim + act_all.shape[-1]
     print(f"{n_windows} windows, traj_dim {traj_dim}, horizon {policy_cfg.horizon}")
 
-    # sample and label (window, box) pairs
+    # sample and label (window, box) pairs, per timestep
     rng = __import__("numpy").random.default_rng(cfg.seed)
     idx = torch.randint(0, n_windows, (cfg.n_pairs,), device=device)
-    box = sample_boxes(rng, cfg.n_pairs, geom["center"], geom["half_extents"], device)
-    free = torch.empty(cfg.n_pairs, dtype=torch.bool, device=device)
-    C = 4096
-    n_chunks = (cfg.n_pairs + C - 1) // C
-    print(f"labeling {cfg.n_pairs} (window, box) pairs via FK...", flush=True)
-    for k, i in enumerate(range(0, cfg.n_pairs, C)):
-        ci = idx[i : i + C]
-        j = act_all[ci][:, :: cfg.label_stride, :7].contiguous()
-        cu = obs_all[ci][:, :: cfg.label_stride, CUBE_IDX : CUBE_IDX + 3].contiguous()
-        free[i : i + C] = labeler.collision_free(j, cu, box[i : i + C], chunk=C)
-        if k % 10 == 0:
-            print(f"  labeled chunk {k}/{n_chunks}", flush=True)
-    print(f"labels: {free.float().mean():.3f} collision-free", flush=True)
+    ts = slice(None, None, cfg.label_stride)
+    if particle:
+        # commanded target xy (the action, which drives the ball) inside the
+        # inflated 2D bar — label the action so guidance moves the executed path
+        box = sample_boxes_2d(rng, cfg.n_pairs, device)  # (P, 4)
+        box_dim, pos_index, pos_dims = 4, 0, 2
+        pos = act_all[idx][:, ts, :2]
+        c, h = box[:, None, :2], box[:, None, 2:]
+        hit = box_sdf(pos, c, h) < cfg.env.ball_radius + cfg.margin
+    else:
+        print("building env + labeler (newton sim, ~1 min)...", flush=True)
+        env = make_env(cfg.env, newton.viewer.ViewerNull())
+        geom = env.obstacle_geometry
+        labeler = FrankaCollision(device, list(env.robot_base_pos), env.cube_size)
+        box = sample_boxes(
+            rng, cfg.n_pairs, geom["center"], geom["half_extents"], device
+        )
+        box_dim, pos_index, pos_dims = 6, env.ee_state_index, 3
+        n_steps = len(range(*ts.indices(act_all.shape[1])))
+        hit = torch.empty(cfg.n_pairs, n_steps, dtype=torch.bool, device=device)
+        C = 4096
+        n_chunks = (cfg.n_pairs + C - 1) // C
+        print(f"labeling {cfg.n_pairs} pairs per step via FK...", flush=True)
+        for k, i in enumerate(range(0, cfg.n_pairs, C)):
+            ci = idx[i : i + C]
+            j = act_all[ci][:, ts, :7].contiguous()
+            cu = obs_all[ci][:, ts, CUBE_IDX : CUBE_IDX + 3].contiguous()
+            hit[i : i + C] = labeler.collisions(
+                j, cu, box[i : i + C], cfg.margin, chunk=C
+            )
+            if k % 10 == 0:
+                print(f"  labeled chunk {k}/{n_chunks}", flush=True)
+    p_hit = hit.float().mean().item()
+    print(f"labels: {p_hit:.3f} of steps collide", flush=True)
+    pos_weight = torch.tensor((1 - p_hit) / max(p_hit, 1e-4), device=device)
 
-    ee = env.ee_state_index
     f32 = {"dtype": torch.float32, "device": device}
-    cube_mean = torch.as_tensor(stats[OBS_STATE]["mean"][ee:], **f32)[:3]
-    cube_std = torch.as_tensor(stats[OBS_STATE]["std"][ee:], **f32)[:3]
+    pos_mean = torch.as_tensor(stats[OBS_STATE]["mean"][pos_index:], **f32)[:pos_dims]
+    pos_std = torch.as_tensor(stats[OBS_STATE]["std"][pos_index:], **f32)[:pos_dims]
 
-    net = GuidanceNet(traj_dim, policy_cfg.horizon).to(device)
+    net = GuidanceNet(traj_dim, box_dim).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=3e-4, weight_decay=1e-4)
     net.train()
     t0 = time.perf_counter()
@@ -123,24 +144,26 @@ def main(cfg: Config):
         mb = torch.randint(0, cfg.n_pairs, (cfg.batch_size,), device=device)
         b = preprocessor({OBS_STATE: obs_all[idx[mb]], ACTION: act_all[idx[mb]]})
         traj = torch.cat([b[OBS_STATE][..., :state_dim], b[ACTION]], dim=-1).float()
-        logit = net(traj, normalize_box(box[mb], cube_mean, cube_std))
-        loss = F.binary_cross_entropy_with_logits(logit, free[mb].float())
+        logit = net(traj[:, ts], normalize_box(box[mb], pos_mean, pos_std))
+        loss = F.binary_cross_entropy_with_logits(
+            logit, hit[mb].float(), pos_weight=pos_weight
+        )
         opt.zero_grad()
         loss.backward()
         opt.step()
         if it % 100 == 0:
-            acc = ((logit > 0) == free[mb]).float().mean().item()
+            pred = logit > 0
+            tp = (pred & hit[mb]).sum().item()
+            recall = tp / max(hit[mb].sum().item(), 1)
+            prec = tp / max(pred.sum().item(), 1)
             print(
-                f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}  acc {acc:.3f}",
+                f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}  "
+                f"recall {recall:.3f}  prec {prec:.3f}",
                 flush=True,
             )
 
     torch.save(
-        {
-            "state_dict": net.state_dict(),
-            "traj_dim": traj_dim,
-            "max_len": policy_cfg.horizon,
-        },
+        {"state_dict": net.state_dict(), "traj_dim": traj_dim, "box_dim": box_dim},
         cfg.out,
     )
     print(f"Saved guidance net to {cfg.out}  ({time.perf_counter() - t0:.0f}s train)")

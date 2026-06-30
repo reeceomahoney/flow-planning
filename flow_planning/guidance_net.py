@@ -1,11 +1,11 @@
-"""Learned classifier guidance: a net scores a planned trajectory as collision-
-free given an obstacle box, and its gradient replaces the hand-crafted SDF cost.
+"""Learned per-timestep collision guidance: a net scores each trajectory step as
+colliding-or-not given an obstacle box, and its gradient replaces the hand-crafted
+SDF cost. Scoring per step (not the whole path) means the gradient only nudges the
+steps that actually hit, so a collision-free grasp right next to the box is left
+alone — unlike a proximity-margin SDF, which fights it.
 
 The supervision is free and exact: take demo trajectories, sample random boxes,
-and label each pair via FK + `box_sdf` (the same geometry the sim penalizes).
-The classifier sees the whole trajectory, so its gradient is non-myopic — it
-selects the collision-free mode the prior can already stitch, rather than
-shoving the nearest point off the box like the per-point cost does.
+and label every step via FK + `box_sdf` (the same geometry the sim penalizes).
 """
 
 import torch
@@ -64,11 +64,17 @@ class FrankaCollision:
         return torch.cat([pts, hoff], dim=1)
 
     @torch.no_grad()
-    def collision_free(
-        self, joints: Tensor, cube_pos: Tensor, box: Tensor, chunk: int = 4096
+    def collisions(
+        self,
+        joints: Tensor,
+        cube_pos: Tensor,
+        box: Tensor,
+        margin: float = 0.02,
+        chunk: int = 4096,
     ) -> Tensor:
-        """joints (P, T, 7), cube_pos (P, T, 3) world, box (P, 6) world
-        [center, half]. Returns bool (P,): True if the whole path clears the box."""
+        """joints (P, T, 7), cube_pos (P, T, 3) world, box (P, 6) [center, half].
+        Returns bool (P, T): True at timesteps where the arm or cube hits the box
+        (inflated by `margin`, a thin safety buffer — sharp, not a proximity band)."""
         out = []
         for i in range(0, joints.shape[0], chunk):
             j, cu, bx = (
@@ -81,11 +87,11 @@ class FrankaCollision:
             # arm: FK in the base frame, so shift the box into it
             pts = self.arm_points(j.reshape(p * t, 7)).reshape(p, t, -1, 3)
             cb = (center - self.base_pos)[:, None, None, :]
-            arm_hit = (box_sdf(pts, cb, half[:, None, None, :]) < 0).any(dim=(1, 2))
+            arm_hit = (box_sdf(pts, cb, half[:, None, None, :]) < margin).any(dim=2)
             # cube: axis-aligned box overlap in the world frame
             d = (cu - center[:, None, :]).abs()
-            cube_hit = (d < half[:, None, :] + self.cube_half).all(-1).any(1)
-            out.append(~(arm_hit | cube_hit))
+            cube_hit = (d < half[:, None, :] + self.cube_half + margin).all(-1)
+            out.append(arm_hit | cube_hit)
         return torch.cat(out)
 
 
@@ -106,51 +112,76 @@ def sample_boxes(rng, n: int, center0, half0, device: str) -> Tensor:
     return torch.cat([center, half], dim=1).to(device)
 
 
-def normalize_box(box: Tensor, cube_mean: Tensor, cube_std: Tensor) -> Tensor:
-    """Put the box on the same scale as the trajectory's position dims."""
-    center = (box[..., :3] - cube_mean) / cube_std
-    half = box[..., 3:] / cube_std
+def sample_boxes_2d(rng, n: int, device: str) -> Tensor:
+    """Random 2D bars spanning the particle arena (matches ParticleEnv's
+    obstacle_random ranges) so the classifier generalizes over placements.
+    Returns (n, 4) [cx, cy, hx, hy]."""
+
+    def u(lo, hi):
+        return torch.from_numpy(rng.uniform(lo, hi, n).astype("float32"))
+
+    return torch.stack(
+        [u(-0.2, 0.2), u(-0.3, 0.3), u(0.3, 0.6), u(0.03, 0.1)], dim=1
+    ).to(device)
+
+
+def normalize_box(box: Tensor, pos_mean: Tensor, pos_std: Tensor) -> Tensor:
+    """Put the box on the same scale as the trajectory's position dims. `d` (2 or
+    3) is inferred from the stats; box is [center(d), half(d)]."""
+    d = pos_mean.shape[-1]
+    center = (box[..., :d] - pos_mean) / pos_std
+    half = box[..., d:] / pos_std
     return torch.cat([center, half], dim=-1)
 
 
 class GuidanceNet(nn.Module):
-    """Score a clean [state, action] trajectory as collision-free given a box.
-    The box token is the readout: it attends over the whole path. Trained on
-    clean trajectories and applied to the denoised estimate x1_hat at inference
-    (reconstruction guidance — smoother than raw classifier guidance here)."""
+    """Per-timestep collision predictor: scores each [state, action] step as
+    collision-free given a box. Collision is memoryless in the config, so this is
+    a per-step MLP (no temporal mixing) — its gradient touches only the steps that
+    actually hit, leaving a collision-free grasp next to the box untouched. Applied
+    to the denoised estimate x1_hat at inference (reconstruction guidance)."""
 
-    def __init__(self, traj_dim: int, max_len: int, d: int = 128, n_layers: int = 3):
+    def __init__(
+        self, traj_dim: int, box_dim: int = 6, d: int = 256, n_layers: int = 3
+    ):
         super().__init__()
-        self.in_proj = nn.Linear(traj_dim, d)
-        self.box_proj = nn.Linear(6, d)
-        self.pos = nn.Parameter(0.02 * torch.randn(max_len + 1, d))
-        layer = nn.TransformerEncoderLayer(
-            d, 4, 4 * d, activation="gelu", batch_first=True, norm_first=True
-        )
-        self.tr = nn.TransformerEncoder(layer, n_layers, enable_nested_tensor=False)
-        self.head = nn.Linear(d, 1)
+        self.box_dim = box_dim
+        layers = [nn.Linear(traj_dim + box_dim, d), nn.GELU()]
+        for _ in range(n_layers - 1):
+            layers += [nn.Linear(d, d), nn.GELU()]
+        layers.append(nn.Linear(d, 1))
+        self.mlp = nn.Sequential(*layers)
 
     def forward(self, traj: Tensor, box: Tensor) -> Tensor:
-        h = self.in_proj(traj)  # (B, H, d)
-        b = self.box_proj(box)[:, None]  # (B, 1, d) readout token
-        x = torch.cat([b, h], dim=1) + self.pos[: h.shape[1] + 1]
-        return self.head(self.tr(x)[:, 0]).squeeze(-1)  # logit
+        b = box[:, None, :].expand(-1, traj.shape[1], -1)  # (B, H, 6)
+        logit = self.mlp(torch.cat([traj, b], dim=-1))  # (B, H, 1)
+        return logit.squeeze(-1)  # (B, H) collision logit
 
 
 class LearnedGuidance:
-    """Inference guidance: gradient of -log P(collision-free) w.r.t. the
-    trajectory, so the sampler ascends toward the collision-free mode."""
+    """Inference guidance: per-step gradient of -log P(collision-free) w.r.t. the
+    trajectory, so the sampler nudges only the colliding steps off the box."""
 
-    def __init__(self, ckpt: str, box, obs_stats, ee_index: int, device, scale: float):
+    def __init__(
+        self,
+        ckpt: str,
+        box,
+        obs_stats,
+        pos_index: int,
+        device,
+        scale: float,
+        pos_dims: int = 3,
+    ):
         blob = torch.load(ckpt, map_location=device, weights_only=False)
-        self.net = GuidanceNet(blob["traj_dim"], blob["max_len"]).to(device)
+        self.box_dim = blob.get("box_dim", 6)
+        self.net = GuidanceNet(blob["traj_dim"], self.box_dim).to(device)
         self.net.load_state_dict(blob["state_dict"])
         self.net.eval()
         f32 = {"dtype": torch.float32, "device": device}
-        cube_mean = torch.as_tensor(obs_stats["mean"][ee_index:], **f32)[:3]
-        cube_std = torch.as_tensor(obs_stats["std"][ee_index:], **f32)[:3]
+        pos_mean = torch.as_tensor(obs_stats["mean"][pos_index:], **f32)[:pos_dims]
+        pos_std = torch.as_tensor(obs_stats["std"][pos_index:], **f32)[:pos_dims]
         box = torch.as_tensor(box, dtype=torch.float32, device=device)
-        self.box = normalize_box(box, cube_mean, cube_std).view(1, 6)
+        self.box = normalize_box(box, pos_mean, pos_std).view(1, self.box_dim)
         self.scale = scale
 
     def reset(self):
@@ -160,7 +191,8 @@ class LearnedGuidance:
         # reconstruction guidance: score the denoised estimate x1_hat = x + (1-t)v
         with torch.enable_grad():
             x1_hat = (x + (1 - t.view(-1, 1, 1)) * v).detach().requires_grad_(True)
-            logit = self.net(x1_hat, self.box.expand(x.shape[0], 6))
-            cost = self.scale * F.softplus(-logit).sum()  # -log p_free
+            box = self.box.expand(x.shape[0], self.box_dim)
+            logit = self.net(x1_hat, box)  # (B, H) collision
+            cost = self.scale * F.softplus(logit).sum()  # penalize per-step collision
             (grad,) = torch.autograd.grad(cost, x1_hat)
         return grad

@@ -81,6 +81,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
     stage_sum = 0  # avg furthest pick-place stage reached, as a dense reward
     total = 0
 
+    has_stage = hasattr(env, "stage")  # franka pick-place ladder; particle has none
     for _ in range(math.ceil(n_episodes / n)):
         env.reset()
         policy.reset()
@@ -89,7 +90,8 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
             env.apply_action(postprocessor(action).numpy().astype(np.float32))
-            max_stage = np.maximum(max_stage, env.stage())
+            if has_stage:
+                max_stage = np.maximum(max_stage, env.stage())
         successes += int(env.success().sum())
         stage_sum += int(max_stage.sum())
         total += n
