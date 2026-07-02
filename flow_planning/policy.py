@@ -7,6 +7,7 @@ lerobot API: it plans a [state, action] chunk and executes the action dims one
 step per call, replanning every `replan_every` steps (receding horizon).
 """
 
+import copy
 import math
 from collections import deque
 from collections.abc import Iterator
@@ -57,7 +58,6 @@ class FlowMatchingConfig(PreTrainedConfig):
     dim_model: int = 128
     n_layers: int = 4
     n_heads: int = 4
-    attn_window: int = 5  # local attention half-width over step tokens; 0 = global
 
     # flow matching
     num_inference_steps: int = 10
@@ -112,58 +112,55 @@ def sinusoidal_embedding(t: Tensor, dim: int) -> Tensor:
     return torch.cat([args.cos(), args.sin()], dim=-1)
 
 
-class FlowTransformer(nn.Module):
-    """Velocity field v(x_t, t | state, goal) over a chunk of [state, action] steps.
+class EncoderLayer(nn.Module):
+    """Pre-norm transformer encoder layer over global SDPA."""
 
-    Each step token carries the full [pos, vel, action] vector and reads out its
-    per-step velocity. The current state is prepended as a token and the goal
-    appended as a token, so they act as the trajectory's boundary conditions.
-    `attn_window` restricts each token to a local neighbourhood (so the prior
-    stays closed under stitching); the state token then anchors the early steps
-    and the goal token the late steps.
+    def __init__(self, d: int, n_heads: int, dim_ff: int):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = d // n_heads
+        self.qkv = nn.Linear(d, 3 * d)
+        self.proj = nn.Linear(d, d)
+        self.norm1 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)
+        self.ff = nn.Sequential(nn.Linear(d, dim_ff), nn.GELU(), nn.Linear(dim_ff, d))
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, n, d = x.shape
+        qkv = self.qkv(self.norm1(x)).view(b, n, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each (B, heads, N, head_dim)
+        o = F.scaled_dot_product_attention(q, k, v)
+        x = x + self.proj(o.transpose(1, 2).reshape(b, n, d))
+        return x + self.ff(self.norm2(x))
+
+
+class FlowTransformer(nn.Module):
+    """Unconditional velocity field v(x_t, t) over a chunk of [state, action] steps.
+
+    No boundary tokens: the start and goal are imposed at inference by clamping the
+    trajectory's first/last frames (inpainting); global attention spreads them across
+    the horizon.
     """
 
-    attn_mask: Tensor | None
-
-    def __init__(self, traj_dim: int, state_dim: int, cfg: FlowMatchingConfig):
+    def __init__(self, traj_dim: int, cfg: FlowMatchingConfig):
         super().__init__()
         d = cfg.dim_model
         self.horizon = cfg.horizon
         self.traj_in = nn.Linear(traj_dim, d)
-        self.state_in = nn.Linear(state_dim, d)  # leading state token
-        self.goal_in = nn.Linear(cfg.goal_dim, d)  # trailing goal token
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
-        n_tokens = self.horizon + 2  # state token + steps + goal token
-        self.pos_emb = nn.Parameter(torch.randn(n_tokens, d) * 0.02)
-
-        layer = nn.TransformerEncoderLayer(
-            d, cfg.n_heads, 4 * d, activation="gelu", batch_first=True, norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            layer, cfg.n_layers, enable_nested_tensor=False
+        self.pos_emb = nn.Parameter(torch.randn(self.horizon, d) * 0.02)
+        self.layers = nn.ModuleList(
+            EncoderLayer(d, cfg.n_heads, 4 * d) for _ in range(cfg.n_layers)
         )
         self.head = nn.Linear(d, traj_dim)
 
-        # local attention: step tokens see only +/-attn_window neighbours, but
-        # state (col 0) and goal (col -1) are global registers
-        if cfg.attn_window > 0:
-            i = torch.arange(n_tokens)
-            band = (i[:, None] - i[None, :]).abs() > cfg.attn_window
-            band[:, 0] = False
-            band[:, -1] = False
-            self.register_buffer("attn_mask", band, persistent=False)
-        else:
-            self.attn_mask = None
-
-    def forward(self, x_t: Tensor, t: Tensor, state: Tensor, goal: Tensor) -> Tensor:
-        # x_t: (B, H, traj_dim), t: (B,), state/goal: (B, state_dim)/(B, goal_dim).
+    def forward(self, x_t: Tensor, t: Tensor) -> Tensor:
+        # x_t: (B, H, traj_dim), t: (B,).
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
-        a = self.traj_in(x_t) + temb[:, None]
-        s = (self.state_in(state) + temb)[:, None]
-        g = (self.goal_in(goal) + temb)[:, None]
-        tokens = torch.cat([s, a, g], dim=1) + self.pos_emb  # state | steps | goal
-        h = self.transformer(tokens, mask=self.attn_mask)
-        return self.head(h[:, 1:-1])
+        h = self.traj_in(x_t) + temb[:, None] + self.pos_emb
+        for layer in self.layers:
+            h = layer(h)
+        return self.head(h)
 
 
 class FlowMatchingPolicy(PreTrainedPolicy):
@@ -185,7 +182,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.state_dim = obs_dim - config.goal_dim
         self.traj_dim = self.state_dim + act_dim
 
-        self.model = FlowTransformer(self.traj_dim, self.state_dim, config)
+        self.model = FlowTransformer(self.traj_dim, config)
         self.guidance_fn = None  # optional obstacle cost, set before rollout
         self.action_clip = None  # optional (low, high) normalized action bounds
         self.reset()
@@ -206,41 +203,51 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         # full-trajectory window: [state, action] per step, both normalized. The
         # tail past the episode end clamps to the goal frame (pos=goal, vel~0,
-        # action=goal target), so training on it teaches the absorbing goal.
+        # action=goal target). Unconditional flow: x_t already carries the real
+        # start/goal in its first/last frames, so the net learns to use them; at
+        # inference those frames are clamped to the commanded values (inpainting).
         # ponytail: assumes lerobot pads delta frames by clamping to the episode end.
         obs = batch[OBS_STATE]  # (B, H, obs_dim); trailing dims = goal
-        state = obs[..., : self.state_dim]
-        x_1 = torch.cat([state, batch[ACTION]], dim=-1)
+        sd, gd = self.state_dim, self.config.goal_dim
+        x_1 = torch.cat([obs[..., :sd], batch[ACTION]], dim=-1)
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
         x_t = (1 - t[:, None, None]) * x_0 + t[:, None, None] * x_1
-        goal = obs[:, 0, -self.config.goal_dim :]  # commanded goal, already in obs
-        v = self.model(x_t, t, state[:, 0], goal)  # condition on state + goal
-        loss = F.mse_loss(v, x_1 - x_0)
+        # boundary frames are clean conditioning context (start state, goal pos),
+        # not noised; exclude them from the loss since their velocity is undefined.
+        x_t[:, 0, :sd] = x_1[:, 0, :sd]
+        x_t[:, -1, :gd] = x_1[:, -1, :gd]
+        v = self.model(x_t, t)
+        err = (v - (x_1 - x_0)) ** 2
+        mask = torch.ones_like(err)
+        mask[:, 0, :sd] = 0.0
+        mask[:, -1, :gd] = 0.0
+        loss = (err * mask).sum() / mask.sum()
         return loss, {"loss": loss.item()}
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        """Flow-ODE integrate a full [state, action] trajectory conditioned on the
-        current state (leading token) and the goal (trailing token), returning the
-        (B, horizon, act_dim) action chunk. The goal is read from the trailing obs
-        dims. Any `self.guidance_fn` cost gradient is subtracted each step.
-        """
+        """Flow-ODE integrate a [state, action] trajectory, conditioning by
+        inpainting: each step clamp frame 0's state to the current state and frame
+        -1's goal dims to the goal (already in position space, see alias_goal_stats).
+        `guidance_fn` (if set) steers around the obstacle. Returns the
+        (B, horizon, act_dim) action chunk."""
         self.eval()
-        obs = batch[OBS_STATE]  # (B, obs_dim) current obs = [state, goal]
-        state = obs[:, : self.state_dim]
-        n = obs.shape[0]
-        goal = obs[:, -self.config.goal_dim :]
-
+        obs = batch[OBS_STATE]
+        sd, gd = self.state_dim, self.config.goal_dim
+        state, goal = obs[:, :sd], obs[:, -gd:]
+        m = obs.shape[0]
         dt = 1.0 / self.config.num_inference_steps
-        x = torch.randn(n, self.config.horizon, self.traj_dim, device=obs.device)
+        x = torch.randn(m, self.config.horizon, self.traj_dim, device=obs.device)
         for i in range(self.config.num_inference_steps):
-            t = torch.full((n,), i * dt, device=x.device)
-            v = self.model(x, t, state, goal)
+            x[:, 0, :sd] = state
+            x[:, -1, :gd] = goal
+            t = torch.full((m,), i * dt, device=x.device)
+            v = self.model(x, t)
             if self.guidance_fn is not None:
                 v = v - self.guidance_fn(x, v, t, obs)
             x = x + dt * v
-        acts = x[..., self.state_dim :]  # normalized action dims
+        acts = x[..., sd:]  # normalized action dims
         if self.action_clip is not None:
             acts = acts.clamp(self.action_clip[0], self.action_clip[1])
         return acts
@@ -267,6 +274,20 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         return action
 
 
+def alias_goal_stats(
+    stats: dict[str, dict[str, Any]], goal_dim: int
+) -> dict[str, dict[str, Any]]:
+    """The goal (obs tail) and the position (obs head) are the same physical
+    quantity, so normalize the goal with the position's stats. Then the commanded
+    goal lands in position space and inpainting can clamp it onto the trajectory
+    directly, no per-call renormalization."""
+    stats = copy.deepcopy(stats)
+    o = stats[OBS_STATE]
+    for k in ("mean", "std"):
+        o[k][-goal_dim:] = o[k][:goal_dim]
+    return stats
+
+
 def make_flow_matching_pre_post_processors(
     config: FlowMatchingConfig,
     dataset_stats: dict[str, dict[str, Any]] | None = None,
@@ -282,6 +303,11 @@ def make_flow_matching_pre_post_processors(
     device = config.device
     assert device is not None
     features = {**(config.input_features or {}), **(config.output_features or {})}
+    norm_stats = (
+        alias_goal_stats(dataset_stats, config.goal_dim)
+        if dataset_stats is not None
+        else None
+    )
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
@@ -290,7 +316,7 @@ def make_flow_matching_pre_post_processors(
         NormalizerProcessorStep(
             features=features,
             norm_map=config.normalization_mapping,
-            stats=dataset_stats,
+            stats=norm_stats,
             device=device,
         ),
     ]

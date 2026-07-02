@@ -226,7 +226,6 @@ class EllipseGuidance:
         m = torch.as_tensor(obs_stats["mean"], **f32)
         s = torch.as_tensor(obs_stats["std"], **f32)
         self.pos_m, self.pos_s = m[:2], s[:2]  # position obs block
-        self.goal_m, self.goal_s = m[-2:], s[-2:]  # goal obs block
         box = torch.as_tensor(box, **f32)  # [cx, cy, hx, hy] physical
         self.center = (box[:2] - self.pos_m) / self.pos_s  # normalized position space
         self.half = box[2:] / self.pos_s
@@ -239,7 +238,7 @@ class EllipseGuidance:
 
     def __call__(self, x: Tensor, v: Tensor, t: Tensor, obs: Tensor | None = None):
         assert obs is not None
-        goal = (obs[:, -2:] * self.goal_s + self.goal_m - self.pos_m) / self.pos_s
+        goal = obs[:, -2:]  # already in position space (see alias_goal_stats)
         start = obs[:, :2]  # normalized position
         cx, cy = self.center
         ax = self.half[0] + self.margin  # cover the bar width -> exit round the end

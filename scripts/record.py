@@ -13,6 +13,7 @@ class Config:
     env: EnvConfig = field(default_factory=FrankaConfig)
     record: bool = True
     episodes: int = 256
+    push_to_hub: bool = False
     repo_id: str = "reece-omahoney/franka"
     task: str = "Pick up the cube and place it at the target"
     viewer: str = "opengl"  # "none", "rerun", or "opengl"; playback only
@@ -72,6 +73,9 @@ def collect(cfg: Config, env):
     dataset.finalize()
     print(f"Saved {dataset.meta.total_episodes} episodes to {dataset.root}")
     print(f"Demo success rate: {successful / attempted:.1%}")
+    if cfg.push_to_hub:
+        dataset.push_to_hub()
+        print(f"Pushed {cfg.repo_id} to the hub")
 
 
 @draccus.wrap()
