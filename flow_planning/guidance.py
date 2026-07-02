@@ -244,7 +244,7 @@ class EllipseGuidance:
     def reset(self):
         pass
 
-    def __call__(self, x: Tensor, v: Tensor, t: Tensor, obs: Tensor | None = None):
+    def __call__(self, x1_hat: Tensor, obs: Tensor | None = None) -> Tensor:
         assert obs is not None
         # start/goal read from the obs (position-normalized), mapped into the action
         # space the ellipse and the guided dims live in (same physical xy).
@@ -260,7 +260,7 @@ class EllipseGuidance:
             mid.abs() < 0.15, mid.new_full((), self.exit_side), mid.sign()
         )
         with torch.enable_grad():
-            x1_hat = (x + (1 - t.view(-1, 1, 1)) * v).detach().requires_grad_(True)
+            x1_hat = x1_hat.detach().requires_grad_(True)
             p = x1_hat[..., self.pos_start : self.pos_start + 2]  # action pos dims
             ex = (p[..., 0] - cx) / ax
             ey = (p[..., 1] - cy) / ay[:, None]
@@ -334,6 +334,24 @@ class Guidance:
                     margin=env.cfg.obstacle_margin,
                     device=device,
                     pos_start=state_dim,
+                )
+            )
+        # particle: convex ellipse keep-out that routes the path round the bar's end
+        ellipse_scale = getattr(env.cfg, "ellipse_scale", 0.0)
+        if geom and not arm and obs_stats is not None and ellipse_scale > 0:
+            c = torch.as_tensor(geom["center"], dtype=torch.float32)[0]
+            h = torch.as_tensor(geom["half_extents"], dtype=torch.float32)[0]
+            self.terms.append(
+                EllipseGuidance(
+                    torch.cat([c, h]),
+                    obs_stats,
+                    action_stats,
+                    state_dim,
+                    device,
+                    ellipse_scale,
+                    margin=env.cfg.ellipse_margin,
+                    ay_scale=env.cfg.ellipse_ay,
+                    bias=env.cfg.ellipse_bias,
                 )
             )
 
