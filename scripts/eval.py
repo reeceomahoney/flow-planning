@@ -12,7 +12,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
-from flow_planning.guidance import Guidance
+from flow_planning.guidance import EllipseGuidance, Guidance
 from flow_planning.guidance_net import LearnedGuidance
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
@@ -25,7 +25,7 @@ from flow_planning.utils import latest_run_dir, make_viewer
 @dataclass
 class Config:
     env: EnvConfig = field(default_factory=FrankaConfig)
-    repo_id: str = "reece-omahoney/franka"
+    repo_id: str = "reece-omahoney/particle"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
     episodes: int = 1  # batches of env.world_count episodes, 0 = unlimited
@@ -33,10 +33,16 @@ class Config:
     viewer: str = "none"  # "none", "rerun", or "opengl"
     rrd: str = ""  # record a rerun .rrd to this path (view locally: `rerun <rrd>`)
     seed: int = 0
-    learned_guidance_ckpt: str = "outputs/guidance_net.pt"
-    learned_guidance_scale: float = 35.0
+    learned_guidance_ckpt: str = "outputs/guidance_net_particle.pt"
+    learned_guidance_scale: float = 3.0
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
+    guidance_mode: str = "ellipse"  # "learned" | "ellipse"
+    ellipse_margin: float = 0.15  # ellipse inflation past the box (normalized)
+    ellipse_bias: float = 1.0  # symmetry-break push toward the exit side
+    ellipse_ay: float = (
+        0.85  # ellipse y-extent as a fraction of half the start->goal gap
+    )
 
 
 @draccus.wrap()
@@ -79,7 +85,21 @@ def main(cfg: Config):
         )
         policy.action_clip = (low, high)
 
-    if cfg.learned_guidance_ckpt:
+    if cfg.learned_guidance_ckpt == "none":
+        policy.guidance_fn = None
+    elif cfg.guidance_mode == "ellipse":
+        geom = env.obstacle_geometry
+        c, h = np.asarray(geom["center"]), np.asarray(geom["half_extents"])
+        policy.guidance_fn = EllipseGuidance(
+            np.concatenate([c[0], h[0]]),
+            stats[OBS_STATE],
+            device,
+            cfg.learned_guidance_scale,
+            margin=cfg.ellipse_margin,
+            ay_scale=cfg.ellipse_ay,
+            bias=cfg.ellipse_bias,
+        )
+    elif cfg.learned_guidance_ckpt:
         geom = env.obstacle_geometry
         if hasattr(env, "ee_state_index"):  # franka: 3D box, EE-relative
             box, pos_index, pos_dims = (
