@@ -3,6 +3,7 @@
 import os
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from flow_planning.kinematics import build_franka_chain
@@ -202,6 +203,66 @@ class ArmObstacleGuidance:
                 f"sdf_min={sdf.min().item():.3f} pen_frac={pen:.3f}",
                 flush=True,
             )
+        return grad
+
+
+class EllipseGuidance:
+    """Push the trajectory out of a smooth ellipse that envelops the obstacle and
+    spans start->goal. Because a long arc of a blocked path lies inside a convex
+    region, the outward gradient shifts the whole arc coherently and it wraps around
+    the end (a detour), instead of the local tear a box-collision cost produces."""
+
+    def __init__(
+        self,
+        box,
+        obs_stats,
+        device,
+        scale: float,
+        margin: float = 0.15,
+        ay_scale: float = 0.85,
+        bias: float = 0.0,
+    ):
+        f32 = {"dtype": torch.float32, "device": device}
+        m = torch.as_tensor(obs_stats["mean"], **f32)
+        s = torch.as_tensor(obs_stats["std"], **f32)
+        self.pos_m, self.pos_s = m[:2], s[:2]  # position obs block
+        self.goal_m, self.goal_s = m[-2:], s[-2:]  # goal obs block
+        box = torch.as_tensor(box, **f32)  # [cx, cy, hx, hy] physical
+        self.center = (box[:2] - self.pos_m) / self.pos_s  # normalized position space
+        self.half = box[2:] / self.pos_s
+        self.scale, self.margin, self.ay_scale = scale, margin, ay_scale
+        self.bias = bias  # symmetry break: push inside points around an end
+        self.exit_side = 1.0 if float(box[0]) <= 0 else -1.0  # arena centered at 0
+
+    def reset(self):
+        pass
+
+    def __call__(self, x: Tensor, v: Tensor, t: Tensor, obs: Tensor | None = None):
+        assert obs is not None
+        goal = (obs[:, -2:] * self.goal_s + self.goal_m - self.pos_m) / self.pos_s
+        start = obs[:, :2]  # normalized position
+        cx, cy = self.center
+        ax = self.half[0] + self.margin  # cover the bar width -> exit round the end
+        span = 0.5 * (start[:, 1] - goal[:, 1]).abs()  # (B,) reach toward start/goal
+        ay = (self.ay_scale * span).clamp_min(self.half[1] + self.margin)
+        # exit side: round the end nearer start/goal (roomier end if centered)
+        mid = 0.5 * (start[:, 0] + goal[:, 0]) - cx
+        side = torch.where(
+            mid.abs() < 0.15, mid.new_full((), self.exit_side), mid.sign()
+        )
+        with torch.enable_grad():
+            x1_hat = (x + (1 - t.view(-1, 1, 1)) * v).detach().requires_grad_(True)
+            p = x1_hat[..., :2]
+            ex = (p[..., 0] - cx) / ax
+            ey = (p[..., 1] - cy) / ay[:, None]
+            e = ex * ex + ey * ey  # <1 inside the ellipse
+            inside = F.softplus(1.0 - e)
+            cost = self.scale * inside.sum()  # penalize inside
+            if self.bias > 0:  # break symmetry: drive inside points to the exit side
+                cost = (
+                    cost - self.scale * self.bias * (inside * side[:, None] * ex).sum()
+                )
+            (grad,) = torch.autograd.grad(cost, x1_hat)
         return grad
 
 
