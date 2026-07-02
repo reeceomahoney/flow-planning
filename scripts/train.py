@@ -86,13 +86,15 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
         env.reset()
         policy.reset()
         max_stage = np.zeros(n, int)
+        succ = np.zeros(n, dtype=bool)
         for _ in range(int(1.5 * env.episode_frames)):
             obs = torch.from_numpy(env.get_obs())
             action = policy.select_action(preprocessor({OBS_STATE: obs}))
             env.apply_action(postprocessor(action).numpy().astype(np.float32))
+            succ |= env.success()  # accrue: reaching the goal sticks past drift
             if has_stage:
                 max_stage = np.maximum(max_stage, env.stage())
-        successes += int(env.success().sum())
+        successes += int(succ.sum())
         stage_sum += int(max_stage.sum())
         total += n
     policy.train()
