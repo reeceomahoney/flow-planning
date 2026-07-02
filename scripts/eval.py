@@ -93,6 +93,8 @@ def main(cfg: Config):
         policy.guidance_fn = EllipseGuidance(
             np.concatenate([c[0], h[0]]),
             stats[OBS_STATE],
+            stats[ACTION],
+            policy.state_dim,
             device,
             cfg.learned_guidance_scale,
             margin=cfg.ellipse_margin,

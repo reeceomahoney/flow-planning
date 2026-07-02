@@ -216,6 +216,8 @@ class EllipseGuidance:
         self,
         box,
         obs_stats,
+        action_stats,
+        state_dim: int,
         device,
         scale: float,
         margin: float = 0.15,
@@ -223,12 +225,18 @@ class EllipseGuidance:
         bias: float = 0.0,
     ):
         f32 = {"dtype": torch.float32, "device": device}
-        m = torch.as_tensor(obs_stats["mean"], **f32)
-        s = torch.as_tensor(obs_stats["std"], **f32)
-        self.pos_m, self.pos_s = m[:2], s[:2]  # position obs block
+        om = torch.as_tensor(obs_stats["mean"], **f32)
+        os_ = torch.as_tensor(obs_stats["std"], **f32)
+        am = torch.as_tensor(action_stats["mean"], **f32)
+        as_ = torch.as_tensor(action_stats["std"], **f32)
+        # guide the ACTION position dims (what's executed), so the ellipse lives in
+        # action-normalized space; obs stats only read start/goal out of the obs.
+        self.pos_m, self.pos_s = om[:2], os_[:2]  # obs position block
+        self.act_m, self.act_s = am[:2], as_[:2]  # action position block
+        self.pos_start = state_dim  # action dims begin here in the trajectory
         box = torch.as_tensor(box, **f32)  # [cx, cy, hx, hy] physical
-        self.center = (box[:2] - self.pos_m) / self.pos_s  # normalized position space
-        self.half = box[2:] / self.pos_s
+        self.center = (box[:2] - self.act_m) / self.act_s  # action-normalized space
+        self.half = box[2:] / self.act_s
         self.scale, self.margin, self.ay_scale = scale, margin, ay_scale
         self.bias = bias  # symmetry break: push inside points around an end
         self.exit_side = 1.0 if float(box[0]) <= 0 else -1.0  # arena centered at 0
@@ -238,8 +246,10 @@ class EllipseGuidance:
 
     def __call__(self, x: Tensor, v: Tensor, t: Tensor, obs: Tensor | None = None):
         assert obs is not None
-        goal = obs[:, -2:]  # already in position space (see alias_goal_stats)
-        start = obs[:, :2]  # normalized position
+        # start/goal read from the obs (position-normalized), mapped into the action
+        # space the ellipse and the guided dims live in (same physical xy).
+        start = (obs[:, :2] * self.pos_s + self.pos_m - self.act_m) / self.act_s
+        goal = (obs[:, -2:] * self.pos_s + self.pos_m - self.act_m) / self.act_s
         cx, cy = self.center
         ax = self.half[0] + self.margin  # cover the bar width -> exit round the end
         span = 0.5 * (start[:, 1] - goal[:, 1]).abs()  # (B,) reach toward start/goal
@@ -251,7 +261,7 @@ class EllipseGuidance:
         )
         with torch.enable_grad():
             x1_hat = (x + (1 - t.view(-1, 1, 1)) * v).detach().requires_grad_(True)
-            p = x1_hat[..., :2]
+            p = x1_hat[..., self.pos_start : self.pos_start + 2]  # action pos dims
             ex = (p[..., 0] - cx) / ax
             ey = (p[..., 1] - cy) / ay[:, None]
             e = ex * ex + ey * ey  # <1 inside the ellipse

@@ -51,7 +51,7 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # dimensions
     horizon: int = 50
-    n_action_steps: int = 40  # replan interval (receding horizon)
+    n_action_steps: int = 75
     goal_dim: int = field(kw_only=True)  # trailing obs dims; set from env.goal_dim
 
     # architecture
