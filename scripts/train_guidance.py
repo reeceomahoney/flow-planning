@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 import draccus
 import newton.viewer
+import numpy as np
 import torch
 import torch.nn.functional as F
 from lerobot.configs.types import FeatureType
@@ -18,6 +19,7 @@ from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, ParticleConfig, make_env
 from flow_planning.guidance import box_sdf
@@ -46,6 +48,8 @@ class Config:
     margin: float = 0.02  # collision-label inflation (thin safety buffer, not a band)
     batch_size: int = 512
     num_iters: int = 6_000  # more steps: per-step labels are far more numerous
+    pos_weight: float = 0.0  # BCE positive-class weight; 0 = auto (neg/pos ratio)
+    feasible_boxes: bool = False  # resample boxes off the cube/goal (hurt: see memory)
     out: str = "outputs/guidance_net.pt"
     seed: int = 0
 
@@ -84,6 +88,7 @@ def main(cfg: Config):
 
     # materialize windows in VRAM (dataset is tiny)
     loader = DataLoader(dataset, batch_size=512, num_workers=8, shuffle=False)
+    loader = tqdm(loader, desc="loading windows")
     obs_l, act_l = zip(*[(b[OBS_STATE], b[ACTION]) for b in loader])
     obs_all = torch.cat(obs_l).to(device)
     act_all = torch.cat(act_l).to(device)
@@ -93,47 +98,64 @@ def main(cfg: Config):
     print(f"{n_windows} windows, traj_dim {traj_dim}, horizon {policy_cfg.horizon}")
 
     # sample and label (window, box) pairs, per timestep
-    rng = __import__("numpy").random.default_rng(cfg.seed)
+    rng = np.random.default_rng(cfg.seed)
     idx = torch.randint(0, n_windows, (cfg.n_pairs,), device=device)
     ts = slice(None, None, cfg.label_stride)
     if particle:
         # commanded target xy (the action, which drives the ball) inside the
         # inflated 2D bar — label the action so guidance moves the executed path
         box = sample_boxes_2d(rng, cfg.n_pairs, device)  # (P, 4)
-        box_dim, pos_index, pos_dims = 4, 0, 2
+        box_dim, pos_dims = 4, 2
         pos = act_all[idx][:, ts, :2]
         c, h = box[:, None, :2], box[:, None, 2:]
         hit = box_sdf(pos, c, h) < cfg.env.ball_radius + cfg.margin
     else:
-        print("building env + labeler (newton sim, ~1 min)...", flush=True)
+        print("building env + labeler", flush=True)
         env = make_env(cfg.env, newton.viewer.ViewerNull())
         geom = env.obstacle_geometry
         labeler = FrankaCollision(device, list(env.robot_base_pos), env.cube_size)
         box = sample_boxes(
             rng, cfg.n_pairs, geom["center"], geom["half_extents"], device
         )
-        box_dim, pos_index, pos_dims = 6, env.ee_state_index, 3
+        if cfg.feasible_boxes:
+            # keep only task-feasible boxes (eval walls never bury the cube/goal):
+            # cuts grasp repulsion but also removes avoidance supervision where
+            # collisions live — net loss in eval, kept for recombination
+            cube_start = obs_all[idx, 0, CUBE_IDX : CUBE_IDX + 3]
+            goal = obs_all[idx, 0, -3:]
+            feas = 0.5 * env.cube_size + 0.05  # fingers + label margin clearance
+            for _ in range(50):
+                c, h = box[:, None, :3], box[:, None, 3:]
+                pts = torch.stack([cube_start, goal], dim=1)
+                bad = (box_sdf(pts, c, h) < feas).any(dim=1)
+                if not bad.any():
+                    break
+                box[bad] = sample_boxes(
+                    rng, int(bad.sum()), geom["center"], geom["half_extents"], device
+                )
+            print(f"feasibility filter: {int(bad.sum())} infeasible boxes left")
+        # net input = FK arm points, box-relative — matches FKLearnedGuidance;
+        # labels are arm-only (the hand offset points stand in for a held cube)
+        box_dim = 3
+        traj_dim = 3 * labeler.arm_points(torch.zeros(1, 7, device=device)).shape[1]
         n_steps = len(range(*ts.indices(act_all.shape[1])))
         hit = torch.empty(cfg.n_pairs, n_steps, dtype=torch.bool, device=device)
         C = 4096
-        n_chunks = (cfg.n_pairs + C - 1) // C
-        print(f"labeling {cfg.n_pairs} pairs per step via FK...", flush=True)
-        for k, i in enumerate(range(0, cfg.n_pairs, C)):
-            ci = idx[i : i + C]
-            j = act_all[ci][:, ts, :7].contiguous()
-            cu = obs_all[ci][:, ts, CUBE_IDX : CUBE_IDX + 3].contiguous()
+        for i in tqdm(range(0, cfg.n_pairs, C), desc="labeling pairs via FK"):
+            j = act_all[idx[i : i + C]][:, ts, :7].contiguous()
             hit[i : i + C] = labeler.collisions(
-                j, cu, box[i : i + C], cfg.margin, chunk=C
+                j, None, box[i : i + C], cfg.margin, chunk=C
             )
-            if k % 10 == 0:
-                print(f"  labeled chunk {k}/{n_chunks}", flush=True)
     p_hit = hit.float().mean().item()
     print(f"labels: {p_hit:.3f} of steps collide", flush=True)
-    pos_weight = torch.tensor((1 - p_hit) / max(p_hit, 1e-4), device=device)
+    pos_weight = torch.tensor(
+        cfg.pos_weight or (1 - p_hit) / max(p_hit, 1e-4), device=device
+    )
 
-    f32 = {"dtype": torch.float32, "device": device}
-    pos_mean = torch.as_tensor(stats[OBS_STATE]["mean"][pos_index:], **f32)[:pos_dims]
-    pos_std = torch.as_tensor(stats[OBS_STATE]["std"][pos_index:], **f32)[:pos_dims]
+    if particle:
+        f32 = {"dtype": torch.float32, "device": device}
+        pos_mean = torch.as_tensor(stats[OBS_STATE]["mean"][:pos_dims], **f32)
+        pos_std = torch.as_tensor(stats[OBS_STATE]["std"][:pos_dims], **f32)
 
     net = GuidanceNet(traj_dim, box_dim).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=3e-4, weight_decay=1e-4)
@@ -141,9 +163,18 @@ def main(cfg: Config):
     t0 = time.perf_counter()
     for it in range(cfg.num_iters):
         mb = torch.randint(0, cfg.n_pairs, (cfg.batch_size,), device=device)
-        b = preprocessor({OBS_STATE: obs_all[idx[mb]], ACTION: act_all[idx[mb]]})
-        traj = torch.cat([b[OBS_STATE][..., :state_dim], b[ACTION]], dim=-1).float()
-        logit = net(traj[:, ts], normalize_box(box[mb], pos_mean, pos_std))
+        if particle:
+            b = preprocessor({OBS_STATE: obs_all[idx[mb]], ACTION: act_all[idx[mb]]})
+            traj = torch.cat([b[OBS_STATE][..., :state_dim], b[ACTION]], dim=-1).float()
+            inp, bx = traj[:, ts], normalize_box(box[mb], pos_mean, pos_std)
+        else:
+            q = act_all[idx[mb]][:, ts, :7]  # physical joints (B, T, 7)
+            m, t = q.shape[:2]
+            with torch.no_grad():
+                pts = labeler.arm_points(q.reshape(-1, 7)).reshape(m, t, -1, 3)
+                inp = (pts + labeler.base_pos - box[mb][:, None, None, :3]).flatten(-2)
+            bx = box[mb][:, 3:]
+        logit = net(inp, bx)
         loss = F.binary_cross_entropy_with_logits(
             logit, hit[mb].float(), pos_weight=pos_weight
         )

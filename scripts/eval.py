@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import Guidance
-from flow_planning.guidance_net import LearnedGuidance
+from flow_planning.guidance_net import FKLearnedGuidance, LearnedGuidance
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -84,24 +84,28 @@ def main(cfg: Config):
         policy.guidance_fn = None
     elif cfg.guidance_mode == "learned":
         geom = env.obstacle_geometry
-        if hasattr(env, "ee_state_index"):  # franka: 3D box, EE-relative
-            box, pos_index, pos_dims = (
+        if hasattr(env, "ee_state_index"):  # franka: FK-point net on joint actions
+            policy.guidance_fn = FKLearnedGuidance(
+                cfg.learned_guidance_ckpt,
                 geom["center"] + geom["half_extents"],
-                env.ee_state_index,
-                3,
+                list(env.robot_base_pos),
+                stats[ACTION],
+                joint_start=policy.state_dim,
+                device=device,
+                scale=cfg.learned_guidance_scale,
+                stride=env.cfg.arm_stride,
             )
         else:  # particle: representative 2D bar, ball pos at obs[0:2]
             c, h = np.asarray(geom["center"]), np.asarray(geom["half_extents"])
-            box, pos_index, pos_dims = np.concatenate([c[0], h[0]]), 0, 2
-        policy.guidance_fn = LearnedGuidance(
-            cfg.learned_guidance_ckpt,
-            box,
-            stats[OBS_STATE],
-            pos_index,
-            device,
-            cfg.learned_guidance_scale,
-            pos_dims=pos_dims,
-        )
+            policy.guidance_fn = LearnedGuidance(
+                cfg.learned_guidance_ckpt,
+                np.concatenate([c[0], h[0]]),
+                stats[OBS_STATE],
+                pos_index=0,
+                device=device,
+                scale=cfg.learned_guidance_scale,
+                pos_dims=2,
+            )
     else:
         policy.guidance_fn = Guidance(
             env,
