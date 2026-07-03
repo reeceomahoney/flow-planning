@@ -1,0 +1,8 @@
+# particle-tuned settings; use with `--config_path configs/particle.yaml`
+repo_id: reece-omahoney/particle
+env:
+  type: particle
+  ellipse_scale: 3.0
+  ellipse_margin: 0.15
+  ellipse_ay: 0.85
+  ellipse_bias: 1.0

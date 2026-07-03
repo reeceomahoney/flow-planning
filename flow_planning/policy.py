@@ -53,6 +53,7 @@ class FlowMatchingConfig(PreTrainedConfig):
     horizon: int = 50
     n_action_steps: int = 75
     goal_dim: int = field(kw_only=True)  # trailing obs dims; set from env.goal_dim
+    goal_state_start: int = 0  # state block the goal clamps onto; set from the env
 
     # architecture
     dim_model: int = 128
@@ -212,6 +213,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # ponytail: assumes lerobot pads delta frames by clamping to the episode end.
         obs = batch[OBS_STATE]  # (B, H, obs_dim); trailing dims = goal
         sd, gd = self.state_dim, self.config.goal_dim
+        gs = self.config.goal_state_start
         x_1 = torch.cat([obs[..., :sd], batch[ACTION]], dim=-1)
         x_0 = torch.randn_like(x_1)
         t = torch.rand(x_1.shape[0], device=x_1.device)
@@ -219,12 +221,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # boundary frames are clean conditioning context (start state, goal pos),
         # not noised; exclude them from the loss since their velocity is undefined.
         x_t[:, 0, :sd] = x_1[:, 0, :sd]
-        x_t[:, -1, :gd] = x_1[:, -1, :gd]
+        x_t[:, -1, gs : gs + gd] = x_1[:, -1, gs : gs + gd]
         v = self.model(x_t, t)
         err = (v - (x_1 - x_0)) ** 2
         mask = torch.ones_like(err)
         mask[:, 0, :sd] = 0.0
-        mask[:, -1, :gd] = 0.0
+        mask[:, -1, gs : gs + gd] = 0.0
         loss = (err * mask).sum() / mask.sum()
         return loss, {"loss": loss.item()}
 
@@ -238,13 +240,14 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.eval()
         obs = batch[OBS_STATE]
         sd, gd = self.state_dim, self.config.goal_dim
+        gs = self.config.goal_state_start
         state, goal = obs[:, :sd], obs[:, -gd:]
         m = obs.shape[0]
         dt = 1.0 / self.config.num_inference_steps
         x = torch.randn(m, self.config.horizon, self.traj_dim, device=obs.device)
         for i in range(self.config.num_inference_steps):
             x[:, 0, :sd] = state
-            x[:, -1, :gd] = goal
+            x[:, -1, gs : gs + gd] = goal
             t = torch.full((m,), i * dt, device=x.device)
             v = self.model(x, t)
             if self.guidance_fn is not None:
@@ -278,16 +281,17 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
 
 def alias_goal_stats(
-    stats: dict[str, dict[str, Any]], goal_dim: int
+    stats: dict[str, dict[str, Any]], goal_dim: int, goal_state_start: int = 0
 ) -> dict[str, dict[str, Any]]:
-    """The goal (obs tail) and the position (obs head) are the same physical
-    quantity, so normalize the goal with the position's stats. Then the commanded
-    goal lands in position space and inpainting can clamp it onto the trajectory
-    directly, no per-call renormalization."""
+    """The goal (obs tail) and the goal-equivalent state block (ball pos, cube pos)
+    are the same physical quantity, so normalize the goal with that block's stats.
+    Then the commanded goal lands in that block's space and inpainting can clamp it
+    onto the trajectory directly, no per-call renormalization."""
     stats = copy.deepcopy(stats)
     o = stats[OBS_STATE]
+    gs = goal_state_start
     for k in ("mean", "std"):
-        o[k][-goal_dim:] = o[k][:goal_dim]
+        o[k][-goal_dim:] = o[k][gs : gs + goal_dim]
     return stats
 
 
@@ -307,7 +311,7 @@ def make_flow_matching_pre_post_processors(
     assert device is not None
     features = {**(config.input_features or {}), **(config.output_features or {})}
     norm_stats = (
-        alias_goal_stats(dataset_stats, config.goal_dim)
+        alias_goal_stats(dataset_stats, config.goal_dim, config.goal_state_start)
         if dataset_stats is not None
         else None
     )

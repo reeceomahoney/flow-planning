@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flow_planning.kinematics import build_franka_chain
+from flow_planning.kinematics import build_franka_chain, ee_positions
 
 
 def box_sdf(points: Tensor, center: Tensor, half_extents: Tensor) -> Tensor:
@@ -210,68 +210,171 @@ class EllipseGuidance:
     """Push the trajectory out of a smooth ellipse that envelops the obstacle and
     spans start->goal. Because a long arc of a blocked path lies inside a convex
     region, the outward gradient shifts the whole arc coherently and it wraps around
-    the end (a detour), instead of the local tear a box-collision cost produces."""
+    the end (a detour), instead of the local tear a box-collision cost produces.
+
+    The ellipse lives in the plane of `travel` (start->goal axis) and `exit_axis`
+    (detour axis): particle guides the action xy round the bar end in x, franka
+    guides the EE state xyz over the wall top in z. `guide_stats` normalize the
+    guided block; `start_stats`/`goal_stats` read the anchors out of the obs.
+    `anchored` picks the travel-extent rule: static visit points that must stay
+    graspable (cube/goal) shrink the keep-out to the nearer one; a moving current
+    position (particle ball) spans the cross-box gap instead."""
 
     def __init__(
         self,
-        box,
-        obs_stats,
-        action_stats,
-        state_dim: int,
+        box,  # physical [center(d), half_extents(d)]
+        guide_stats,  # (mean, std) of the guided trajectory block
+        start_stats,  # (mean, std) of the current-position obs block
+        goal_stats,  # (mean, std) of the goal obs block (post goal-aliasing)
+        pos_start: int,  # guided block offset in the trajectory
+        start_index: int,  # current-position offset in the obs
+        travel: int,
+        exit_axis: int,
         device,
         scale: float,
         margin: float = 0.15,
         ay_scale: float = 0.85,
         bias: float = 0.0,
+        exit_side: float = 0.0,  # fixed side along exit_axis; 0 = pick per batch
+        anchored: bool = False,  # True: anchors are static visit points (cube/goal)
     ):
-        f32 = {"dtype": torch.float32, "device": device}
-        om = torch.as_tensor(obs_stats["mean"], **f32)
-        os_ = torch.as_tensor(obs_stats["std"], **f32)
-        am = torch.as_tensor(action_stats["mean"], **f32)
-        as_ = torch.as_tensor(action_stats["std"], **f32)
-        # guide the ACTION position dims (what's executed), so the ellipse lives in
-        # action-normalized space; obs stats only read start/goal out of the obs.
-        self.pos_m, self.pos_s = om[:2], os_[:2]  # obs position block
-        self.act_m, self.act_s = am[:2], as_[:2]  # action position block
-        self.pos_start = state_dim  # action dims begin here in the trajectory
-        box = torch.as_tensor(box, **f32)  # [cx, cy, hx, hy] physical
-        self.center = (box[:2] - self.act_m) / self.act_s  # action-normalized space
-        self.half = box[2:] / self.act_s
+        def t(v):
+            return torch.as_tensor(v, dtype=torch.float32, device=device)
+
+        box = t(box)
+        d = box.shape[0] // 2
+        self.d, self.pos_start, self.start_index = d, pos_start, start_index
+        self.travel, self.exit_axis = travel, exit_axis
+        self.gm, self.gs = t(guide_stats[0])[:d], t(guide_stats[1])[:d]
+        self.sm, self.ss = t(start_stats[0])[:d], t(start_stats[1])[:d]
+        self.qm, self.qs = t(goal_stats[0])[:d], t(goal_stats[1])[:d]
+        self.center = (box[:d] - self.gm) / self.gs  # guided-normalized space
+        self.half = box[d:] / self.gs
         self.scale, self.margin, self.ay_scale = scale, margin, ay_scale
-        self.bias = bias  # symmetry break: push inside points around an end
-        self.exit_side = 1.0 if float(box[0]) <= 0 else -1.0  # arena centered at 0
+        self.bias = bias  # symmetry break: push inside points toward the exit
+        self.anchored = anchored
+        self.fixed_side = exit_side
+        # per-batch fallback for a start/goal tie: exit round the roomier end
+        self.tie_side = 1.0 if float(box[exit_axis]) <= 0 else -1.0
 
     def reset(self):
         pass
 
     def __call__(self, x1_hat: Tensor, obs: Tensor | None = None) -> Tensor:
         assert obs is not None
-        # start/goal read from the obs (position-normalized), mapped into the action
-        # space the ellipse and the guided dims live in (same physical xy).
-        start = (obs[:, :2] * self.pos_s + self.pos_m - self.act_m) / self.act_s
-        goal = (obs[:, -2:] * self.pos_s + self.pos_m - self.act_m) / self.act_s
-        cx, cy = self.center
-        ax = self.half[0] + self.margin  # cover the bar width -> exit round the end
-        span = 0.5 * (start[:, 1] - goal[:, 1]).abs()  # (B,) reach toward start/goal
-        ay = (self.ay_scale * span).clamp_min(self.half[1] + self.margin)
-        # exit side: round the end nearer start/goal (roomier end if centered)
-        mid = 0.5 * (start[:, 0] + goal[:, 0]) - cx
-        side = torch.where(
-            mid.abs() < 0.15, mid.new_full((), self.exit_side), mid.sign()
-        )
+        d, tv, ex = self.d, self.travel, self.exit_axis
+        si = self.start_index
+        # start/goal mapped into the normalized space the guided dims live in
+        start = (obs[:, si : si + d] * self.ss + self.sm - self.gm) / self.gs
+        goal = (obs[:, -d:] * self.qs + self.qm - self.gm) / self.gs
+        c = self.center
+        a_exit = self.half[ex] + self.margin  # cover the box -> exit past its end
+        if self.anchored:
+            # static visit points (grasp/place) must stay outside the keep-out:
+            # reach to the nearer one, floor covers only the box itself
+            span = torch.minimum(
+                (start[:, tv] - c[tv]).abs(), (goal[:, tv] - c[tv]).abs()
+            )
+            a_travel = (self.ay_scale * span).clamp_min(self.half[tv])
+        else:
+            # start is the CURRENT position: it legitimately enters the keep-out
+            # mid-detour, so span the cross-box gap instead of shrinking to it
+            span = 0.5 * (start[:, tv] - goal[:, tv]).abs()
+            a_travel = (self.ay_scale * span).clamp_min(self.half[tv] + self.margin)
+        if self.fixed_side != 0.0:
+            side = start.new_full((start.shape[0],), self.fixed_side)
+        else:  # exit the side nearer start/goal (tie_side if centered)
+            mid = 0.5 * (start[:, ex] + goal[:, ex]) - c[ex]
+            side = torch.where(
+                mid.abs() < 0.15, mid.new_full((), self.tie_side), mid.sign()
+            )
         with torch.enable_grad():
             x1_hat = x1_hat.detach().requires_grad_(True)
-            p = x1_hat[..., self.pos_start : self.pos_start + 2]  # action pos dims
-            ex = (p[..., 0] - cx) / ax
-            ey = (p[..., 1] - cy) / ay[:, None]
-            e = ex * ex + ey * ey  # <1 inside the ellipse
+            p = x1_hat[..., self.pos_start : self.pos_start + d]
+            eu = (p[..., ex] - c[ex]) / a_exit
+            ev = (p[..., tv] - c[tv]) / a_travel[:, None]
+            e = eu * eu + ev * ev  # <1 inside the ellipse
             inside = F.softplus(1.0 - e)
             cost = self.scale * inside.sum()  # penalize inside
             if self.bias > 0:  # break symmetry: drive inside points to the exit side
                 cost = (
-                    cost - self.scale * self.bias * (inside * side[:, None] * ex).sum()
+                    cost - self.scale * self.bias * (inside * side[:, None] * eu).sum()
                 )
             (grad,) = torch.autograd.grad(cost, x1_hat)
+        return grad
+
+
+class FKEllipseGuidance:
+    """EllipseGuidance's anchored keep-out, evaluated at the FK EE position of the
+    planned JOINT actions so the gradient reaches the dims that are executed
+    (pushing the EE *state* dims relies on model coupling, which proved weak).
+    Works in physical world space: `margin` is metres, anchors are the cube/goal
+    obs blocks, and the exit is fixed up (+z)."""
+
+    def __init__(
+        self,
+        chain,
+        box,  # physical world [center(3), half_extents(3)]
+        base_pos,  # robot base -> world, added to FK outputs
+        joint_stats,  # (mean, std) of the 7 arm joint action dims
+        anchor_stats,  # (mean, std) of the cube obs block (goal aliases to it)
+        anchor_index: int,  # cube block offset in the obs
+        joint_start: int,  # joint action dims offset in the trajectory
+        device,
+        scale: float,
+        margin: float,
+        ay_scale: float,
+        bias: float,
+        travel: int = 1,
+        exit_axis: int = 2,
+        n_arm: int = 7,
+        stride: int = 2,
+    ):
+        def t(v):
+            return torch.as_tensor(v, dtype=torch.float32, device=device)
+
+        box = t(box)
+        self.chain = chain
+        self.center, self.half = box[:3], box[3:]
+        self.base_pos = t(base_pos)
+        self.jm, self.js = t(joint_stats[0])[:n_arm], t(joint_stats[1])[:n_arm]
+        self.am, self.as_ = t(anchor_stats[0])[:3], t(anchor_stats[1])[:3]
+        self.anchor_index, self.joint_start = anchor_index, joint_start
+        self.scale, self.margin, self.ay_scale, self.bias = (
+            scale,
+            margin,
+            ay_scale,
+            bias,
+        )
+        self.travel, self.exit_axis = travel, exit_axis
+        self.n_arm, self.stride = n_arm, stride
+
+    def reset(self):
+        pass
+
+    def __call__(self, x1_hat: Tensor, obs: Tensor | None = None) -> Tensor:
+        assert obs is not None
+        tv, ex, ai = self.travel, self.exit_axis, self.anchor_index
+        cube = obs[:, ai : ai + 3] * self.as_ + self.am  # physical anchors
+        goal = obs[:, -3:] * self.as_ + self.am
+        c = self.center
+        a_exit = self.half[ex] + self.margin
+        span = torch.minimum((cube[:, tv] - c[tv]).abs(), (goal[:, tv] - c[tv]).abs())
+        a_travel = (self.ay_scale * span).clamp_min(self.half[tv])
+        with torch.enable_grad():
+            x = x1_hat.detach().requires_grad_(True)
+            s = self.joint_start
+            q = x[..., s : s + self.n_arm] * self.js + self.jm  # (B, H, n_arm)
+            q = q[:, :: self.stride]
+            b, h = q.shape[:2]
+            ee = ee_positions(self.chain, q.reshape(-1, self.n_arm)).reshape(b, h, 3)
+            ee = ee + self.base_pos  # world frame
+            eu = (ee[..., ex] - c[ex]) / a_exit
+            ev = (ee[..., tv] - c[tv]) / a_travel[:, None]
+            inside = F.softplus(1.0 - (eu * eu + ev * ev))
+            # penalize inside; bias drives inside points up toward the fixed exit
+            cost = self.scale * (inside - self.bias * inside * eu).sum()
+            (grad,) = torch.autograd.grad(cost, x)
         return grad
 
 
@@ -336,24 +439,52 @@ class Guidance:
                     pos_start=state_dim,
                 )
             )
-        # particle: convex ellipse keep-out that routes the path round the bar's end
-        ellipse_scale = getattr(env.cfg, "ellipse_scale", 0.0)
-        if geom and not arm and obs_stats is not None and ellipse_scale > 0:
-            c = torch.as_tensor(geom["center"], dtype=torch.float32)[0]
-            h = torch.as_tensor(geom["half_extents"], dtype=torch.float32)[0]
-            self.terms.append(
-                EllipseGuidance(
-                    torch.cat([c, h]),
-                    obs_stats,
-                    action_stats,
-                    state_dim,
-                    device,
-                    ellipse_scale,
-                    margin=env.cfg.ellipse_margin,
-                    ay_scale=env.cfg.ellipse_ay,
-                    bias=env.cfg.ellipse_bias,
+        # ellipse keep-out. particle: guide the executed action xy round the bar's
+        # end. franka: actions are joints, so FK the planned joints and push the
+        # resulting EE path over the wall top (state-dim coupling proved weak).
+        if geom and obs_stats is not None and env.cfg.ellipse_scale > 0:
+            om, os_ = obs_stats["mean"], obs_stats["std"]
+            if arm:
+                gs = env.cfg.goal_state_start
+                chain, _, _ = build_franka_chain(device)
+                self.terms.append(
+                    FKEllipseGuidance(
+                        chain,
+                        list(geom["center"]) + list(geom["half_extents"]),
+                        list(env.robot_base_pos),
+                        (action_stats["mean"], action_stats["std"]),
+                        (om[gs : gs + 3], os_[gs : gs + 3]),
+                        anchor_index=gs,
+                        joint_start=state_dim,
+                        device=device,
+                        scale=env.cfg.ellipse_scale,
+                        margin=env.cfg.ellipse_margin,
+                        ay_scale=env.cfg.ellipse_ay,
+                        bias=env.cfg.ellipse_bias,
+                        stride=env.cfg.arm_stride,
+                    )
                 )
-            )
+            else:
+                c = torch.as_tensor(geom["center"], dtype=torch.float32)[0]
+                h = torch.as_tensor(geom["half_extents"], dtype=torch.float32)[0]
+                am, as_ = action_stats["mean"], action_stats["std"]
+                self.terms.append(
+                    EllipseGuidance(
+                        torch.cat([c, h]),
+                        (am[:2], as_[:2]),
+                        (om[:2], os_[:2]),
+                        (om[:2], os_[:2]),
+                        pos_start=state_dim,
+                        start_index=0,
+                        travel=1,
+                        exit_axis=0,  # round the bar end, side picked per batch
+                        device=device,
+                        scale=env.cfg.ellipse_scale,
+                        margin=env.cfg.ellipse_margin,
+                        ay_scale=env.cfg.ellipse_ay,
+                        bias=env.cfg.ellipse_bias,
+                    )
+                )
 
     def __call__(self, x, v, t, obs):
         x1_hat = x + (1 - t.view(-1, 1, 1)) * v

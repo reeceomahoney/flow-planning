@@ -46,12 +46,9 @@ class ParticleConfig(EnvConfig):
 
     goal_dim: int = 2  # goal xy
 
-    # ellipse keep-out guidance; supersedes the box-SDF term, hence obstacle_scale=0
+    # ellipse keep-out guidance supersedes the box-SDF term, hence obstacle_scale=0
     obstacle_scale: float = 0.0
-    ellipse_scale: float = 3.0  # 0 disables
-    ellipse_margin: float = 0.15  # ellipse inflation past the box (normalized)
-    ellipse_ay: float = 0.85  # y-extent as a fraction of half the start->goal gap
-    ellipse_bias: float = 1.0  # symmetry-break push toward the exit side
+    ellipse_scale: float = 3.0
 
 
 @wp.kernel(enable_backward=False)
