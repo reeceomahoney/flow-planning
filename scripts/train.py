@@ -159,9 +159,7 @@ def main(cfg: Config):
     assert stats is not None
 
     policy = FlowMatchingPolicy(policy_cfg, dataset_stats=stats).to(device)
-    policy.model = cast(
-        FlowTransformer, torch.compile(policy.model, mode="reduce-overhead")
-    )
+    policy.model = cast(FlowTransformer, torch.compile(policy.model))
 
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
@@ -174,15 +172,14 @@ def main(cfg: Config):
     env = None
     if cfg.eval_every > 0:
         env = make_env(cfg.env, newton.viewer.ViewerNull())
-
-    # inference-time guidance for eval rollouts (unused by training forward)
-    policy.guidance_fn = Guidance(
-        env,
-        policy.state_dim,
-        stats[ACTION],
-        device,
-        obs_stats=stats[OBS_STATE],
-    )
+        # inference-time guidance for eval rollouts (unused by training forward)
+        policy.guidance_fn = Guidance(
+            env,
+            policy.state_dim,
+            stats[ACTION],
+            device,
+            obs_stats=stats[OBS_STATE],
+        )
 
     # dataset is tiny, just materialize it in VRAM for fast training
     mat_loader = DataLoader(dataset, batch_size=512, num_workers=8, shuffle=False)
@@ -222,6 +219,7 @@ def main(cfg: Config):
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
         ema.update(policy.model)
@@ -235,7 +233,14 @@ def main(cfg: Config):
                 last_log_time = now
             wandb.log(metrics, step=it)
         if it % 1000 == 0:
-            print(f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}", flush=True)
+            grads = {p: g for p in policy.parameters() if (g := p.grad) is not None}
+            pnorm = torch.norm(torch.stack([p.norm() for p in grads])).item()
+            gnorm = torch.norm(torch.stack([g.norm() for g in grads.values()])).item()
+            print(
+                f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}"
+                f"  pnorm {pnorm:.2f}  gnorm {gnorm:.3f}",
+                flush=True,
+            )
 
         if env is not None and it > 0 and it % cfg.eval_every == 0:
             ema.store(policy.model)

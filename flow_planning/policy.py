@@ -123,13 +123,15 @@ class EncoderLayer(nn.Module):
         self.proj = nn.Linear(d, d)
         self.norm1 = nn.LayerNorm(d)
         self.norm2 = nn.LayerNorm(d)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
         self.ff = nn.Sequential(nn.Linear(d, dim_ff), nn.GELU(), nn.Linear(dim_ff, d))
 
     def forward(self, x: Tensor) -> Tensor:
         b, n, d = x.shape
         qkv = self.qkv(self.norm1(x)).view(b, n, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each (B, heads, N, head_dim)
-        o = F.scaled_dot_product_attention(q, k, v)
+        o = F.scaled_dot_product_attention(self.q_norm(q), self.k_norm(k), v)
         x = x + self.proj(o.transpose(1, 2).reshape(b, n, d))
         return x + self.ff(self.norm2(x))
 
@@ -152,6 +154,7 @@ class FlowTransformer(nn.Module):
         self.layers = nn.ModuleList(
             EncoderLayer(d, cfg.n_heads, 4 * d) for _ in range(cfg.n_layers)
         )
+        self.norm_out = nn.LayerNorm(d)
         self.head = nn.Linear(d, traj_dim)
 
     def forward(self, x_t: Tensor, t: Tensor) -> Tensor:
@@ -160,7 +163,7 @@ class FlowTransformer(nn.Module):
         h = self.traj_in(x_t) + temb[:, None] + self.pos_emb
         for layer in self.layers:
             h = layer(h)
-        return self.head(h)
+        return self.head(self.norm_out(h))
 
 
 class FlowMatchingPolicy(PreTrainedPolicy):
