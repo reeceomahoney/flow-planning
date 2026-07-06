@@ -29,7 +29,7 @@ run: |
   # v12: straight source demos + OFFLINE continuous-latent augmentation.
   # Cached datasets are reused; delete them to force a re-record.
   C=/home/sky/.cache/huggingface/lerobot/reece-omahoney
-  [ -f $C/franka-src/meta/info.json ] || { rm -rf $C/franka-src; uv run scripts/record.py --env.type franka --env.task_time 1.5 --env.grasp_symmetry false --episodes 768 --repo_id reece-omahoney/franka-src; }
+  [ -f $C/franka-src/meta/info.json ] || { rm -rf $C/franka-src; uv run scripts/record.py --env.type franka --env.world_count 256 --env.task_time 1.5 --env.grasp_symmetry false --episodes 768 --repo_id reece-omahoney/franka-src; }
   [ -f $C/franka/meta/info.json ] || { rm -rf $C/franka; uv run scripts/augment.py --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka --copies 3 --env.world_count 256; }
   uv run scripts/train.py --repo_id reece-omahoney/franka --num_iters 75000 --env.type franka --env.task_time 1.5
   E="uv run scripts/eval.py --repo_id reece-omahoney/franka --episodes 2 --env.type franka --env.bend_amp 1.0 --env.task_time 1.5 --episode_seconds 30 --learned_guidance_ckpt none"
