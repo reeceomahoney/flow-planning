@@ -32,7 +32,6 @@ run: |
   uv run scripts/record.py --env.type franka --env.task_time 1.5 --env.grasp_symmetry false --episodes 768 --repo_id reece-omahoney/franka-src
   uv run scripts/augment.py --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka --copies 3 --env.world_count 256
   uv run scripts/train.py --repo_id reece-omahoney/franka --num_iters 75000 --env.type franka --env.task_time 1.5
-  uv run scripts/train_guidance.py --repo_id reece-omahoney/franka
   E="uv run scripts/eval.py --repo_id reece-omahoney/franka --episodes 2 --env.type franka --env.bend_amp 1.0 --env.task_time 1.5 --episode_seconds 30 --learned_guidance_ckpt none"
   $E --cond=0,0,0.3,0.12 --warm_start_t 0.6
   $E --cond=0,0,0.3,0.28 --warm_start_t 0.6
