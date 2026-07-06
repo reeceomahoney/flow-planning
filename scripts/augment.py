@@ -233,7 +233,9 @@ def main(cfg: Config):
                 nf, d = len(x["obs"]), x["d"]
                 achieved, _, _ = fk(na_j[:nf, i])
                 err = np.linalg.norm(achieved - (x["act_ee"] + d), axis=1)
-                if err.max() > 0.05:  # arc not reachable with this latent draw
+                jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
+                # unreachable arc, or a posture flip that still tracks the EE
+                if err.max() > 0.05 or jerk > 0.6:
                     rejected.append(x)
                     continue
                 na, no = x["act"].copy(), x["obs"].copy()
