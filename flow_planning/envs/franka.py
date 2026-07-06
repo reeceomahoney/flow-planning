@@ -74,6 +74,10 @@ class FrankaConfig(EnvConfig):
     bend_frac: float = 0.0  # fraction of worlds bent; recording only
     bend_amp: float = 0.6  # peak detour as a fraction of segment length
 
+    # keep cube/goal at least this far from the wall plane (feasible instances);
+    # 0 = unconstrained. Wall-adjacent grasps (<8cm) are physically infeasible.
+    sample_wall_margin: float = 0.0
+
     grasp_symmetry: bool = True  # randomize grasp yaw over the cube's 90° symmetry
     goal_dim: int = 3  # goal xyz
     goal_state_start: int = 18  # cube pos block in the obs (9 joints + 3 EE + 6 rot6d)
@@ -434,6 +438,13 @@ class FrankaEnv:
         pos = np.tile(center, (n, 1)).astype(np.float32)
         pos[:, 0] += self.rng.uniform(-self.cfg.jitter, self.cfg.jitter, n)
         pos[:, 1] += self.rng.uniform(-self.cfg.jitter, self.cfg.jitter, n)
+        m = self.cfg.sample_wall_margin
+        if m > 0 and self.cfg.obstacle:
+            wall_y = self.obstacle_center[1]
+            if center[1] > wall_y:  # cube side
+                pos[:, 1] = np.maximum(pos[:, 1], wall_y + m)
+            else:  # goal side
+                pos[:, 1] = np.minimum(pos[:, 1], wall_y - m)
         return pos
 
     def reset(self):
