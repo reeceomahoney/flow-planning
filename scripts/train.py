@@ -14,7 +14,6 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
-from torch.utils.data import DataLoader
 
 import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
@@ -154,14 +153,6 @@ def main(cfg: Config):
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
     policy_cfg.horizon = max(dataset.meta.episodes["length"])
-
-    delta_timestamps = {
-        "action": [i / dataset.fps for i in policy_cfg.action_delta_indices],
-        "observation.state": [
-            i / dataset.fps for i in policy_cfg.observation_delta_indices
-        ],
-    }
-    dataset = LeRobotDataset(cfg.repo_id, delta_timestamps=delta_timestamps)
     stats = dataset.meta.stats
     assert stats is not None
 
@@ -188,24 +179,20 @@ def main(cfg: Config):
             obs_stats=stats[OBS_STATE],
         )
 
-    # materialize windows in pinned host RAM; the preprocessor moves each batch
-    # to the GPU (the full window set no longer fits in VRAM at 1.5k episodes)
-    mat_loader = DataLoader(dataset, batch_size=512, num_workers=8, shuffle=False)
-    obs_all, act_all, bend_all = [], [], []
-    for b in mat_loader:
-        obs_all.append(b[OBS_STATE])
-        act_all.append(b[ACTION])
-        if policy_cfg.cond_dim:
-            bend_all.append(b["bend"])
-    pin = torch.cuda.is_available()
-    obs_all = torch.cat(obs_all)
-    act_all = torch.cat(act_all)
-    if pin:
-        obs_all, act_all = obs_all.pin_memory(), act_all.pin_memory()
-    bend_all = torch.cat(bend_all) if bend_all else None
+    # frames live once in host RAM; full-horizon windows are gathered per batch
+    # with a clamped index, which IS the absorbing goal-frame tail pad
+    hf = dataset.hf_dataset.with_format("numpy")
+    obs_all = torch.from_numpy(np.asarray(hf["observation.state"]))
+    act_all = torch.from_numpy(np.asarray(hf["action"]))
+    bend_all = torch.from_numpy(np.asarray(hf["bend"])) if policy_cfg.cond_dim else None
+    ep = torch.as_tensor(np.asarray(hf["episode_index"]), dtype=torch.long)
+    last = torch.zeros(int(ep.max()) + 1, dtype=torch.long)
+    last[ep] = torch.arange(len(ep))  # sequential writes leave each episode's end
+    ep_end = last[ep]
     n_samples = obs_all.shape[0]
+    steps = torch.arange(policy_cfg.horizon)
     mb = (obs_all.nbytes + act_all.nbytes) / 1e6
-    print(f"Materialized {n_samples} windows ({mb:.0f} MB) in VRAM", flush=True)
+    print(f"Loaded {n_samples} frames ({mb:.0f} MB) in RAM", flush=True)
 
     optimizer = torch.optim.AdamW(
         policy.get_optim_params(),
@@ -227,7 +214,8 @@ def main(cfg: Config):
     last_log_time = time.perf_counter()
     for it in range(cfg.num_iters):
         idx = torch.randint(0, n_samples, (cfg.batch_size,))
-        batch = preprocessor({OBS_STATE: obs_all[idx], ACTION: act_all[idx]})
+        rows = torch.minimum(idx[:, None] + steps, ep_end[idx][:, None])
+        batch = preprocessor({OBS_STATE: obs_all[rows], ACTION: act_all[rows]})
         if bend_all is not None:
             batch["bend"] = bend_all[idx].to(device, non_blocking=True)
         with amp:
