@@ -86,12 +86,12 @@ def main(cfg: Config):
     particle = isinstance(cfg.env, ParticleConfig)
     preprocessor, _ = make_flow_matching_pre_post_processors(policy_cfg, stats)
 
-    # materialize windows in VRAM (dataset is tiny)
+    # materialize windows in host RAM; slices move to the GPU at use sites
     loader = DataLoader(dataset, batch_size=512, num_workers=8, shuffle=False)
     loader = tqdm(loader, desc="loading windows")
     obs_l, act_l = zip(*[(b[OBS_STATE], b[ACTION]) for b in loader])
-    obs_all = torch.cat(obs_l).to(device)
-    act_all = torch.cat(act_l).to(device)
+    obs_all = torch.cat(obs_l)
+    act_all = torch.cat(act_l)
     n_windows = obs_all.shape[0]
     state_dim = obs_all.shape[-1] - cfg.env.goal_dim
     traj_dim = state_dim + act_all.shape[-1]
@@ -99,14 +99,14 @@ def main(cfg: Config):
 
     # sample and label (window, box) pairs, per timestep
     rng = np.random.default_rng(cfg.seed)
-    idx = torch.randint(0, n_windows, (cfg.n_pairs,), device=device)
+    idx = torch.randint(0, n_windows, (cfg.n_pairs,))
     ts = slice(None, None, cfg.label_stride)
     if particle:
         # commanded target xy (the action, which drives the ball) inside the
         # inflated 2D bar — label the action so guidance moves the executed path
         box = sample_boxes_2d(rng, cfg.n_pairs, device)  # (P, 4)
         box_dim, pos_dims = 4, 2
-        pos = act_all[idx][:, ts, :2]
+        pos = act_all[idx][:, ts, :2].to(device)
         c, h = box[:, None, :2], box[:, None, 2:]
         hit = box_sdf(pos, c, h) < cfg.env.ball_radius + cfg.margin
     else:
@@ -121,8 +121,8 @@ def main(cfg: Config):
             # keep only task-feasible boxes (eval walls never bury the cube/goal):
             # cuts grasp repulsion but also removes avoidance supervision where
             # collisions live — net loss in eval, kept for recombination
-            cube_start = obs_all[idx, 0, CUBE_IDX : CUBE_IDX + 3]
-            goal = obs_all[idx, 0, -3:]
+            cube_start = obs_all[idx, 0, CUBE_IDX : CUBE_IDX + 3].to(device)
+            goal = obs_all[idx, 0, -3:].to(device)
             feas = 0.5 * env.cube_size + 0.05  # fingers + label margin clearance
             for _ in range(50):
                 c, h = box[:, None, :3], box[:, None, 3:]
@@ -142,7 +142,7 @@ def main(cfg: Config):
         hit = torch.empty(cfg.n_pairs, n_steps, dtype=torch.bool, device=device)
         C = 4096
         for i in tqdm(range(0, cfg.n_pairs, C), desc="labeling pairs via FK"):
-            j = act_all[idx[i : i + C]][:, ts, :7].contiguous()
+            j = act_all[idx[i : i + C]][:, ts, :7].contiguous().to(device)
             hit[i : i + C] = labeler.collisions(
                 j, None, box[i : i + C], cfg.margin, chunk=C
             )
@@ -162,29 +162,30 @@ def main(cfg: Config):
     net.train()
     t0 = time.perf_counter()
     for it in range(cfg.num_iters):
-        mb = torch.randint(0, cfg.n_pairs, (cfg.batch_size,), device=device)
+        mb = torch.randint(0, cfg.n_pairs, (cfg.batch_size,))
+        mbd = mb.to(device)  # windows live on CPU; boxes/labels on the GPU
         if particle:
             b = preprocessor({OBS_STATE: obs_all[idx[mb]], ACTION: act_all[idx[mb]]})
             traj = torch.cat([b[OBS_STATE][..., :state_dim], b[ACTION]], dim=-1).float()
-            inp, bx = traj[:, ts], normalize_box(box[mb], pos_mean, pos_std)
+            inp, bx = traj[:, ts], normalize_box(box[mbd], pos_mean, pos_std)
         else:
-            q = act_all[idx[mb]][:, ts, :7]  # physical joints (B, T, 7)
+            q = act_all[idx[mb]][:, ts, :7].to(device)  # physical joints (B, T, 7)
             m, t = q.shape[:2]
             with torch.no_grad():
                 pts = labeler.arm_points(q.reshape(-1, 7)).reshape(m, t, -1, 3)
-                inp = (pts + labeler.base_pos - box[mb][:, None, None, :3]).flatten(-2)
-            bx = box[mb][:, 3:]
+                inp = (pts + labeler.base_pos - box[mbd][:, None, None, :3]).flatten(-2)
+            bx = box[mbd][:, 3:]
         logit = net(inp, bx)
         loss = F.binary_cross_entropy_with_logits(
-            logit, hit[mb].float(), pos_weight=pos_weight
+            logit, hit[mbd].float(), pos_weight=pos_weight
         )
         opt.zero_grad()
         loss.backward()
         opt.step()
         if it % 100 == 0:
             pred = logit > 0
-            tp = (pred & hit[mb]).sum().item()
-            recall = tp / max(hit[mb].sum().item(), 1)
+            tp = (pred & hit[mbd]).sum().item()
+            recall = tp / max(hit[mbd].sum().item(), 1)
             prec = tp / max(pred.sum().item(), 1)
             print(
                 f"step {it}/{cfg.num_iters}  loss {loss.item():.4f}  "
