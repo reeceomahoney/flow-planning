@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 import draccus
+import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
@@ -31,6 +32,10 @@ def collect(cfg: Config, env):
         "action": {"dtype": "float32", "shape": (action.shape[1],), "names": None},
         "next.success": {"dtype": "bool", "shape": (1,), "names": None},
     }
+    has_bend = hasattr(env, "episode_cond")  # franka: per-episode demo latents
+    if has_bend:
+        cd = env.episode_cond.shape[1]
+        features["bend"] = {"dtype": "float32", "shape": (cd,), "names": None}
     dataset = LeRobotDataset.create(
         repo_id=cfg.repo_id, fps=cfg.env.fps, features=features, use_videos=False
     )
@@ -50,15 +55,16 @@ def collect(cfg: Config, env):
                     break
                 if not success[w]:
                     continue
-                for state, action in buf:
-                    dataset.add_frame(
-                        {
-                            "observation.state": state,
-                            "action": action,
-                            "next.success": success[w : w + 1],
-                            "task": cfg.task,
-                        }
-                    )
+                for state, action, bend in buf:
+                    frame = {
+                        "observation.state": state,
+                        "action": action,
+                        "next.success": success[w : w + 1],
+                        "task": cfg.task,
+                    }
+                    if has_bend:
+                        frame["bend"] = bend
+                    dataset.add_frame(frame)
                 dataset.save_episode()
                 collected += 1
                 pbar.update(1)
@@ -66,8 +72,9 @@ def collect(cfg: Config, env):
             continue
 
         obs, action = env.record_frame()
+        bend = env.episode_cond if has_bend else np.zeros((cfg.env.world_count, 2))
         for w in range(cfg.env.world_count):
-            buffers[w].append((obs[w], action[w]))
+            buffers[w].append((obs[w], action[w], bend[w]))
 
     pbar.close()
     dataset.finalize()

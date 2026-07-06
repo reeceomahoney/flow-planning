@@ -70,6 +70,10 @@ class FrankaConfig(EnvConfig):
     obstacle_width: float = 0.15
     obstacle_thickness: float = 0.01
 
+    # bend transit phases into random perpendicular arcs (record-blind detour aug)
+    bend_frac: float = 0.0  # fraction of worlds bent; recording only
+    bend_amp: float = 0.6  # peak detour as a fraction of segment length
+
     grasp_symmetry: bool = True  # randomize grasp yaw over the cube's 90° symmetry
     goal_dim: int = 3  # goal xyz
     goal_state_start: int = 18  # cube pos block in the obs (9 joints + 3 EE + 6 rot6d)
@@ -92,6 +96,8 @@ def set_target_pose_kernel(
     off_lift: wp.array(dtype=wp.vec3),
     grasp_offset: wp.array(dtype=wp.float32),
     place_offset: wp.array(dtype=wp.float32),
+    bend: wp.array(dtype=wp.vec2),
+    wrist_bias: wp.array(dtype=wp.vec3),
     off_retract: wp.vec3,
     task_init_body_q: wp.array(dtype=wp.transform),
     body_q: wp.array(dtype=wp.transform),
@@ -102,6 +108,7 @@ def set_target_pose_kernel(
     ee_pos_out: wp.array(dtype=wp.vec3),
     ee_rot_out: wp.array(dtype=wp.vec4),
     gripper_out: wp.array2d(dtype=wp.float32),
+    wrist_out: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
 
@@ -153,8 +160,26 @@ def set_target_pose_kernel(
         ee_pos_target = drop + off_retract
 
     ee_pos_out[tid] = ee_pos_prev * (1.0 - t) + ee_pos_target * t
+    # detour aug: half-sine arc perpendicular to the transit segment, zero at
+    # the endpoints so the grasp/place phases are untouched
+    if task == TaskType.APPROACH.value or task == TaskType.MOVE_TO_DROP_OFF.value:
+        seg = ee_pos_target - ee_pos_prev
+        up = wp.vec3(0.0, 0.0, 1.0)
+        lat = wp.cross(seg, up)
+        if wp.length(lat) > 1.0e-4:
+            arc = bend[tid][0] * wp.normalize(lat) + bend[tid][1] * up
+            # plateau profile: rise, hold at full detour mid-phase, descend —
+            # keeps clearance wherever the obstacle crossing falls
+            prof = wp.min(1.0, 2.0 * wp.sin(wp.pi * t))
+            ee_pos_out[tid] += wp.length(seg) * prof * arc
     q = wp.quat_slerp(ee_quat_prev, ee_quat_target, t)
     ee_rot_out[tid] = wp.vec4(q[0], q[1], q[2], q[3])
+    # wrist-carriage objective: neutral until the cube is held; the latent only
+    # shapes transit/place posture, so grasp precision is untouched
+    wb = wrist_bias[tid]
+    if task < TaskType.MOVE_TO_DROP_OFF.value:
+        wb = wp.vec3(0.0, 0.0, 0.18)
+    wrist_out[tid] = ee_pos_out[tid] + wb
 
     gripper_pos = 0.06 * (1.0 - t_gripper)
     gripper_out[tid, 0] = gripper_pos
@@ -360,11 +385,28 @@ class FrankaEnv:
             joint_limit_upper=upper.flatten(),
         )
 
+        # weak wrist-position objective: its per-episode target bias is a demo
+        # latent steering which IK posture family the arm uses
+        labels = list(self.model_single.body_label)
+        wrist_link = next(i for i, lb in enumerate(labels) if "link7" in str(lb))
+        self.wrist_target = wp.zeros(n, dtype=wp.vec3)
+        self.wrist_obj = ik.IKObjectivePosition(
+            link_index=wrist_link,
+            link_offset=wp.vec3(0.0, 0.0, 0.0),
+            target_positions=self.wrist_target,
+            weight=0.4,  # weak enough to keep EE precision, strong enough to obey
+        )
+
         self.joint_q_ik = wp.clone(self.model.joint_q.reshape((n, -1))[:, :ik_dofs])
         self.ik_solver = ik.IKSolver(
             model=self.model_single,
             n_problems=n,
-            objectives=[self.pos_obj, self.rot_obj, self.obj_joint_limits],
+            objectives=[
+                self.pos_obj,
+                self.rot_obj,
+                self.wrist_obj,
+                self.obj_joint_limits,
+            ],
             lambda_initial=0.1,
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
@@ -380,6 +422,8 @@ class FrankaEnv:
         self.gripper_target = wp.zeros((n, 2), dtype=wp.float32)
         self.grasp_offset = wp.zeros(n, dtype=wp.float32)  # per-episode grasp-yaw aug
         self.place_offset = wp.zeros(n, dtype=wp.float32)  # per-episode place-yaw aug
+        self.bend = wp.zeros(n, dtype=wp.vec2)  # per-episode [lateral, vertical] arc
+        self.wrist_bias = wp.zeros(n, dtype=wp.vec3)  # per-episode posture latent
         self.goal_wp = wp.zeros(n, dtype=wp.vec3)
         self.task_idx = 0
         self.task_time = 0.0
@@ -419,6 +463,33 @@ class FrankaEnv:
         sym(self.grasp_offset)
         sym(self.place_offset)
 
+        # detour aug: discrete modes (straight/left/right x flat/over) so each mode
+        # gets enough demos to stay crisp; amplitude jitter keeps them a family.
+        # +lat arcs toward the base (cramped, rarely executable) — sampled rarely;
+        # vertical is moderated to stay off the workspace ceiling
+        lat = self.rng.choice([-1.0, 0.0, 1.0], n, p=[0.35, 0.5, 0.15])
+        vert = self.rng.choice([0.0, 1.0], n, p=[0.6, 0.4])
+        jit = np.stack(
+            [self.rng.uniform(0.7, 1.0, n), self.rng.uniform(0.45, 0.8, n)], axis=1
+        )
+        do = self.rng.uniform(0.0, 1.0, n) < self.cfg.bend_frac
+        b = self.cfg.bend_amp * do[:, None] * jit * np.stack([lat, vert], axis=1)
+        self.bend_np = b.astype(np.float32)
+        wp.copy(self.bend, wp.array(self.bend_np, dtype=wp.vec2))
+
+        # wrist posture latent: wrist CARRIAGE HEIGHT above the EE (low/high) —
+        # which IK posture family the arm uses, esp. during low placement
+        wz = self.rng.choice([0.12, 0.28], n, p=[0.5, 0.5]).astype(np.float32)
+        wb = np.zeros((n, 3), np.float32)
+        wb[:, 2] = wz
+        wp.copy(self.wrist_bias, wp.array(wb, dtype=wp.vec3))
+
+        # policy conditioning = every per-episode latent of the demo generator:
+        # unexplained latents smear the flow's plans into slow-motion averages
+        self.episode_cond = np.concatenate(
+            [self.bend_np, lift[:, 2:3], wz[:, None]], axis=1
+        )
+
         jq = np.zeros((n, self.coords_per_world), np.float32)
         jq[:, :9] = HOME_Q
         jq[:, 9:12] = cube_start
@@ -454,6 +525,8 @@ class FrankaEnv:
                 self.off_lift,
                 self.grasp_offset,
                 self.place_offset,
+                self.bend,
+                self.wrist_bias,
                 self.off_retract,
                 self.task_init_body_q,
                 self.state_0.body_q,
@@ -461,7 +534,12 @@ class FrankaEnv:
                 self.robot_body_count,
                 self.num_bodies_per_world,
             ],
-            outputs=[self.ee_pos_target, self.ee_rot_target, self.gripper_target],
+            outputs=[
+                self.ee_pos_target,
+                self.ee_rot_target,
+                self.gripper_target,
+                self.wrist_target,
+            ],
         )
         self.pos_obj.set_target_positions(self.ee_pos_target)
         self.rot_obj.set_target_rotations(self.ee_rot_target)
