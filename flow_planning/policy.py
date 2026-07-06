@@ -64,6 +64,11 @@ class FlowMatchingConfig(PreTrainedConfig):
     num_inference_steps: int = 10
     action_lpf: float = 0.3  # EMA alpha on executed actions; <1 smooths seam jumps
 
+    # bend-parameter conditioning (0 disables); dropout trains the null token (CFG)
+    cond_dim: int = 0
+    cond_dropout: float = 0.15
+    adaln: bool = False  # per-layer AdaLN-Zero on (time+cond); False = additive bias
+
     # training
     optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-2
@@ -114,27 +119,40 @@ def sinusoidal_embedding(t: Tensor, dim: int) -> Tensor:
 
 
 class EncoderLayer(nn.Module):
-    """Pre-norm transformer encoder layer over global SDPA."""
+    """Pre-norm transformer encoder layer over global SDPA, optionally with
+    AdaLN-Zero modulation by a conditioning vector (DiT-style)."""
 
-    def __init__(self, d: int, n_heads: int, dim_ff: int):
+    def __init__(self, d: int, n_heads: int, dim_ff: int, adaln: bool = False):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d // n_heads
         self.qkv = nn.Linear(d, 3 * d)
         self.proj = nn.Linear(d, d)
-        self.norm1 = nn.LayerNorm(d)
-        self.norm2 = nn.LayerNorm(d)
+        self.norm1 = nn.LayerNorm(d, elementwise_affine=not adaln)
+        self.norm2 = nn.LayerNorm(d, elementwise_affine=not adaln)
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
         self.ff = nn.Sequential(nn.Linear(d, dim_ff), nn.GELU(), nn.Linear(dim_ff, d))
+        if adaln:
+            self.mod = nn.Linear(d, 6 * d)
+            nn.init.zeros_(self.mod.weight)
+            nn.init.zeros_(self.mod.bias)
 
-    def forward(self, x: Tensor) -> Tensor:
-        b, n, d = x.shape
-        qkv = self.qkv(self.norm1(x)).view(b, n, 3, self.n_heads, self.head_dim)
+    def attn(self, h: Tensor) -> Tensor:
+        b, n, d = h.shape
+        qkv = self.qkv(h).view(b, n, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each (B, heads, N, head_dim)
         o = F.scaled_dot_product_attention(self.q_norm(q), self.k_norm(k), v)
-        x = x + self.proj(o.transpose(1, 2).reshape(b, n, d))
-        return x + self.ff(self.norm2(x))
+        return self.proj(o.transpose(1, 2).reshape(b, n, d))
+
+    def forward(self, x: Tensor, c: Tensor | None = None) -> Tensor:
+        if not hasattr(self, "mod"):
+            x = x + self.attn(self.norm1(x))
+            return x + self.ff(self.norm2(x))
+        assert c is not None
+        sc1, sh1, g1, sc2, sh2, g2 = self.mod(c)[:, None].chunk(6, dim=-1)
+        x = x + g1 * self.attn(self.norm1(x) * (1 + sc1) + sh1)
+        return x + g2 * self.ff(self.norm2(x) * (1 + sc2) + sh2)
 
 
 class FlowTransformer(nn.Module):
@@ -152,18 +170,41 @@ class FlowTransformer(nn.Module):
         self.traj_in = nn.Linear(traj_dim, d)
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
         self.pos_emb = nn.Parameter(torch.randn(self.horizon, d) * 0.02)
+        if cfg.cond_dim:
+            self.cond_mlp = nn.Sequential(
+                nn.Linear(cfg.cond_dim, d), nn.GELU(), nn.Linear(d, d)
+            )
+            self.null_cond = nn.Parameter(torch.zeros(d))
+        self.adaln = cfg.adaln
         self.layers = nn.ModuleList(
-            EncoderLayer(d, cfg.n_heads, 4 * d) for _ in range(cfg.n_layers)
+            EncoderLayer(d, cfg.n_heads, 4 * d, adaln=cfg.adaln)
+            for _ in range(cfg.n_layers)
         )
         self.norm_out = nn.LayerNorm(d)
         self.head = nn.Linear(d, traj_dim)
 
-    def forward(self, x_t: Tensor, t: Tensor) -> Tensor:
-        # x_t: (B, H, traj_dim), t: (B,).
+    def forward(
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        cond: Tensor | None = None,
+        cond_drop: Tensor | None = None,
+    ) -> Tensor:
+        # x_t: (B, H, traj_dim), t: (B,), cond: (B, cond_dim) or None (-> null).
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
-        h = self.traj_in(x_t) + temb[:, None] + self.pos_emb
+        c = temb
+        if hasattr(self, "cond_mlp"):
+            ce = self.null_cond.expand(x_t.shape[0], -1)
+            if cond is not None:
+                ce = self.cond_mlp(cond)
+                if cond_drop is not None:
+                    ce = torch.where(cond_drop[:, None], self.null_cond, ce)
+            c = c + ce
+        h = self.traj_in(x_t) + self.pos_emb
+        if not self.adaln:  # additive fallback: cond/time as a global bias
+            h = h + c[:, None]
         for layer in self.layers:
-            h = layer(h)
+            h = layer(h, c)
         return self.head(self.norm_out(h))
 
 
@@ -222,7 +263,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # not noised; exclude them from the loss since their velocity is undefined.
         x_t[:, 0, :sd] = x_1[:, 0, :sd]
         x_t[:, -1, gs : gs + gd] = x_1[:, -1, gs : gs + gd]
-        v = self.model(x_t, t)
+        cond = batch.get("bend") if self.config.cond_dim else None
+        drop = None
+        if cond is not None:
+            drop = (
+                torch.rand(cond.shape[0], device=cond.device) < self.config.cond_dropout
+            )
+        v = self.model(x_t, t, cond, drop)
         err = (v - (x_1 - x_0)) ** 2
         mask = torch.ones_like(err)
         mask[:, 0, :sd] = 0.0

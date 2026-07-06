@@ -43,6 +43,7 @@ class Config:
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
+    adaln: bool = True  # new runs use AdaLN; old checkpoints keep additive bias
 
 
 class EMA:
@@ -145,6 +146,10 @@ def main(cfg: Config):
         goal_dim=cfg.env.goal_dim,
         goal_state_start=cfg.env.goal_state_start,
         n_action_steps=cfg.env.n_action_steps,
+        cond_dim=dataset.features["bend"]["shape"][0]
+        if "bend" in dataset.features
+        else 0,
+        adaln=cfg.adaln,
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
@@ -186,15 +191,18 @@ def main(cfg: Config):
     # materialize windows in pinned host RAM; the preprocessor moves each batch
     # to the GPU (the full window set no longer fits in VRAM at 1.5k episodes)
     mat_loader = DataLoader(dataset, batch_size=512, num_workers=8, shuffle=False)
-    obs_all, act_all = [], []
+    obs_all, act_all, bend_all = [], [], []
     for b in mat_loader:
         obs_all.append(b[OBS_STATE])
         act_all.append(b[ACTION])
+        if policy_cfg.cond_dim:
+            bend_all.append(b["bend"])
     pin = torch.cuda.is_available()
     obs_all = torch.cat(obs_all)
     act_all = torch.cat(act_all)
     if pin:
         obs_all, act_all = obs_all.pin_memory(), act_all.pin_memory()
+    bend_all = torch.cat(bend_all) if bend_all else None
     n_samples = obs_all.shape[0]
     mb = (obs_all.nbytes + act_all.nbytes) / 1e6
     print(f"Materialized {n_samples} windows ({mb:.0f} MB) in VRAM", flush=True)
@@ -220,6 +228,8 @@ def main(cfg: Config):
     for it in range(cfg.num_iters):
         idx = torch.randint(0, n_samples, (cfg.batch_size,))
         batch = preprocessor({OBS_STATE: obs_all[idx], ACTION: act_all[idx]})
+        if bend_all is not None:
+            batch["bend"] = bend_all[idx].to(device, non_blocking=True)
         with amp:
             loss, _ = policy.forward(batch)
 
