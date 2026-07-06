@@ -1,15 +1,19 @@
 """Offline detour augmentation of a recorded dataset (teleop-compatible).
 
 Bends the transit segments of each episode in EE space (continuous lateral/
-vertical arcs + wrist-carriage posture), re-IKs to joint actions, and labels
-every copy with its latents. Only the gripper signal segments the episode, so
-this applies to any pre-existing demo dataset, not just scripted ones.
+vertical arcs + wrist-carriage posture) and re-IKs to joint actions; only the
+gripper signal segments the episode, so the action-side augmentation applies
+to any pre-existing demo dataset. States come from REPLAYING the bent actions
+in sim: IK-synthesized states are kinematically right but dynamically sterile
+(no tracking lag, no contact), and a policy trained on them collapses when
+eval clamps a real state into the plan.
 """
 
 from dataclasses import dataclass, field
 from typing import Any
 
 import draccus
+import newton
 import numpy as np
 import torch
 import warp as wp
@@ -48,12 +52,23 @@ def transit_segments(gripper: np.ndarray) -> tuple[int, int]:
     return close, opened
 
 
-def bend_delta(ee, close, opened, lat, vert):
-    """Per-frame EE displacement: plateau-profile arc on each transit segment,
-    zero at the endpoints so grasp/release are untouched."""
+def bend_delta(ee, close, opened, lat, vert, clear=0.1):
+    """Per-frame EE displacement: plateau-profile arc on each transit segment.
+    Segments shrink to where the EE is `clear` above its grasp/place height, so
+    the approach descent, grasp, lift and place descent stay untouched — the
+    geometric analogue of the online recorder's phase gating."""
     d = np.zeros_like(ee)
     up = np.array([0.0, 0.0, 1.0])
-    for s0, s1 in ((0, close), (close, opened)):
+    z = ee[:, 2]
+    hi1 = np.nonzero(z[:close] > z[max(close - 1, 0)] + clear)[0]
+    hi2 = np.nonzero(z[close:opened] > z[opened - 1] + clear)[0] + close
+    lifted2 = np.nonzero(z[close:opened] > z[close] + clear)[0] + close
+    segs = []
+    if len(hi1):
+        segs.append((0, int(hi1[-1])))  # home -> just above the grasp
+    if len(hi2) and len(lifted2):  # lift done -> just above the place
+        segs.append((int(lifted2[0]), int(hi2[-1])))
+    for s0, s1 in segs:
         if s1 - s0 < 4:
             continue
         chord = ee[s1 - 1] - ee[s0]
@@ -169,7 +184,6 @@ def main(cfg: Config):
         if opened - close < 4:
             continue
         act_ee, act_quat, al7 = fk(act[:, :7])
-        st_ee, st_quat, sl7 = fk(obs[:, :7])
         todo.append(
             dict(
                 obs=obs,
@@ -179,85 +193,119 @@ def main(cfg: Config):
                 act_ee=act_ee,
                 act_quat=act_quat,
                 awz0=al7 - act_ee[:, 2],
-                st_ee=st_ee,
-                st_quat=st_quat,
-                swz0=sl7 - st_ee[:, 2],
             )
         )
 
     def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
         return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
 
-    def targets(grp, key, wzs, tm):
-        """Bent EE/rot/wrist target stacks (tm, n, .) for one IK pass."""
-        ee, quat, wz0 = f"{key}_ee", f"{key}_quat", f"{key[0]}wz0"
+    def targets(grp, wzs, tm):
+        """Bent EE/rot/wrist target stacks (tm, n, .) for the action IK pass."""
         out: dict[str, list] = {"e": [], "q": [], "w": []}
         for x, d, wz in zip(grp, (x["d"] for x in grp), wzs):
-            carr = x[wz0].copy()
-            c, r = x["close"], 25  # original posture until held, then ramp in
+            carr = x["awz0"].copy()
+            z = x["obs"][:, EE.start + 2]
+            up = np.nonzero(z[x["close"] :] > z[x["close"]] + 0.1)[0]
+            c = x["close"] + (int(up[0]) if len(up) else 0)  # lift done
+            r = 25  # original posture until the lift completes, then ramp in
             carr[c + r :] = wz
             carr[c : c + r] = (
                 carr[c] + (wz - carr[c]) * np.arange(r)[: len(carr) - c] / r
             )
-            e = x[ee] + d
+            e = x["act_ee"] + d
             w = e.copy()
             w[:, 2] += carr
-            for k, v in zip(out, (e, x[quat], w)):
+            for k, v in zip(out, (e, x["act_quat"], w)):
                 out[k].append(tpad(v, tm))
         e, q, w = (np.stack(out[k], axis=1) for k in out)
         return e, q, w
 
-    # pass 2: bent copies. IK batches episodes and streams frames; copies whose
-    # achieved EE path can't track the bent target (unreachable arcs) get their
-    # latents resampled — the offline analogue of the recorder's success filter.
-    ee_err, jacc, written = [], [], 0
+    def replay(grp):
+        """Execute each copy's actions open-loop from its episode's initial
+        conditions; real dynamics produce the states (and a success filter)."""
+        n = env.cfg.world_count
+        tm = max(len(x["na"]) for x in grp)
+        acts = rig.pad(np.stack([tpad(x["na"], tm) for x in grp]))
+        jq = np.zeros((n, env.coords_per_world), np.float32)
+        o0 = rig.pad(np.stack([x["obs"][0] for x in grp]))
+        jq[:, :9] = o0[:, :9]
+        jq[:, 9:12] = o0[:, 18:21]
+        yaw = np.arctan2(o0[:, 21], o0[:, 22])
+        jq[:, 14] = np.sin(yaw / 2)
+        jq[:, 15] = np.cos(yaw / 2)
+        env.reset()
+        env.goal_pos = o0[:, 23:26]
+        env.cube_pos_prev = o0[:, 18:21].copy()
+        env.cube_start_z = o0[:, 20].copy()
+        wp.copy(env.state_0.joint_q, wp.array(jq.flatten(), dtype=wp.float32))
+        env.state_0.joint_qd.zero_()
+        newton.eval_fk(
+            env.model, env.state_0.joint_q, env.state_0.joint_qd, env.state_0
+        )
+        obs_seq = np.empty((tm, n, o0.shape[1]), np.float32)
+        for t in range(tm):
+            env.apply_action(acts[:, t])
+            obs_seq[t] = env.get_obs()
+        return obs_seq, env.success()
+
+    # pass 2: bend + re-IK actions, then replay in sim for real states. Copies
+    # that fail either gate — IK can't track the arc (unreachable / posture
+    # flip) or the replayed rollout fails the task — get their latents
+    # resampled, like the recorder's success filter.
+    ee_err: list[np.ndarray] = []
+    written = 0
     pending = [dict(x) for x in todo for _ in range(cfg.copies)]
-    for attempt in range(3):
+    for attempt in range(4):
         rejected = []
-        for g in tqdm(range(0, len(pending), rig.W), desc=f"bent (try {attempt})"):
+        for g in tqdm(range(0, len(pending), rig.W), desc=f"bend (try {attempt})"):
             grp = pending[g : g + rig.W]
             n, tm = len(grp), max(len(x["obs"]) for x in grp)
             lats = cfg.bend_amp * rng.uniform(-1.0, 1.0, n)
             verts = cfg.bend_amp * rng.uniform(0.0, 0.8, n)
             wzs = rng.uniform(cfg.wrist_lo, cfg.wrist_hi, n)
-            for x, lat, vert in zip(grp, lats, verts):
+            for x, lat, vert, wz in zip(grp, lats, verts, wzs):
                 x["d"] = bend_delta(x["obs"][:, EE], x["close"], x["opened"], lat, vert)
+                x["label"] = np.array([lat, vert, 0.0, wz])
             aseed = np.stack([x["act"][0, [0, 1, 2, 3, 4, 5, 6, 7, 7]] for x in grp])
-            sseed = np.stack([x["obs"][0, :9] for x in grp])
-            ae, aq, aw = targets(grp, "act", wzs, tm)
-            se, sq, sw = targets(grp, "st", wzs, tm)
+            ae, aq, aw = targets(grp, wzs, tm)
             na_j = rig.solve_seq(ae, aq, aw, aseed)
-            no_j = rig.solve_seq(se, sq, sw, sseed)
 
+            ready = []
             for i, x in enumerate(grp):
-                nf, d = len(x["obs"]), x["d"]
+                nf = len(x["obs"])
                 achieved, _, _ = fk(na_j[:nf, i])
-                err = np.linalg.norm(achieved - (x["act_ee"] + d), axis=1)
+                err = np.linalg.norm(achieved - (x["act_ee"] + x["d"]), axis=1)
                 jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
-                # unreachable arc, or a posture flip that still tracks the EE
                 if err.max() > 0.05 or jerk > 0.6:
                     rejected.append(x)
                     continue
-                na, no = x["act"].copy(), x["obs"].copy()
+                na = x["act"].copy()
                 na[:, :7] = na_j[:nf, i]
-                no[:, :7] = no_j[:nf, i]
-                no[:, EE] = x["obs"][:, EE] + d
+                x["na"], x["err"] = na, err
+                ready.append(x)
+
+            if not ready:
+                continue
+            obs_seq, succ = replay(ready)
+            for i, x in enumerate(ready):
+                if not succ[i]:
+                    rejected.append(x)
+                    continue
+                nf = len(x["na"])
+                no = obs_seq[:nf, i]
                 held = slice(x["close"], x["opened"])
-                no[held, CUBE] = x["obs"][held, CUBE] + d[held]  # rides the gripper
-                nl = float(no[held, EE][:, 2].max() - no[x["close"], EE.start + 2])
-                write(no, na, np.array([lats[i], verts[i], nl, wzs[i]]))
+                x["label"][2] = no[held, EE][:, 2].max() - no[x["close"], EE.start + 2]
+                write(no, x["na"], x["label"])
                 written += 1
-                ee_err.append(err)
-                jacc.append(np.abs(np.diff(na[:, :7], n=2, axis=0)).max(axis=1))
+                ee_err.append(x["err"])
         pending = rejected
         if not pending:
             break
 
-    err, acc = np.concatenate(ee_err), np.concatenate(jacc)
-    print(f"kept {written} copies, dropped {len(pending)} unreachable")
+    err = np.concatenate(ee_err)
+    total = written + len(pending)
+    print(f"wrote {written}/{total} copies ({len(pending)} dropped after retries)")
     print(f"re-IK EE error: mean {err.mean():.4f}m  p95 {np.percentile(err, 95):.4f}m")
-    p95, p99 = np.percentile(acc, 95), np.percentile(acc, 99)
-    print(f"joint accel: p95 {p95:.5f}  p99 {p99:.5f}  max {acc.max():.4f}")
     dst.finalize()
 
 
