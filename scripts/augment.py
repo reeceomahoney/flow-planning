@@ -7,6 +7,7 @@ this applies to any pre-existing demo dataset, not just scripted ones.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import draccus
 import numpy as np
@@ -31,7 +32,7 @@ class Config:
     bend_amp: float = 1.0  # scales the sampled arc, as in the online recorder
     wrist_lo: float = 0.12  # wrist-carriage height range above the EE
     wrist_hi: float = 0.32
-    ik_iters: int = 40  # seeds are the source joints, so this converges fast
+    ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
     env: FrankaConfig = field(default_factory=FrankaConfig)  # IK rig only
 
@@ -67,33 +68,37 @@ def bend_delta(ee, close, opened, lat, vert):
 
 
 class IKRig:
-    """Batched re-IK through the env's solver: EE pose + wrist-carriage target
-    -> arm joints, warm-started from the source joints."""
+    """Re-IK through the env's solver, batched over episodes and SEQUENTIAL over
+    frames: each frame warm-starts from the previous frame's solution, exactly
+    like the online recorder. Independent per-frame solves hop between IK
+    posture families and produce unusably jerky joint trajectories."""
 
     def __init__(self, env, iters: int):
         self.env, self.iters = env, iters
         self.W = env.cfg.world_count
         self.dofs = env.joint_q_ik.shape[1]
 
-    def solve(self, ee_t, quat_t, wrist_t, seed_q):
-        env, W = self.env, self.W
-        out = np.empty((len(ee_t), 7), np.float32)
-        for i in range(0, len(ee_t), W):
-            j = min(i + W, len(ee_t))
+    def pad(self, a):  # (B, ...) -> (W, ...) by repeating the last row
+        p = np.repeat(a[-1:], self.W, axis=0)
+        p[: len(a)] = a
+        return np.ascontiguousarray(p, np.float32)
 
-            def pad(a):
-                p = np.repeat(a[j - 1 : j], W, axis=0)
-                p[: j - i] = a[i:j]
-                return np.ascontiguousarray(p, np.float32)
-
-            env.pos_obj.set_target_positions(wp.array(pad(ee_t), dtype=wp.vec3))
-            env.rot_obj.set_target_rotations(wp.array(pad(quat_t), dtype=wp.vec4))
-            wp.copy(env.wrist_target, wp.array(pad(wrist_t), dtype=wp.vec3))
-            seed = np.zeros((W, self.dofs), np.float32)
-            seed[:, :9] = pad(seed_q)
-            wp.copy(env.joint_q_ik, wp.array(seed, dtype=wp.float32))
+    def solve_seq(self, ee_t, quat_t, wrist_t, seed0):
+        """(T, B, 3/4) target sequences + (B, 9) initial joints -> (T, B, 7)."""
+        env = self.env
+        T, B = ee_t.shape[:2]
+        seed = np.zeros((self.W, self.dofs), np.float32)
+        seed[:, :9] = self.pad(seed0)
+        wp.copy(env.joint_q_ik, wp.array(seed, dtype=wp.float32))
+        out = np.empty((T, B, 7), np.float32)
+        for t in range(T):
+            env.pos_obj.set_target_positions(wp.array(self.pad(ee_t[t]), dtype=wp.vec3))
+            env.rot_obj.set_target_rotations(
+                wp.array(self.pad(quat_t[t]), dtype=wp.vec4)
+            )
+            wp.copy(env.wrist_target, wp.array(self.pad(wrist_t[t]), dtype=wp.vec3))
             env.ik_solver.step(env.joint_q_ik, env.joint_q_ik, iterations=self.iters)
-            out[i:j] = env.joint_q_ik.numpy()[: j - i, :7]
+            out[t] = env.joint_q_ik.numpy()[:B, :7]
         return out
 
 
@@ -151,8 +156,9 @@ def main(cfg: Config):
             )
         dst.save_episode()
 
-    ee_err = []
-    for e in tqdm(range(src.num_episodes), desc="augmenting"):
+    # pass 1: write originals (measured lift label), FK-cache bendable episodes
+    todo: list[dict[str, Any]] = []
+    for e in tqdm(range(src.num_episodes), desc="originals"):
         sel = epi == e
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
@@ -162,34 +168,94 @@ def main(cfg: Config):
         write(obs, act, np.array([0.0, 0.0, lift, wz_src]))
         if opened - close < 4:
             continue
+        act_ee, act_quat, al7 = fk(act[:, :7])
+        st_ee, st_quat, sl7 = fk(obs[:, :7])
+        todo.append(
+            dict(
+                obs=obs,
+                act=act,
+                close=close,
+                opened=opened,
+                act_ee=act_ee,
+                act_quat=act_quat,
+                awz0=al7 - act_ee[:, 2],
+                st_ee=st_ee,
+                st_quat=st_quat,
+                swz0=sl7 - st_ee[:, 2],
+            )
+        )
 
-        act_ee, act_quat, _ = fk(act[:, :7])
-        st_ee, st_quat, _ = fk(obs[:, :7])
-        act_seed = np.concatenate([act[:, :7], act[:, 7:8], act[:, 7:8]], axis=1)
-        for _ in range(cfg.copies):
-            lat = cfg.bend_amp * rng.uniform(-1.0, 1.0)
-            vert = cfg.bend_amp * rng.uniform(0.0, 0.8)
-            wz = rng.uniform(cfg.wrist_lo, cfg.wrist_hi)
-            d = bend_delta(obs[:, EE], close, opened, lat, vert)
-            # wrist carriage is neutral until the cube is held (grasp precision)
-            wzf = np.full(len(obs), 0.18, np.float32)
-            wzf[close:] = wz
-            wrist = np.zeros((len(obs), 3), np.float32)
-            wrist[:, 2] = wzf
+    def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
+        return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
 
-            na, no = act.copy(), obs.copy()
-            na[:, :7] = rig.solve(act_ee + d, act_quat, act_ee + d + wrist, act_seed)
-            no[:, :7] = rig.solve(st_ee + d, st_quat, st_ee + d + wrist, obs[:, :9])
-            no[:, EE] = obs[:, EE] + d
-            no[held, CUBE] = obs[held, CUBE] + d[held]  # cube rides the gripper
-            nl = float(no[held, EE][:, 2].max() - no[close, EE.start + 2])
-            write(no, na, np.array([lat, vert, nl, wz]))
+    def targets(grp, key, wzs, tm):
+        """Bent EE/rot/wrist target stacks (tm, n, .) for one IK pass."""
+        ee, quat, wz0 = f"{key}_ee", f"{key}_quat", f"{key[0]}wz0"
+        out: dict[str, list] = {"e": [], "q": [], "w": []}
+        for x, d, wz in zip(grp, (x["d"] for x in grp), wzs):
+            carr = x[wz0].copy()
+            c, r = x["close"], 25  # original posture until held, then ramp in
+            carr[c + r :] = wz
+            carr[c : c + r] = (
+                carr[c] + (wz - carr[c]) * np.arange(r)[: len(carr) - c] / r
+            )
+            e = x[ee] + d
+            w = e.copy()
+            w[:, 2] += carr
+            for k, v in zip(out, (e, x[quat], w)):
+                out[k].append(tpad(v, tm))
+        e, q, w = (np.stack(out[k], axis=1) for k in out)
+        return e, q, w
 
-            achieved, _, _ = fk(na[:, :7])
-            ee_err.append(np.linalg.norm(achieved - (act_ee + d), axis=1))
+    # pass 2: bent copies. IK batches episodes and streams frames; copies whose
+    # achieved EE path can't track the bent target (unreachable arcs) get their
+    # latents resampled — the offline analogue of the recorder's success filter.
+    ee_err, jacc, written = [], [], 0
+    pending = [dict(x) for x in todo for _ in range(cfg.copies)]
+    for attempt in range(3):
+        rejected = []
+        for g in tqdm(range(0, len(pending), rig.W), desc=f"bent (try {attempt})"):
+            grp = pending[g : g + rig.W]
+            n, tm = len(grp), max(len(x["obs"]) for x in grp)
+            lats = cfg.bend_amp * rng.uniform(-1.0, 1.0, n)
+            verts = cfg.bend_amp * rng.uniform(0.0, 0.8, n)
+            wzs = rng.uniform(cfg.wrist_lo, cfg.wrist_hi, n)
+            for x, lat, vert in zip(grp, lats, verts):
+                x["d"] = bend_delta(x["obs"][:, EE], x["close"], x["opened"], lat, vert)
+            aseed = np.stack([x["act"][0, [0, 1, 2, 3, 4, 5, 6, 7, 7]] for x in grp])
+            sseed = np.stack([x["obs"][0, :9] for x in grp])
+            ae, aq, aw = targets(grp, "act", wzs, tm)
+            se, sq, sw = targets(grp, "st", wzs, tm)
+            na_j = rig.solve_seq(ae, aq, aw, aseed)
+            no_j = rig.solve_seq(se, sq, sw, sseed)
 
-    err = np.concatenate(ee_err)
+            for i, x in enumerate(grp):
+                nf, d = len(x["obs"]), x["d"]
+                achieved, _, _ = fk(na_j[:nf, i])
+                err = np.linalg.norm(achieved - (x["act_ee"] + d), axis=1)
+                if err.max() > 0.05:  # arc not reachable with this latent draw
+                    rejected.append(x)
+                    continue
+                na, no = x["act"].copy(), x["obs"].copy()
+                na[:, :7] = na_j[:nf, i]
+                no[:, :7] = no_j[:nf, i]
+                no[:, EE] = x["obs"][:, EE] + d
+                held = slice(x["close"], x["opened"])
+                no[held, CUBE] = x["obs"][held, CUBE] + d[held]  # rides the gripper
+                nl = float(no[held, EE][:, 2].max() - no[x["close"], EE.start + 2])
+                write(no, na, np.array([lats[i], verts[i], nl, wzs[i]]))
+                written += 1
+                ee_err.append(err)
+                jacc.append(np.abs(np.diff(na[:, :7], n=2, axis=0)).max(axis=1))
+        pending = rejected
+        if not pending:
+            break
+
+    err, acc = np.concatenate(ee_err), np.concatenate(jacc)
+    print(f"kept {written} copies, dropped {len(pending)} unreachable")
     print(f"re-IK EE error: mean {err.mean():.4f}m  p95 {np.percentile(err, 95):.4f}m")
+    p95, p99 = np.percentile(acc, 95), np.percentile(acc, 99)
+    print(f"joint accel: p95 {p95:.5f}  p99 {p99:.5f}  max {acc.max():.4f}")
     dst.finalize()
 
 
