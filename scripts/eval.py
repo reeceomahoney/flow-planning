@@ -13,7 +13,11 @@ from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.guidance import Guidance
-from flow_planning.guidance_net import FKLearnedGuidance, LearnedGuidance
+from flow_planning.guidance_net import (
+    AnalyticSelector,
+    FKLearnedGuidance,
+    LearnedGuidance,
+)
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -38,6 +42,15 @@ class Config:
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     guidance_mode: str = "analytic"  # "analytic" (Guidance terms) | "learned"
+    best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
+    cond: str = "null"  # "null" | "zero" | "search" (grid+latch) | "lat,vert" fixed
+    cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
+    cond_scale: float = 1.0  # CFG weight on the bend conditioning; >1 sharpens
+    selector: str = "net"  # best-of-N scorer: "net" (learned) | "analytic" (FK)
+    selector_cap: float = 0.08  # clearance sufficiency cap (analytic selector)
+    selector_prog: float = 0.03  # progress-term weight (analytic selector)
+    action_lpf: float = 0.0  # >0 overrides the checkpoint's executed-action EMA
+    warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
 @draccus.wrap()
@@ -53,6 +66,9 @@ def main(cfg: Config):
         policy.config.n_action_steps = cfg.n_action_steps
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
+    if cfg.action_lpf > 0:
+        policy.config.action_lpf = cfg.action_lpf
+    policy.warm_start_t = cfg.warm_start_t
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -80,12 +96,13 @@ def main(cfg: Config):
         )
         policy.action_clip = (low, high)
 
+    lg = None
     if cfg.learned_guidance_ckpt == "none":
         policy.guidance_fn = None
     elif cfg.guidance_mode == "learned":
         geom = env.obstacle_geometry
         if hasattr(env, "ee_state_index"):  # franka: FK-point net on joint actions
-            policy.guidance_fn = FKLearnedGuidance(
+            lg = FKLearnedGuidance(
                 cfg.learned_guidance_ckpt,
                 geom["center"] + geom["half_extents"],
                 list(env.robot_base_pos),
@@ -95,6 +112,8 @@ def main(cfg: Config):
                 scale=cfg.learned_guidance_scale,
                 stride=env.cfg.arm_stride,
             )
+            # scale 0 = selection only: score plans, no gradient
+            policy.guidance_fn = lg if cfg.learned_guidance_scale > 0 else None
         else:  # particle: representative 2D bar, ball pos at obs[0:2]
             c, h = np.asarray(geom["center"]), np.asarray(geom["half_extents"])
             policy.guidance_fn = LearnedGuidance(
@@ -114,6 +133,38 @@ def main(cfg: Config):
             device,
             obs_stats=stats[OBS_STATE],
         )
+    if (cfg.best_of > 1 or cfg.cond == "search") and hasattr(env, "ee_state_index"):
+        if cfg.selector == "analytic":
+            geom = env.obstacle_geometry
+            sel = AnalyticSelector(
+                geom["center"] + geom["half_extents"],
+                list(env.robot_base_pos),
+                stats[ACTION],
+                stats[OBS_STATE],
+                joint_start=policy.state_dim,
+                device=device,
+                cube_size=env.cube_size,
+                cap=cfg.selector_cap,
+                prog=cfg.selector_prog,
+            )
+            policy.selector_fn = sel.score
+        else:
+            assert lg is not None, "selector=net needs a learned guidance ckpt"
+            policy.selector_fn = lg.score
+        policy.n_samples = cfg.best_of
+    if getattr(policy.config, "cond_dim", 0):
+        policy.cond_scale = cfg.cond_scale
+        if cfg.cond == "zero":
+            policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)
+        elif "," in cfg.cond:  # fixed bend command, e.g. "0.5,0.5"
+            vals = [float(v) for v in cfg.cond.split(",")]
+            policy.cond = torch.tensor([vals], device=device)
+        elif cfg.cond == "search":  # bend-mode grid, scored + latched via selector
+            assert policy.selector_fn is not None, "search needs a selector"
+            assert cfg.cond_grid, "search needs --cond_grid"
+            grid = [[float(v) for v in g.split(",")] for g in cfg.cond_grid.split(";")]
+            policy.cond_candidates = torch.tensor(grid, device=device)
+
     arm = hasattr(env, "ee_state_index")  # franka: planned path needs EE FK
     if arm:
         chain = build_franka_chain(device)[0]

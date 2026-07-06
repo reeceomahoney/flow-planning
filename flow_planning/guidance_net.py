@@ -196,6 +196,70 @@ class LearnedGuidance:
         return grad
 
 
+class AnalyticSelector:
+    """Best-of-N scorer using exact FK + box geometry (no net): counts plan steps
+    where the arm or the plan's predicted cube position hits the box. Selection
+    needs no gradients, so exact geometry beats a learned proxy."""
+
+    def __init__(
+        self,
+        box,  # physical world [center(3), half_extents(3)]
+        base_pos,
+        joint_stats,  # action stats; leading 7 dims are the arm joints
+        obs_stats,  # obs stats; cube pos block normalizes the plan's cube dims
+        joint_start: int,
+        device,
+        cube_size: float,
+        cube_index: int = 18,
+        margin: float = 0.06,  # generous: execution wobble eats small clearances
+        n_arm: int = 7,
+        cap: float = 0.08,  # clearance beyond this buys nothing
+        prog: float = 0.03,  # weight of the mean cube-to-goal progress term
+    ):
+        f32 = {"dtype": torch.float32, "device": device}
+        self.fc = FrankaCollision(device, base_pos, cube_size)
+        self.box = torch.as_tensor(box, **f32).view(1, 6)
+        self.jm = torch.as_tensor(joint_stats["mean"], **f32)[:n_arm]
+        self.js = torch.as_tensor(joint_stats["std"], **f32)[:n_arm]
+        # the plan's predicted joint STATES share the action normalization only
+        # if recorded identically; use obs stats for the state block instead
+        self.sm = torch.as_tensor(obs_stats["mean"], **f32)[:n_arm]
+        self.ss = torch.as_tensor(obs_stats["std"], **f32)[:n_arm]
+        ci = cube_index
+        self.cm = torch.as_tensor(obs_stats["mean"], **f32)[ci : ci + 3]
+        self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
+        self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
+        self.margin, self.cap, self.prog = margin, cap, prog
+
+    @torch.no_grad()
+    def score(self, traj: Tensor) -> Tensor:
+        """Worst-case clearance, capped at 'enough' (8cm), minus a small progress
+        term. Uncapped margin-max games the goal clamp: the safest plan is one
+        that never approaches the cube/goal at all."""
+        out = [self.clearance(traj[i : i + 1024]) for i in range(0, len(traj), 1024)]
+        clear = torch.cat(out)
+        cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
+        prog = (cube - cube[:, -1:]).norm(dim=-1).mean(dim=1)  # mean dist to goal
+        return -clear.clamp(max=self.cap) + self.prog * prog
+
+    def clearance(self, traj: Tensor) -> Tensor:
+        s, n = self.joint_start, self.n_arm
+        center, half = self.box[:, :3], self.box[:, None, None, 3:]
+        cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
+        worst = []
+        for q in (  # joint targets AND predicted joint states must both clear
+            traj[..., s : s + n] * self.js + self.jm,
+            traj[..., :n] * self.ss + self.sm,
+        ):
+            b, t = q.shape[:2]
+            pts = self.fc.arm_points(q.reshape(-1, n).float()).reshape(b, t, -1, 3)
+            d = box_sdf(pts + self.fc.base_pos, center[:, None, None], half)
+            worst.append(d.amin(dim=(1, 2)))
+        dc = box_sdf(cube[:, :, None].float(), center[:, None, None], half)
+        worst.append(dc.amin(dim=(1, 2)) - self.fc.cube_half)
+        return torch.stack(worst).amin(dim=0)
+
+
 class FKLearnedGuidance:
     """LearnedGuidance for franka: the per-step net scores FK arm collision points
     of the planned JOINT actions (box-relative, world frame), so the gradient
@@ -230,16 +294,26 @@ class FKLearnedGuidance:
     def reset(self):
         pass
 
+    def cost(self, traj: Tensor) -> Tensor:
+        """Per-step predicted collision cost of a normalized plan, (B, H')."""
+        s = self.joint_start
+        q = traj[..., s : s + self.n_arm] * self.js + self.jm  # (B, H, 7)
+        q = q[:, :: self.stride]
+        b, h = q.shape[:2]
+        pts = self.fc.arm_points(q.reshape(-1, self.n_arm)).reshape(b, h, -1, 3)
+        feat = (pts + self.fc.base_pos - self.center).flatten(-2)
+        logit = self.net(feat, self.half.expand(b, 3))  # (B, H') collision
+        return F.softplus(logit)
+
+    @torch.no_grad()
+    def score(self, traj: Tensor) -> Tensor:
+        """Worst-step collision cost per plan, for best-of-N selection. Max, not
+        sum: summing lets a plan hover then sprint through the wall in few steps."""
+        return self.cost(traj).amax(dim=1)
+
     def __call__(self, x: Tensor, v: Tensor, t: Tensor, obs: Tensor | None = None):
         with torch.enable_grad():
             x1_hat = (x + (1 - t.view(-1, 1, 1)) * v).detach().requires_grad_(True)
-            s = self.joint_start
-            q = x1_hat[..., s : s + self.n_arm] * self.js + self.jm  # (B, H, 7)
-            q = q[:, :: self.stride]
-            b, h = q.shape[:2]
-            pts = self.fc.arm_points(q.reshape(-1, self.n_arm)).reshape(b, h, -1, 3)
-            feat = (pts + self.fc.base_pos - self.center).flatten(-2)
-            logit = self.net(feat, self.half.expand(b, 3))  # (B, H') collision
-            cost = self.scale * F.softplus(logit).sum()
+            cost = self.scale * self.cost(x1_hat).sum()
             (grad,) = torch.autograd.grad(cost, x1_hat)
         return grad

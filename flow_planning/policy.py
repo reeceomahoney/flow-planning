@@ -230,6 +230,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.model = FlowTransformer(self.traj_dim, config)
         self.guidance_fn = None  # optional obstacle cost, set before rollout
         self.action_clip = None  # optional (low, high) normalized action bounds
+        self.selector_fn = None  # optional plan scorer for best-of-N selection
+        self.n_samples = 1  # plans sampled per world when selector_fn is set
+        self.cond = None  # commanded bend params (1, cond_dim), None = null token
+        self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
+        self.cond_scale = 1.0  # CFG weight; >1 sharpens mode adherence (2 passes)
+        self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
+        # and integrate t..1, keeping timing/mode continuity across replans
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -241,7 +248,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def reset(self):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
+        self.last_traj = None
         self.lpf_state = None  # EMA state for the executed-action low-pass
+        self.latched_cond = None  # per-world bend picked at the first replan
         if self.guidance_fn is not None:
             self.guidance_fn.reset()
 
@@ -286,20 +295,84 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         (B, horizon, act_dim) action chunk."""
         self.eval()
         obs = batch[OBS_STATE]
+        sel = self.selector_fn
+        n_worlds = obs.shape[0]
+        ns = self.n_samples if sel is not None else 1
+        # bend conditioning: fixed command, latched pick, or a candidate search;
+        # ns samples per mode are drawn and the selector keeps the best plan
+        cond, k, searching = None, ns, False
+        if self.config.cond_dim and self.cond_candidates is not None:
+            if self.latched_cond is not None:
+                cond = self.latched_cond.repeat_interleave(ns, dim=0)
+            else:
+                searching = True
+                k = self.cond_candidates.shape[0] * ns
+                cond = self.cond_candidates.repeat_interleave(ns, dim=0).repeat(
+                    n_worlds, 1
+                )
+        elif self.config.cond_dim and self.cond is not None:
+            cond = self.cond.expand(n_worlds, -1).repeat_interleave(ns, dim=0)
+        if k > 1:
+            obs = obs.repeat_interleave(k, dim=0)
         sd, gd = self.state_dim, self.config.goal_dim
         gs = self.config.goal_state_start
         state, goal = obs[:, :sd], obs[:, -gd:]
         m = obs.shape[0]
-        dt = 1.0 / self.config.num_inference_steps
         x = torch.randn(m, self.config.horizon, self.traj_dim, device=obs.device)
-        for i in range(self.config.num_inference_steps):
-            x[:, 0, :sd] = state
-            x[:, -1, gs : gs + gd] = goal
-            t = torch.full((m,), i * dt, device=x.device)
-            v = self.model(x, t)
-            if self.guidance_fn is not None:
-                v = v - self.guidance_fn(x, v, t, obs)
-            x = x + dt * v
+        last = self.last_traj
+        t0 = self.warm_start_t if last is not None else 0.0
+        if t0 > 0 and last is not None:
+            # re-anchor: shift by the plan frame closest to the current state —
+            # rolling by executed steps drifts into the absorbing tail (and
+            # stalls there) whenever execution lags the plan's schedule
+            na, h = self.config.n_action_steps, last.shape[1]
+            cur = state[::k, :sd]  # one row per world
+            w = min(2 * na, h - 1)
+            d = (last[:, :w, :sd] - cur[:, None]).norm(dim=-1)
+            shift = d.argmin(dim=1)  # (n_worlds,)
+            idx = (torch.arange(h, device=x.device)[None] + shift[:, None]).clamp(
+                max=h - 1
+            )
+            prev = last.gather(1, idx[..., None].expand(-1, -1, last.shape[-1]))
+            x = (1 - t0) * x + t0 * prev.repeat_interleave(k, dim=0)
+        dt = (1.0 - t0) / self.config.num_inference_steps
+
+        def integrate(x, state, goal, cond, obs):
+            mm = x.shape[0]
+            for i in range(self.config.num_inference_steps):
+                x[:, 0, :sd] = state
+                x[:, -1, gs : gs + gd] = goal
+                t = torch.full((mm,), t0 + i * dt, device=x.device)
+                v = self.model(x, t, cond)
+                if cond is not None and self.cond_scale != 1.0:
+                    v_null = self.model(x, t, None)
+                    v = v_null + self.cond_scale * (v - v_null)
+                if self.guidance_fn is not None:
+                    v = v - self.guidance_fn(x, v, t, obs)
+                x = x + dt * v
+            return x
+
+        mb = 4096  # ponytail: micro-batch cap sized for a 24GB card at horizon 600
+        x = torch.cat(
+            [
+                integrate(
+                    x[i : i + mb],
+                    state[i : i + mb],
+                    goal[i : i + mb],
+                    None if cond is None else cond[i : i + mb],
+                    obs[i : i + mb],
+                )
+                for i in range(0, m, mb)
+            ]
+        )
+        if sel is not None and k > 1:  # best-of-N: lowest-scoring plan per world
+            pick = sel(x).view(-1, k).argmin(dim=1)
+            rows = torch.arange(len(pick), device=x.device)
+            x = x.view(-1, k, *x.shape[1:])[rows, pick]
+            if searching:  # commit to the picked bend mode for later replans
+                assert cond is not None
+                self.latched_cond = cond.view(-1, k, cond.shape[-1])[rows, pick]
+        self.last_traj = x  # full [state, action] plan, for viz/diagnostics
         acts = x[..., sd:]  # normalized action dims
         if self.action_clip is not None:
             acts = acts.clamp(self.action_clip[0], self.action_clip[1])
