@@ -64,10 +64,10 @@ class FlowMatchingConfig(PreTrainedConfig):
     num_inference_steps: int = 10
     action_lpf: float = 0.3  # EMA alpha on executed actions; <1 smooths seam jumps
 
-    # bend-parameter conditioning (0 disables); dropout trains the null token (CFG)
+    # bend-parameter conditioning (0 disables); dropout trains the null token
     cond_dim: int = 0
     cond_dropout: float = 0.15
-    adaln: bool = False  # per-layer AdaLN-Zero on (time+cond); False = additive bias
+    adaln: bool = True  # ignored (AdaLN-Zero is the only path); kept for ckpt compat
 
     # training
     optimizer_lr: float = 1e-4
@@ -96,13 +96,14 @@ class FlowMatchingConfig(PreTrainedConfig):
         if self.action_feature is None:
             raise ValueError("Flow matching policy requires an action output.")
 
+    # unused (train.py gathers windows itself) but abstract in PreTrainedConfig
     @property
-    def observation_delta_indices(self) -> list[int]:
-        return list(range(self.horizon))
+    def observation_delta_indices(self) -> None:
+        return None
 
     @property
-    def action_delta_indices(self) -> list[int]:
-        return list(range(self.horizon))
+    def action_delta_indices(self) -> None:
+        return None
 
     @property
     def reward_delta_indices(self) -> None:
@@ -119,24 +120,23 @@ def sinusoidal_embedding(t: Tensor, dim: int) -> Tensor:
 
 
 class EncoderLayer(nn.Module):
-    """Pre-norm transformer encoder layer over global SDPA, optionally with
-    AdaLN-Zero modulation by a conditioning vector (DiT-style)."""
+    """Pre-norm transformer encoder layer over global SDPA, with AdaLN-Zero
+    modulation by a conditioning vector (DiT-style)."""
 
-    def __init__(self, d: int, n_heads: int, dim_ff: int, adaln: bool = False):
+    def __init__(self, d: int, n_heads: int, dim_ff: int):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d // n_heads
         self.qkv = nn.Linear(d, 3 * d)
         self.proj = nn.Linear(d, d)
-        self.norm1 = nn.LayerNorm(d, elementwise_affine=not adaln)
-        self.norm2 = nn.LayerNorm(d, elementwise_affine=not adaln)
+        self.norm1 = nn.LayerNorm(d, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(d, elementwise_affine=False)
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
         self.ff = nn.Sequential(nn.Linear(d, dim_ff), nn.GELU(), nn.Linear(dim_ff, d))
-        if adaln:
-            self.mod = nn.Linear(d, 6 * d)
-            nn.init.zeros_(self.mod.weight)
-            nn.init.zeros_(self.mod.bias)
+        self.mod = nn.Linear(d, 6 * d)
+        nn.init.zeros_(self.mod.weight)
+        nn.init.zeros_(self.mod.bias)
 
     def attn(self, h: Tensor) -> Tensor:
         b, n, d = h.shape
@@ -145,11 +145,7 @@ class EncoderLayer(nn.Module):
         o = F.scaled_dot_product_attention(self.q_norm(q), self.k_norm(k), v)
         return self.proj(o.transpose(1, 2).reshape(b, n, d))
 
-    def forward(self, x: Tensor, c: Tensor | None = None) -> Tensor:
-        if not hasattr(self, "mod"):
-            x = x + self.attn(self.norm1(x))
-            return x + self.ff(self.norm2(x))
-        assert c is not None
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
         sc1, sh1, g1, sc2, sh2, g2 = self.mod(c)[:, None].chunk(6, dim=-1)
         x = x + g1 * self.attn(self.norm1(x) * (1 + sc1) + sh1)
         return x + g2 * self.ff(self.norm2(x) * (1 + sc2) + sh2)
@@ -175,10 +171,8 @@ class FlowTransformer(nn.Module):
                 nn.Linear(cfg.cond_dim, d), nn.GELU(), nn.Linear(d, d)
             )
             self.null_cond = nn.Parameter(torch.zeros(d))
-        self.adaln = cfg.adaln
         self.layers = nn.ModuleList(
-            EncoderLayer(d, cfg.n_heads, 4 * d, adaln=cfg.adaln)
-            for _ in range(cfg.n_layers)
+            EncoderLayer(d, cfg.n_heads, 4 * d) for _ in range(cfg.n_layers)
         )
         self.norm_out = nn.LayerNorm(d)
         self.head = nn.Linear(d, traj_dim)
@@ -201,8 +195,6 @@ class FlowTransformer(nn.Module):
                     ce = torch.where(cond_drop[:, None], self.null_cond, ce)
             c = c + ce
         h = self.traj_in(x_t) + self.pos_emb
-        if not self.adaln:  # additive fallback: cond/time as a global bias
-            h = h + c[:, None]
         for layer in self.layers:
             h = layer(h, c)
         return self.head(self.norm_out(h))
@@ -228,13 +220,11 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.traj_dim = self.state_dim + act_dim
 
         self.model = FlowTransformer(self.traj_dim, config)
-        self.guidance_fn = None  # optional obstacle cost, set before rollout
         self.action_clip = None  # optional (low, high) normalized action bounds
         self.selector_fn = None  # optional plan scorer for best-of-N selection
         self.n_samples = 1  # plans sampled per world when selector_fn is set
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
-        self.cond_scale = 1.0  # CFG weight; >1 sharpens mode adherence (2 passes)
         self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
         # and integrate t..1, keeping timing/mode continuity across replans
         self.reset()
@@ -251,8 +241,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.last_traj = None
         self.lpf_state = None  # EMA state for the executed-action low-pass
         self.latched_cond = None  # per-world bend picked at the first replan
-        if self.guidance_fn is not None:
-            self.guidance_fn.reset()
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         # full-trajectory window: [state, action] per step, both normalized. The
@@ -291,8 +279,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         """Flow-ODE integrate a [state, action] trajectory, conditioning by
         inpainting: each step clamp frame 0's state to the current state and frame
         -1's goal dims to the goal (already in position space, see alias_goal_stats).
-        `guidance_fn` (if set) steers around the obstacle. Returns the
-        (B, horizon, act_dim) action chunk."""
+        Returns the (B, horizon, act_dim) action chunk."""
         self.eval()
         obs = batch[OBS_STATE]
         sel = self.selector_fn
@@ -337,22 +324,16 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             x = (1 - t0) * x + t0 * prev.repeat_interleave(k, dim=0)
         dt = (1.0 - t0) / self.config.num_inference_steps
 
-        def integrate(x, state, goal, cond, obs):
+        def integrate(x, state, goal, cond):
             mm = x.shape[0]
             for i in range(self.config.num_inference_steps):
                 x[:, 0, :sd] = state
                 x[:, -1, gs : gs + gd] = goal
                 t = torch.full((mm,), t0 + i * dt, device=x.device)
-                v = self.model(x, t, cond)
-                if cond is not None and self.cond_scale != 1.0:
-                    v_null = self.model(x, t, None)
-                    v = v_null + self.cond_scale * (v - v_null)
-                if self.guidance_fn is not None:
-                    v = v - self.guidance_fn(x, v, t, obs)
-                x = x + dt * v
+                x = x + dt * self.model(x, t, cond)
             return x
 
-        mb = 4096  # ponytail: micro-batch cap sized for a 24GB card at horizon 600
+        mb = 4096  # micro-batch cap sized for a 24GB card at horizon 600
         x = torch.cat(
             [
                 integrate(
@@ -360,7 +341,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                     state[i : i + mb],
                     goal[i : i + mb],
                     None if cond is None else cond[i : i + mb],
-                    obs[i : i + mb],
                 )
                 for i in range(0, m, mb)
             ]

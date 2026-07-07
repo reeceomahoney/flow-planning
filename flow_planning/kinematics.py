@@ -1,9 +1,5 @@
-"""Franka kinematics from the sim's URDF, via pytorch_kinematics / volumetric.
-
-Both the per-link collision SDF (obstacle guidance) and forward kinematics (EE
-path visualization) come from one shared pk chain built from the same URDF the
-sim loads. Validated to match newton's eval_fk to floating-point precision.
-"""
+"""Franka FK via pytorch_kinematics, from the same URDF the sim loads.
+Validated to match newton's eval_fk to floating-point precision."""
 
 import re
 

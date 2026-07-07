@@ -30,7 +30,6 @@ def collect(cfg: Config, env):
             "names": None,
         },
         "action": {"dtype": "float32", "shape": (action.shape[1],), "names": None},
-        "next.success": {"dtype": "bool", "shape": (1,), "names": None},
     }
     has_bend = hasattr(env, "episode_cond")  # franka: per-episode demo latents
     if has_bend:
@@ -59,7 +58,6 @@ def collect(cfg: Config, env):
                     frame = {
                         "observation.state": state,
                         "action": action,
-                        "next.success": success[w : w + 1],
                         "task": cfg.task,
                     }
                     if has_bend:

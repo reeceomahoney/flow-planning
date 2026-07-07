@@ -151,7 +151,6 @@ def main(cfg: Config):
             "names": None,
         },
         "action": {"dtype": "float32", "shape": act_all.shape[1:], "names": None},
-        "next.success": {"dtype": "bool", "shape": (1,), "names": None},
         "bend": {"dtype": "float32", "shape": (4,), "names": None},
     }
     dst = LeRobotDataset.create(
@@ -164,7 +163,6 @@ def main(cfg: Config):
                 {
                     "observation.state": obs[f],
                     "action": act[f],
-                    "next.success": np.ones(1, bool),
                     "bend": bend.astype(np.float32),
                     "task": "pick_place",
                 }

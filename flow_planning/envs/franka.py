@@ -1,13 +1,8 @@
 """Franka FR3 pick-and-place environment built on newton, with physics + IK.
 
-Shared by `record.py` (collect demos) and `eval.py` (roll out a policy). A cube
-is grasped at `cube_start` and placed at `cube_goal`; a scripted task state
-machine drives an analytic-IK controller through a MuJoCo simulation (adapted
-from newton's `ik_cube_stacking` example). The observation is the per-world
-joint coords, current EE pose, and the cube and goal positions; the action is the
-EE target pose (position + 6D rotation) plus a gripper command, mapped to joints
-by IK.
-"""
+Shared by `record.py` (scripted IK demos) and `eval.py` (policy rollouts,
+joint-target actions executed directly). Adapted from newton's
+`ik_cube_stacking` example."""
 
 import enum
 from dataclasses import dataclass
@@ -70,25 +65,12 @@ class FrankaConfig(EnvConfig):
     obstacle_width: float = 0.15
     obstacle_thickness: float = 0.01
 
-    # bend transit phases into random perpendicular arcs (record-blind detour aug)
-    bend_frac: float = 0.0  # fraction of worlds bent; recording only
-    bend_amp: float = 0.6  # peak detour as a fraction of segment length
-
     # keep cube/goal at least this far from the wall plane (feasible instances);
     # 0 = unconstrained. Wall-adjacent grasps (<8cm) are physically infeasible.
     sample_wall_margin: float = 0.0
 
-    grasp_symmetry: bool = True  # randomize grasp yaw over the cube's 90° symmetry
     goal_dim: int = 3  # goal xyz
     goal_state_start: int = 18  # cube pos block in the obs (9 joints + 3 EE + 6 rot6d)
-    n_action_steps: int = 40
-    obstacle_scale: float = 60.0  # tall barrier needs a stronger push than particle
-    obstacle_margin: float = 0.15  # and more clearance to lift the cube over the top
-    arm_scale: float = 50.0  # geometry-aware FK clearance (gripper+arm), 0 disables
-    arm_margin: float = 0.05  # link/gripper clearance from the obstacle box
-    arm_stride: int = 2  # guide every Nth plan timestep (1 = all; >1 is faster)
-    ee_scale: float = 100.0  # task-space EE-position over-top guidance (0 disables)
-    ee_margin: float = 0.12  # EE clearance from the wall (cube hangs below the EE)
 
 
 @wp.kernel(enable_backward=False)
@@ -98,9 +80,6 @@ def set_target_pose_kernel(
     drop_off_pos: wp.array(dtype=wp.vec3),
     off_approach: wp.vec3,
     off_lift: wp.array(dtype=wp.vec3),
-    grasp_offset: wp.array(dtype=wp.float32),
-    place_offset: wp.array(dtype=wp.float32),
-    bend: wp.array(dtype=wp.vec2),
     wrist_bias: wp.array(dtype=wp.vec3),
     off_retract: wp.vec3,
     task_init_body_q: wp.array(dtype=wp.transform),
@@ -128,15 +107,11 @@ def set_target_pose_kernel(
     drop = drop_off_pos[tid]
     ee_quat_target = ee_quat_down
     t_gripper = float(0.0)
-    # place orientation: down + a random yaw (cube 90° symmetry), for wrist diversity
-    q_place = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), place_offset[tid])
-    ee_quat_place = q_place * ee_quat_down
+    ee_quat_place = ee_quat_down
 
     if task == TaskType.APPROACH.value:
-        # rotate the grasp over the cube's 90° symmetry: same grasp, varied wrist
-        q_off = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), grasp_offset[tid])
         ee_pos_target = obj_pos + off_approach
-        ee_quat_target = ee_quat_down * wp.quat_inverse(q_off * obj_quat)
+        ee_quat_target = ee_quat_down * wp.quat_inverse(obj_quat)
     elif task == TaskType.REFINE_APPROACH.value:
         ee_pos_target = obj_pos
         ee_quat_target = ee_quat_prev
@@ -164,18 +139,6 @@ def set_target_pose_kernel(
         ee_pos_target = drop + off_retract
 
     ee_pos_out[tid] = ee_pos_prev * (1.0 - t) + ee_pos_target * t
-    # detour aug: half-sine arc perpendicular to the transit segment, zero at
-    # the endpoints so the grasp/place phases are untouched
-    if task == TaskType.APPROACH.value or task == TaskType.MOVE_TO_DROP_OFF.value:
-        seg = ee_pos_target - ee_pos_prev
-        up = wp.vec3(0.0, 0.0, 1.0)
-        lat = wp.cross(seg, up)
-        if wp.length(lat) > 1.0e-4:
-            arc = bend[tid][0] * wp.normalize(lat) + bend[tid][1] * up
-            # plateau profile: rise, hold at full detour mid-phase, descend —
-            # keeps clearance wherever the obstacle crossing falls
-            prof = wp.min(1.0, 2.0 * wp.sin(wp.pi * t))
-            ee_pos_out[tid] += wp.length(seg) * prof * arc
     q = wp.quat_slerp(ee_quat_prev, ee_quat_target, t)
     ee_rot_out[tid] = wp.vec4(q[0], q[1], q[2], q[3])
     # wrist-carriage objective: neutral until the cube is held; the latent only
@@ -424,9 +387,6 @@ class FrankaEnv:
         self.ee_pos_target = wp.zeros(n, dtype=wp.vec3)
         self.ee_rot_target = wp.full(n, wp.vec4(0.0, 0.0, 0.0, 1.0), dtype=wp.vec4)
         self.gripper_target = wp.zeros((n, 2), dtype=wp.float32)
-        self.grasp_offset = wp.zeros(n, dtype=wp.float32)  # per-episode grasp-yaw aug
-        self.place_offset = wp.zeros(n, dtype=wp.float32)  # per-episode place-yaw aug
-        self.bend = wp.zeros(n, dtype=wp.vec2)  # per-episode [lateral, vertical] arc
         self.wrist_bias = wp.zeros(n, dtype=wp.vec3)  # per-episode posture latent
         self.goal_wp = wp.zeros(n, dtype=wp.vec3)
         self.task_idx = 0
@@ -465,29 +425,6 @@ class FrankaEnv:
         quat[:, 2] = np.sin(theta / 2)
         quat[:, 3] = np.cos(theta / 2)
 
-        # symmetry aug: random 90° grasp/place yaw; bad ones drop via record's filter
-        def sym(k):
-            o = self.rng.choice([0.0, 0.5, 1.0, 1.5], n) * np.pi
-            o = o if self.cfg.grasp_symmetry else np.zeros(n)
-            wp.copy(k, wp.array(o.astype(np.float32), dtype=wp.float32))
-
-        sym(self.grasp_offset)
-        sym(self.place_offset)
-
-        # detour aug: discrete modes (straight/left/right x flat/over) so each mode
-        # gets enough demos to stay crisp; amplitude jitter keeps them a family.
-        # +lat arcs toward the base (cramped, rarely executable) — sampled rarely;
-        # vertical is moderated to stay off the workspace ceiling
-        lat = self.rng.choice([-1.0, 0.0, 1.0], n, p=[0.35, 0.5, 0.15])
-        vert = self.rng.choice([0.0, 1.0], n, p=[0.6, 0.4])
-        jit = np.stack(
-            [self.rng.uniform(0.7, 1.0, n), self.rng.uniform(0.45, 0.8, n)], axis=1
-        )
-        do = self.rng.uniform(0.0, 1.0, n) < self.cfg.bend_frac
-        b = self.cfg.bend_amp * do[:, None] * jit * np.stack([lat, vert], axis=1)
-        self.bend_np = b.astype(np.float32)
-        wp.copy(self.bend, wp.array(self.bend_np, dtype=wp.vec2))
-
         # wrist posture latent: wrist CARRIAGE HEIGHT above the EE (low/high) —
         # which IK posture family the arm uses, esp. during low placement
         wz = self.rng.choice([0.12, 0.28], n, p=[0.5, 0.5]).astype(np.float32)
@@ -496,9 +433,11 @@ class FrankaEnv:
         wp.copy(self.wrist_bias, wp.array(wb, dtype=wp.vec3))
 
         # policy conditioning = every per-episode latent of the demo generator:
-        # unexplained latents smear the flow's plans into slow-motion averages
+        # unexplained latents smear the flow's plans into slow-motion averages.
+        # layout [lat, vert, lift, wz]: bend dims are 0 in source demos and
+        # filled in by the offline augmentation (scripts/augment.py)
         self.episode_cond = np.concatenate(
-            [self.bend_np, lift[:, 2:3], wz[:, None]], axis=1
+            [np.zeros((n, 2), np.float32), lift[:, 2:3], wz[:, None]], axis=1
         )
 
         jq = np.zeros((n, self.coords_per_world), np.float32)
@@ -534,9 +473,6 @@ class FrankaEnv:
                 self.goal_wp,
                 self.off_approach,
                 self.off_lift,
-                self.grasp_offset,
-                self.place_offset,
-                self.bend,
                 self.wrist_bias,
                 self.off_retract,
                 self.task_init_body_q,
@@ -603,9 +539,8 @@ class FrankaEnv:
 
     def apply_action(self, action):
         """Drive the sim with joint-target actions, (world_count, 8): 7 arm joint
-        targets + gripper. Executed directly (no IK), so the planned arm posture
-        runs verbatim and whole-arm obstacle guidance steers the elbow/wrist. The
-        EE pose stays in the observation (FK), so it is still available to guidance."""
+        targets + gripper, executed directly (no IK) so the planned posture runs
+        verbatim."""
         n = self.cfg.world_count
         a = np.ascontiguousarray(np.asarray(action, np.float32).reshape(n, 8))
         arm = np.ascontiguousarray(a[:, :7])
@@ -677,10 +612,10 @@ class FrankaEnv:
             return np.zeros(self.cfg.world_count, dtype=bool)
         return self.obstacle_sensor.read()
 
-    # -------------------------------------------------------------- guidance
+    # -------------------------------------------------------------- selector
     @property
     def obstacle_geometry(self):
-        """Obstacle box and detour mode for ObstacleGuidance."""
+        """Obstacle box [center(3), half_extents(3)] for the plan selector."""
         return {
             "center": list(self.obstacle_center),
             "half_extents": [
@@ -688,7 +623,6 @@ class FrankaEnv:
                 self.cfg.obstacle_thickness,
                 0.5 * self.cfg.obstacle_height,
             ],
-            "over_top": True,
         }
 
     # --------------------------------------------------------------- render

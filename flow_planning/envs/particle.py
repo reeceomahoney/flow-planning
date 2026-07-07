@@ -46,10 +46,6 @@ class ParticleConfig(EnvConfig):
 
     goal_dim: int = 2  # goal xy
 
-    # ellipse keep-out guidance supersedes the box-SDF term, hence obstacle_scale=0
-    obstacle_scale: float = 0.0
-    ellipse_scale: float = 3.0
-
 
 @wp.kernel(enable_backward=False)
 def pd_force_kernel(
@@ -333,19 +329,12 @@ class ParticleEnv:
             fail |= self.obstacle_sensor.read()
         return fail
 
-    # -------------------------------------------------------------- guidance
-    @property
-    def boundary_geometry(self):
-        """Inner arena half-extent (wall minus ball radius) for BoundaryGuidance."""
-        return {"half_extent": self.cfg.arena_size - self.cfg.ball_radius, "dims": 2}
-
     @property
     def obstacle_geometry(self):
-        """Per-world obstacle box and detour mode for ObstacleGuidance."""
+        """Per-world obstacle box [center(2), half_extents(2)]."""
         return {
             "center": self.obstacle_box[:, :2],
             "half_extents": self.obstacle_box[:, 2:],
-            "around": True,
         }
 
     # --------------------------------------------------------------- render

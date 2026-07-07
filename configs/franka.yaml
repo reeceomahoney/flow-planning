@@ -2,12 +2,3 @@
 repo_id: reece-omahoney/franka
 env:
   type: franka
-  grasp_symmetry: false # multimodal grasp yaw makes the flow interpolate into misses
-  # ellipse keep-out replaces the old box-SDF / FK guidance terms
-  obstacle_scale: 0.0
-  arm_scale: 0.0
-  ee_scale: 0.0
-  ellipse_scale: 3.0
-  ellipse_margin: 0.05 # metres past the wall top (FK guidance is physical-space)
-  ellipse_ay: 0.6 # keep near-wall grasp poses outside the soft boundary
-  ellipse_bias: 1.0

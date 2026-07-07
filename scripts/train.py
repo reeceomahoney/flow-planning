@@ -17,7 +17,6 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
-from flow_planning.guidance import Guidance
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
@@ -42,7 +41,6 @@ class Config:
     log_every: int = 100
     wandb_project: str = "flow-planning"
     wandb_mode: str = "online"  # "online" | "offline" | "disabled"
-    adaln: bool = True  # new runs use AdaLN; old checkpoints keep additive bias
 
 
 class EMA:
@@ -147,7 +145,6 @@ def main(cfg: Config):
         cond_dim=dataset.features["bend"]["shape"][0]
         if "bend" in dataset.features
         else 0,
-        adaln=cfg.adaln,
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
@@ -169,14 +166,6 @@ def main(cfg: Config):
     env = None
     if cfg.eval_every > 0:
         env = make_env(cfg.env, newton.viewer.ViewerNull())
-        # inference-time guidance for eval rollouts (unused by training forward)
-        policy.guidance_fn = Guidance(
-            env,
-            policy.state_dim,
-            stats[ACTION],
-            device,
-            obs_stats=stats[OBS_STATE],
-        )
 
     # frames live once in host RAM; full-horizon windows are gathered per batch
     # with a clamped index, which IS the absorbing goal-frame tail pad

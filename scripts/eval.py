@@ -12,17 +12,12 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
-from flow_planning.guidance import Guidance
-from flow_planning.guidance_net import (
-    AnalyticSelector,
-    FKLearnedGuidance,
-    LearnedGuidance,
-)
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
 )
+from flow_planning.selector import AnalyticSelector
 from flow_planning.utils import latest_run_dir, make_viewer
 
 
@@ -37,19 +32,13 @@ class Config:
     viewer: str = "none"  # "none", "rerun", or "opengl"
     rrd: str = ""  # record a rerun .rrd to this path (view locally: `rerun <rrd>`)
     seed: int = 0
-    learned_guidance_ckpt: str = "outputs/guidance_net_particle.pt"
-    learned_guidance_scale: float = 3.0
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
-    guidance_mode: str = "analytic"  # "analytic" (Guidance terms) | "learned"
     best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
     cond: str = "null"  # "null" | "zero" | "search" (grid+latch) | "lat,vert" fixed
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
-    cond_scale: float = 1.0  # CFG weight on the bend conditioning; >1 sharpens
-    selector: str = "net"  # best-of-N scorer: "net" (learned) | "analytic" (FK)
-    selector_cap: float = 0.08  # clearance sufficiency cap (analytic selector)
-    selector_prog: float = 0.03  # progress-term weight (analytic selector)
-    action_lpf: float = 0.0  # >0 overrides the checkpoint's executed-action EMA
+    selector_cap: float = 0.08  # clearance sufficiency cap
+    selector_prog: float = 0.03  # progress-term weight
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
@@ -66,8 +55,6 @@ def main(cfg: Config):
         policy.config.n_action_steps = cfg.n_action_steps
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
-    if cfg.action_lpf > 0:
-        policy.config.action_lpf = cfg.action_lpf
     policy.warm_start_t = cfg.warm_start_t
     policy.to(device)
 
@@ -96,64 +83,22 @@ def main(cfg: Config):
         )
         policy.action_clip = (low, high)
 
-    lg = None
-    if cfg.learned_guidance_ckpt == "none":
-        policy.guidance_fn = None
-    elif cfg.guidance_mode == "learned":
-        geom = env.obstacle_geometry
-        if hasattr(env, "ee_state_index"):  # franka: FK-point net on joint actions
-            lg = FKLearnedGuidance(
-                cfg.learned_guidance_ckpt,
-                geom["center"] + geom["half_extents"],
-                list(env.robot_base_pos),
-                stats[ACTION],
-                joint_start=policy.state_dim,
-                device=device,
-                scale=cfg.learned_guidance_scale,
-                stride=env.cfg.arm_stride,
-            )
-            # scale 0 = selection only: score plans, no gradient
-            policy.guidance_fn = lg if cfg.learned_guidance_scale > 0 else None
-        else:  # particle: representative 2D bar, ball pos at obs[0:2]
-            c, h = np.asarray(geom["center"]), np.asarray(geom["half_extents"])
-            policy.guidance_fn = LearnedGuidance(
-                cfg.learned_guidance_ckpt,
-                np.concatenate([c[0], h[0]]),
-                stats[OBS_STATE],
-                pos_index=0,
-                device=device,
-                scale=cfg.learned_guidance_scale,
-                pos_dims=2,
-            )
-    else:
-        policy.guidance_fn = Guidance(
-            env,
-            policy.state_dim,
-            stats[ACTION],
-            device,
-            obs_stats=stats[OBS_STATE],
-        )
     if (cfg.best_of > 1 or cfg.cond == "search") and hasattr(env, "ee_state_index"):
-        if cfg.selector == "analytic":
-            geom = env.obstacle_geometry
-            sel = AnalyticSelector(
-                geom["center"] + geom["half_extents"],
-                list(env.robot_base_pos),
-                stats[ACTION],
-                stats[OBS_STATE],
-                joint_start=policy.state_dim,
-                device=device,
-                cube_size=env.cube_size,
-                cap=cfg.selector_cap,
-                prog=cfg.selector_prog,
-            )
-            policy.selector_fn = sel.score
-        else:
-            assert lg is not None, "selector=net needs a learned guidance ckpt"
-            policy.selector_fn = lg.score
+        geom = env.obstacle_geometry
+        sel = AnalyticSelector(
+            geom["center"] + geom["half_extents"],
+            list(env.robot_base_pos),
+            stats[ACTION],
+            stats[OBS_STATE],
+            joint_start=policy.state_dim,
+            device=device,
+            cube_size=env.cube_size,
+            cap=cfg.selector_cap,
+            prog=cfg.selector_prog,
+        )
+        policy.selector_fn = sel.score
         policy.n_samples = cfg.best_of
     if getattr(policy.config, "cond_dim", 0):
-        policy.cond_scale = cfg.cond_scale
         if cfg.cond == "zero":
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)
         elif "," in cfg.cond:  # fixed bend command, e.g. "0.5,0.5"
