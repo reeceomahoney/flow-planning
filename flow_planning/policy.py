@@ -338,8 +338,28 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             with torch.no_grad():
                 cond.clamp_(lo, hi)
         with torch.no_grad():
-            x = self.flow_integrate(x0, state, goal, cond.detach())
-            pick = self.selector_fn(x).view(n, r).argmin(dim=1)
+            # latch like the grid: score m fresh draws per restart, not the one
+            # fixed draw the descent saw (which overfits to a lucky sample)
+            m = o.get("latch_samples", 16)
+            sm = state.repeat_interleave(m, dim=0)
+            gm = goal.repeat_interleave(m, dim=0)
+            cm = cond.detach().repeat_interleave(m, dim=0)
+            xm = torch.randn(n * r * m, *x0.shape[1:], device=obs.device)
+            mb = 4096
+            scores = torch.cat(
+                [
+                    self.selector_fn(
+                        self.flow_integrate(
+                            xm[i : i + mb],
+                            sm[i : i + mb],
+                            gm[i : i + mb],
+                            cm[i : i + mb],
+                        )
+                    )
+                    for i in range(0, n * r * m, mb)
+                ]
+            )
+            pick = scores.view(n, r, m).amin(dim=2).argmin(dim=1)
             rows = torch.arange(n, device=obs.device)
             self.latched_cond = cond.detach().view(n, r, -1)[rows, pick]
 

@@ -123,12 +123,14 @@ def main(cfg: Config):
                         [0.0, 0.6, 0.3, 0.28],
                         [-0.85, 0.0, 0.3, 0.28],
                         [0.85, 0.0, 0.3, 0.28],
-                        [0.0, 0.0, 0.3, 0.2],
+                        [0.0, 0.0, 0.3, 0.28],
                     ],
                     device=device,
                 ),
+                # wz pinned near high-wrist: lower carriage executes unreliably
+                # (wrist clips the wall top) and the verifier can't see that
                 "bounds": torch.tensor(
-                    [[-1.0, 0.0, 0.1, 0.12], [1.0, 0.8, 0.5, 0.32]], device=device
+                    [[-1.0, 0.0, 0.1, 0.26], [1.0, 0.8, 0.5, 0.32]], device=device
                 ),
                 "iters": cfg.opt_iters,
                 "lr": cfg.opt_lr,
@@ -208,6 +210,10 @@ def main(cfg: Config):
             f"failure {fail.mean():.3f} timeout {stuck.mean():.3f} "
             f"accel_p95 {accel_p95:.4f} "
         )
+        lc = policy.latched_cond
+        if searching and lc is not None:  # latent distribution, for diagnosis
+            lc = lc.cpu().numpy()
+            print(f"  latched cond mean {lc.mean(0).round(3)} std {lc.std(0).round(3)}")
         if stages is not None:
             counts = np.bincount(max_stage, minlength=len(stages))
             stage_hist += counts
