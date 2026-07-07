@@ -35,8 +35,10 @@ class Config:
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
-    cond: str = "null"  # "null" | "zero" | "search" (grid+latch) | "lat,vert" fixed
+    cond: str = "null"  # "null" | "zero" | "search" | "optimize" | "a,b,..." fixed
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
+    opt_iters: int = 30  # gradient latent search: descent steps
+    opt_lr: float = 0.05  # gradient latent search: Adam step size
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
@@ -83,7 +85,8 @@ def main(cfg: Config):
         )
         policy.action_clip = (low, high)
 
-    if (cfg.best_of > 1 or cfg.cond == "search") and hasattr(env, "ee_state_index"):
+    searching = cfg.cond in ("search", "optimize")
+    if (cfg.best_of > 1 or searching) and hasattr(env, "ee_state_index"):
         geom = env.obstacle_geometry
         sel = AnalyticSelector(
             geom["center"] + geom["half_extents"],
@@ -109,6 +112,27 @@ def main(cfg: Config):
             assert cfg.cond_grid, "search needs --cond_grid"
             grid = [[float(v) for v in g.split(",")] for g in cfg.cond_grid.split(";")]
             policy.cond_candidates = torch.tensor(grid, device=device)
+        elif cfg.cond == "optimize":  # gradient descent on the latent + latch
+            assert policy.selector_fn is not None, "optimize needs a selector"
+            # restarts cover the discrete lateral choice; bounds = the label
+            # ranges the augmentation trained (see scripts/augment.py)
+            policy.cond_opt = {
+                "cost": sel.pen_cost,
+                "inits": torch.tensor(
+                    [
+                        [0.0, 0.6, 0.3, 0.28],
+                        [-0.85, 0.0, 0.3, 0.28],
+                        [0.85, 0.0, 0.3, 0.28],
+                        [0.0, 0.0, 0.3, 0.2],
+                    ],
+                    device=device,
+                ),
+                "bounds": torch.tensor(
+                    [[-1.0, 0.0, 0.1, 0.12], [1.0, 0.8, 0.5, 0.32]], device=device
+                ),
+                "iters": cfg.opt_iters,
+                "lr": cfg.opt_lr,
+            }
 
     arm = hasattr(env, "ee_state_index")  # franka: planned path needs EE FK
     if arm:

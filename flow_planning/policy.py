@@ -17,6 +17,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
@@ -225,6 +226,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.n_samples = 1  # plans sampled per world when selector_fn is set
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
+        self.cond_opt = None  # gradient latent search: dict(cost, inits, bounds, ...)
         self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
         # and integrate t..1, keeping timing/mode continuity across replans
         self.reset()
@@ -274,6 +276,73 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         loss = (err * mask).sum() / mask.sum()
         return loss, {"loss": loss.item()}
 
+    def flow_integrate(
+        self,
+        x: Tensor,
+        state: Tensor,
+        goal: Tensor,
+        cond: Tensor | None,
+        t0: float = 0.0,
+        ckpt: bool = False,
+    ) -> Tensor:
+        """ODE-integrate x from t0 to 1, re-clamping the boundary frames each
+        step. `ckpt` checkpoints each step so gradients (w.r.t. cond) fit."""
+        sd, gd = self.state_dim, self.config.goal_dim
+        gs = self.config.goal_state_start
+        dt = (1.0 - t0) / self.config.num_inference_steps
+
+        def step(x, t, cond):
+            x = x.clone()
+            x[:, 0, :sd] = state
+            x[:, -1, gs : gs + gd] = goal
+            return x + dt * self.model(x, t, cond)
+
+        for i in range(self.config.num_inference_steps):
+            t = torch.full((x.shape[0],), t0 + i * dt, device=x.device)
+            if ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    step, x, t, cond, use_reentrant=False
+                )
+            else:
+                x = step(x, t, cond)
+        return x
+
+    @torch.enable_grad()
+    def optimize_cond(self, obs: Tensor):
+        """Gradient-descend the bend latent through the ODE from a few restarts,
+        latch the best per world (by the hard selector score). Fixed noise per
+        restart makes the objective deterministic."""
+        o = self.cond_opt
+        assert o is not None and self.selector_fn is not None
+        n, r = obs.shape[0], o["inits"].shape[0]
+        sd, gd = self.state_dim, self.config.goal_dim
+        state = obs[:, :sd].repeat_interleave(r, dim=0)
+        goal = obs[:, -gd:].repeat_interleave(r, dim=0)
+        cond = o["inits"].repeat(n, 1).clone().requires_grad_(True)
+        x0 = torch.randn(n * r, self.config.horizon, self.traj_dim, device=obs.device)
+        lo, hi = o["bounds"]
+        opt = torch.optim.Adam([cond], lr=o["lr"])
+        mb = 128  # grad accumulation: ~90MB per 2 plans through the ODE
+        for _ in range(o["iters"]):
+            opt.zero_grad()
+            for i in range(0, n * r, mb):
+                x = self.flow_integrate(
+                    x0[i : i + mb],
+                    state[i : i + mb],
+                    goal[i : i + mb],
+                    cond[i : i + mb],
+                    ckpt=True,
+                )
+                o["cost"](x).sum().backward()
+            opt.step()
+            with torch.no_grad():
+                cond.clamp_(lo, hi)
+        with torch.no_grad():
+            x = self.flow_integrate(x0, state, goal, cond.detach())
+            pick = self.selector_fn(x).view(n, r).argmin(dim=1)
+            rows = torch.arange(n, device=obs.device)
+            self.latched_cond = cond.detach().view(n, r, -1)[rows, pick]
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Flow-ODE integrate a [state, action] trajectory, conditioning by
@@ -285,10 +354,16 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         sel = self.selector_fn
         n_worlds = obs.shape[0]
         ns = self.n_samples if sel is not None else 1
-        # bend conditioning: fixed command, latched pick, or a candidate search;
-        # ns samples per mode are drawn and the selector keeps the best plan
+        # bend conditioning: fixed command, latched pick, or a search (gradient
+        # descent on the latent, or a candidate grid); ns samples per mode are
+        # drawn and the selector keeps the best plan
         cond, k, searching = None, ns, False
-        if self.config.cond_dim and self.cond_candidates is not None:
+        if self.config.cond_dim and self.cond_opt is not None:
+            if self.latched_cond is None:
+                self.optimize_cond(obs)
+            assert self.latched_cond is not None
+            cond = self.latched_cond.repeat_interleave(ns, dim=0)
+        elif self.config.cond_dim and self.cond_candidates is not None:
             if self.latched_cond is not None:
                 cond = self.latched_cond.repeat_interleave(ns, dim=0)
             else:
@@ -302,7 +377,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         if k > 1:
             obs = obs.repeat_interleave(k, dim=0)
         sd, gd = self.state_dim, self.config.goal_dim
-        gs = self.config.goal_state_start
         state, goal = obs[:, :sd], obs[:, -gd:]
         m = obs.shape[0]
         x = torch.randn(m, self.config.horizon, self.traj_dim, device=obs.device)
@@ -322,25 +396,16 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             )
             prev = last.gather(1, idx[..., None].expand(-1, -1, last.shape[-1]))
             x = (1 - t0) * x + t0 * prev.repeat_interleave(k, dim=0)
-        dt = (1.0 - t0) / self.config.num_inference_steps
-
-        def integrate(x, state, goal, cond):
-            mm = x.shape[0]
-            for i in range(self.config.num_inference_steps):
-                x[:, 0, :sd] = state
-                x[:, -1, gs : gs + gd] = goal
-                t = torch.full((mm,), t0 + i * dt, device=x.device)
-                x = x + dt * self.model(x, t, cond)
-            return x
 
         mb = 4096  # micro-batch cap sized for a 24GB card at horizon 600
         x = torch.cat(
             [
-                integrate(
+                self.flow_integrate(
                     x[i : i + mb],
                     state[i : i + mb],
                     goal[i : i + mb],
                     None if cond is None else cond[i : i + mb],
+                    t0=t0,
                 )
                 for i in range(0, m, mb)
             ]

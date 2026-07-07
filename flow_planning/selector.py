@@ -106,6 +106,28 @@ class AnalyticSelector:
         prog = (cube - cube[:, -1:]).norm(dim=-1).mean(dim=1)  # mean dist to goal
         return -clear.clamp(max=self.cap) + self.prog * prog
 
+    def pen_cost(self, traj: Tensor, margin: float = 0.05) -> Tensor:
+        """Differentiable per-plan cost for gradient latent search: dense box
+        penetration + progress. The worst-case min in `score` is right for
+        selection but its gradient touches one point; this sums over all of
+        them."""
+        s, n = self.joint_start, self.n_arm
+        center, half = self.box[:, :3], self.box[:, None, None, 3:]
+        pen = 0.0
+        for q in (
+            traj[..., s : s + n] * self.js + self.jm,
+            traj[..., :n] * self.ss + self.sm,
+        ):
+            b, t = q.shape[:2]
+            pts = self.fc.arm_points(q.reshape(-1, n).float()).reshape(b, t, -1, 3)
+            d = box_sdf(pts + self.fc.base_pos, center[:, None, None], half)
+            pen = pen + torch.relu(margin - d).square().sum(dim=(1, 2))
+        cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
+        dc = box_sdf(cube[:, :, None].float(), center[:, None, None], half)
+        pen = pen + torch.relu(margin + self.fc.cube_half - dc).square().sum(dim=(1, 2))
+        prog = (cube - cube[:, -1:]).norm(dim=-1).mean(dim=1)
+        return pen + self.prog * prog
+
     def clearance(self, traj: Tensor) -> Tensor:
         s, n = self.joint_start, self.n_arm
         center, half = self.box[:, :3], self.box[:, None, None, 3:]
