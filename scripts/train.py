@@ -41,7 +41,7 @@ class Config:
     eval_episodes: int = 256
     log_every: int = 100
     wandb_project: str = "flow-planning"
-    wandb_mode: Literal["online", "offline", "disabled"] = "online"
+    wandb_mode: str = "online"  # "online" | "offline" | "disabled"
     adaln: bool = True  # new runs use AdaLN; old checkpoints keep additive bias
 
 
@@ -127,9 +127,8 @@ def main(cfg: Config):
     out_dir = make_run_dir(cfg.out_dir, cfg.env.type)
     print(f"Output directory: {out_dir}")
 
-    wandb.init(
-        project=cfg.wandb_project, mode=cfg.wandb_mode, config=draccus.encode(cfg)
-    )
+    mode = cast(Literal["online", "offline", "disabled"], cfg.wandb_mode)
+    wandb.init(project=cfg.wandb_project, mode=mode, config=draccus.encode(cfg))
 
     dataset = LeRobotDataset(cfg.repo_id)
     features = dataset_to_policy_features(dataset.features)
