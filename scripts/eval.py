@@ -141,6 +141,9 @@ def main(cfg: Config):
     if arm:
         chain = build_franka_chain(device)[0]
         base_pos = np.asarray(env.robot_base_pos, np.float32)  # base frame -> world
+        gs = cfg.env.goal_state_start  # plan-cube dims, for hover diagnostics
+        cube_m = np.asarray(stats[OBS_STATE]["mean"])[gs : gs + 3]
+        cube_s = np.asarray(stats[OBS_STATE]["std"])[gs : gs + 3]
 
     n = cfg.env.world_count
     frames = round(cfg.episode_seconds * cfg.env.fps)
@@ -158,6 +161,8 @@ def main(cfg: Config):
         succ = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
         acts = []
+        plan_low = np.full(n, np.inf)  # closest interior plan-cube approach to goal
+        term_jumps, max_jumps = [], []
         frame = 0
         pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
         while frame < frames and viewer.is_running():
@@ -174,6 +179,19 @@ def main(cfg: Config):
                         torch.cuda.synchronize()
                     plan_t += time.perf_counter() - t0
                     n_plan += 1
+                    if arm and policy.last_traj is not None:
+                        # hover diagnostics: does the plan descend to the goal
+                        # before the clamped final frame, or teleport into it?
+                        pc = policy.last_traj[..., gs : gs + 3].cpu().numpy()
+                        pc = pc * cube_s + cube_m
+                        gw = obs[:, -3:].numpy()
+                        d = np.linalg.norm(pc[:, :-1] - gw[:, None], axis=-1)
+                        plan_low = np.minimum(plan_low, d.min(axis=1))
+                        term_jumps.append(
+                            np.linalg.norm(pc[:, -1] - pc[:, -2], axis=-1)
+                        )
+                        steps = np.linalg.norm(np.diff(pc, axis=1), axis=-1)
+                        max_jumps.append(steps.max(axis=1))
                 phys = postprocessor(action).numpy().astype(np.float32)
                 acts.append(phys)
                 env.apply_action(phys)
@@ -215,6 +233,20 @@ def main(cfg: Config):
         if searching and lc is not None:  # latent distribution, for diagnosis
             lc = lc.cpu().numpy()
             print(f"  latched cond mean {lc.mean(0).round(3)} std {lc.std(0).round(3)}")
+        if term_jumps:
+            tj, mj = np.concatenate(term_jumps), np.concatenate(max_jumps)
+            print(
+                f"  plan term_jump p50 {np.median(tj):.3f} "
+                f"p90 {np.percentile(tj, 90):.3f} "
+                f"max_jump p50 {np.median(mj):.3f} p90 {np.percentile(mj, 90):.3f}"
+            )
+            for name, m in (("succ", succ), ("fail", fail), ("stuck", stuck)):
+                if m.any():
+                    print(
+                        f"  plan_low[{name}] p50 {np.median(plan_low[m]):.3f} "
+                        f"p90 {np.percentile(plan_low[m], 90):.3f} "
+                        f"hover_frac {(plan_low[m] > 0.05).mean():.2f}"
+                    )
         if stages is not None:
             counts = np.bincount(max_stage, minlength=len(stages))
             stage_hist += counts
