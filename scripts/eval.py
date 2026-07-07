@@ -127,10 +127,11 @@ def main(cfg: Config):
                     ],
                     device=device,
                 ),
-                # wz pinned near high-wrist: lower carriage executes unreliably
-                # (wrist clips the wall top) and the verifier can't see that
+                # bounds = the grid's execution-validated hull, not the aug label
+                # ranges: descent rides clearance to the corners (lift 0.5, lat
+                # +-1) which verify clean but execute as timeouts
                 "bounds": torch.tensor(
-                    [[-1.0, 0.0, 0.1, 0.26], [1.0, 0.8, 0.5, 0.32]], device=device
+                    [[-0.85, 0.0, 0.1, 0.26], [0.85, 0.6, 0.35, 0.32]], device=device
                 ),
                 "iters": cfg.opt_iters,
                 "lr": cfg.opt_lr,
