@@ -25,11 +25,12 @@ run: |
   rm -rf $JOB; mkdir -p $JOB
   rsync -a --exclude .venv --exclude outputs --exclude wandb ~/sky_workdir/ $JOB/
   cd $JOB && uv sync
-  # diagnostic: is data-derived's 0.574 gap (vs hand grid 0.773) the FPS extremes
-  # or the wz spread specifically? kmeans=central modes, wz_lo=high-wrist only
+  # execution test: the data-derived gap is timeout (execution stall), not routing.
+  # kmeans+wz_lo candidates (collision 0.102, timeout 0.227). Does committing to
+  # the latched plan (no per-replan resample / open-loop) recover the timeout?
   CKPT=/home/sky/v12job/outputs/franka/2026-07-06/18-21-13
-  E="uv run scripts/eval.py --repo_id reece-omahoney/franka --episodes 2 --env.type franka --env.task_time 1.5 --episode_seconds 30 --checkpoint $CKPT --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 --warm_start_t 0.6 --cond search --best_of 16 --selector_cap 0.10 --selector_prog 0.01 --n_cond 8"
-  $E --cond_reduce kmeans                    # central modes (avoid extremes)
-  $E --cond_wz_lo 0.26                        # fps but high-wrist only
-  $E --cond_reduce kmeans --cond_wz_lo 0.26  # both
+  E="uv run scripts/eval.py --repo_id reece-omahoney/franka --episodes 2 --env.type franka --env.task_time 1.5 --episode_seconds 30 --checkpoint $CKPT --env.obstacle true --env.sample_wall_margin 0.15 --warm_start_t 0.6 --cond search --n_cond 8 --cond_reduce kmeans --cond_wz_lo 0.26 --best_of 16 --selector_cap 0.10 --selector_prog 0.01"
+  $E --n_action_steps 75                          # baseline: resample 16 every replan
+  $E --n_action_steps 75 --post_latch_best_of 1   # no resample after latch
+  $E --n_action_steps 599                         # open-loop: execute the full plan
 

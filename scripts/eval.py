@@ -35,6 +35,7 @@ class Config:
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
+    post_latch_best_of: int = 0  # >0: samples/replan after a mode latches (0=best_of)
     cond: str = "null"  # "null" | "zero" | "search" | "a,b,..." fixed
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
@@ -141,6 +142,7 @@ def main(cfg: Config):
         )
         policy.selector_fn = sel.score
         policy.n_samples = cfg.best_of
+        policy.post_latch_samples = cfg.post_latch_best_of or None
     if getattr(policy.config, "cond_dim", 0):
         if cfg.cond == "zero":
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)

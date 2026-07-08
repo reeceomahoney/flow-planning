@@ -223,6 +223,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.action_clip = None  # optional (low, high) normalized action bounds
         self.selector_fn = None  # optional plan scorer for best-of-N selection
         self.n_samples = 1  # plans sampled per world when selector_fn is set
+        self.post_latch_samples = None  # <n_samples after a mode latches (0/None=same)
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
@@ -310,7 +311,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         cond, k, searching = None, ns, False
         if self.config.cond_dim and self.cond_candidates is not None:
             if self.latched_cond is not None:
-                cond = self.latched_cond.repeat_interleave(ns, dim=0)
+                k = self.post_latch_samples or ns  # fewer re-rolls once committed
+                cond = self.latched_cond.repeat_interleave(k, dim=0)
             else:
                 searching = True
                 k = self.cond_candidates.shape[0] * ns
