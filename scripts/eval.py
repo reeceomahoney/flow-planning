@@ -37,9 +37,27 @@ class Config:
     best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
     cond: str = "null"  # "null" | "zero" | "search" | "a,b,..." fixed
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
+    n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
+
+
+def data_cond_candidates(dataset, k: int, device) -> torch.Tensor:
+    """K conditioning modes farthest-point-sampled from the dataset's own bend
+    labels. The augmentation only kept labels whose sim-replay succeeded, so this
+    set is on-manifold and execution-validated — no hand-tuned grid needed."""
+    bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
+    modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
+    if len(modes) <= k:
+        return torch.tensor(modes, dtype=torch.float32, device=device)
+    idx = [int(np.linalg.norm(modes - modes.mean(0), axis=1).argmin())]  # central seed
+    d = np.linalg.norm(modes - modes[idx[0]], axis=1)
+    for _ in range(k - 1):
+        i = int(d.argmax())
+        idx.append(i)
+        d = np.minimum(d, np.linalg.norm(modes - modes[i], axis=1))
+    return torch.tensor(modes[idx], dtype=torch.float32, device=device)
 
 
 @draccus.wrap()
@@ -105,11 +123,17 @@ def main(cfg: Config):
         elif "," in cfg.cond:  # fixed bend command, e.g. "0.5,0.5"
             vals = [float(v) for v in cfg.cond.split(",")]
             policy.cond = torch.tensor([vals], device=device)
-        elif cfg.cond == "search":  # bend-mode grid, scored + latched via selector
+        elif cfg.cond == "search":  # candidates scored + latched via selector
             assert policy.selector_fn is not None, "search needs a selector"
-            assert cfg.cond_grid, "search needs --cond_grid"
-            grid = [[float(v) for v in g.split(",")] for g in cfg.cond_grid.split(";")]
-            policy.cond_candidates = torch.tensor(grid, device=device)
+            if cfg.cond_grid:  # explicit hand grid
+                grid = [
+                    [float(v) for v in g.split(",")] for g in cfg.cond_grid.split(";")
+                ]
+                cand = torch.tensor(grid, device=device)
+            else:  # scalable: sample execution-validated modes from the data itself
+                cand = data_cond_candidates(dataset, cfg.n_cond, device)
+            policy.cond_candidates = cand
+            print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
 
     arm = hasattr(env, "ee_state_index")  # franka: planned path needs EE FK
     if arm:
