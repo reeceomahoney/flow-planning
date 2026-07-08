@@ -64,7 +64,14 @@ class ObstacleContactSensor:
             np.int32,
         )
         self.model = model
-        self.labels = [label.split("/")[-1] for label in model.shape_label]
+        # prefer the owning body's key (link name); fall back to the shape label
+        sbody = model.shape_body.numpy()
+        bkey = list(getattr(model, "body_key", []) or [])
+        self.labels = []
+        for s, lab in enumerate(model.shape_label):
+            b = int(sbody[s])
+            name = bkey[b] if 0 <= b < len(bkey) else lab
+            self.labels.append(str(name).split("/")[-1])
         self.shape_is_obstacle = wp.array(is_obstacle, dtype=wp.int32)
         self.contacted = wp.zeros(model.world_count, dtype=wp.int32)
         self.contact_shape = wp.full(model.world_count, -1, dtype=wp.int32)

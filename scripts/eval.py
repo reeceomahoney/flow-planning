@@ -43,6 +43,7 @@ class Config:
     cond_wz_lo: float = 0.0  # >0: drop data modes with wz below this (diagnostic)
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
+    selector_link_radius: float = 0.0  # inflate arm points by a link radius
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
@@ -139,6 +140,7 @@ def main(cfg: Config):
             cube_size=env.cube_size,
             cap=cfg.selector_cap,
             prog=cfg.selector_prog,
+            link_radius=cfg.selector_link_radius,
         )
         policy.selector_fn = sel.score
         policy.n_samples = cfg.best_of

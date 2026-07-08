@@ -80,6 +80,7 @@ class AnalyticSelector:
         n_arm: int = 7,
         cap: float = 0.08,  # clearance beyond this buys nothing
         prog: float = 0.03,  # weight of the mean cube-to-goal progress term
+        link_radius: float = 0.0,  # inflate arm points: origin spine misses volume
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.fc = FrankaCollision(device, base_pos, cube_size)
@@ -94,7 +95,7 @@ class AnalyticSelector:
         self.cm = torch.as_tensor(obs_stats["mean"], **f32)[ci : ci + 3]
         self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
-        self.cap, self.prog = cap, prog
+        self.cap, self.prog, self.link_radius = cap, prog, link_radius
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
@@ -118,7 +119,7 @@ class AnalyticSelector:
             b, t = q.shape[:2]
             pts = self.fc.arm_points(q.reshape(-1, n).float()).reshape(b, t, -1, 3)
             d = box_sdf(pts + self.fc.base_pos, center[:, None, None], half)
-            worst.append(d.amin(dim=(1, 2)))
+            worst.append(d.amin(dim=(1, 2)) - self.link_radius)
         dc = box_sdf(cube[:, :, None].float(), center[:, None, None], half)
         worst.append(dc.amin(dim=(1, 2)) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)
