@@ -34,6 +34,7 @@ class Config:
     dst_repo: str = "reece-omahoney/franka"
     copies: int = 2  # bent copies per episode; the original is always kept
     bend_amp: float = 1.0  # scales the sampled arc, as in the online recorder
+    vert_hi: float = 0.8  # upper bound of the vertical arc (clearance magnitude)
     wrist_lo: float = 0.12  # wrist-carriage height range above the EE
     wrist_hi: float = 0.32
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
@@ -259,7 +260,7 @@ def main(cfg: Config):
             grp = pending[g : g + rig.W]
             n, tm = len(grp), max(len(x["obs"]) for x in grp)
             lats = cfg.bend_amp * rng.uniform(-1.0, 1.0, n)
-            verts = cfg.bend_amp * rng.uniform(0.0, 0.8, n)
+            verts = cfg.bend_amp * rng.uniform(0.0, cfg.vert_hi, n)
             wzs = rng.uniform(cfg.wrist_lo, cfg.wrist_hi, n)
             for x, lat, vert, wz in zip(grp, lats, verts, wzs):
                 x["d"] = bend_delta(x["obs"][:, EE], x["close"], x["opened"], lat, vert)
