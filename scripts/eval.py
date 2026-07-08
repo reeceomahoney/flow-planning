@@ -38,25 +38,49 @@ class Config:
     cond: str = "null"  # "null" | "zero" | "search" | "a,b,..." fixed
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
+    cond_reduce: str = "fps"  # "fps" | "kmeans": how to pick n_cond data modes
+    cond_wz_lo: float = 0.0  # >0: drop data modes with wz below this (diagnostic)
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
-def data_cond_candidates(dataset, k: int, device) -> torch.Tensor:
-    """K conditioning modes farthest-point-sampled from the dataset's own bend
-    labels. The augmentation only kept labels whose sim-replay succeeded, so this
-    set is on-manifold and execution-validated — no hand-tuned grid needed."""
-    bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
-    modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
-    if len(modes) <= k:
-        return torch.tensor(modes, dtype=torch.float32, device=device)
-    idx = [int(np.linalg.norm(modes - modes.mean(0), axis=1).argmin())]  # central seed
-    d = np.linalg.norm(modes - modes[idx[0]], axis=1)
+def fps_idx(pts: np.ndarray, k: int, seed: int) -> list[int]:
+    """Farthest-point sampling: indices of k points with maximal mutual spread."""
+    idx = [seed]
+    d = np.linalg.norm(pts - pts[seed], axis=1)
     for _ in range(k - 1):
         i = int(d.argmax())
         idx.append(i)
-        d = np.minimum(d, np.linalg.norm(modes - modes[i], axis=1))
+        d = np.minimum(d, np.linalg.norm(pts - pts[i], axis=1))
+    return idx
+
+
+def data_cond_candidates(
+    dataset, k: int, device, reduce: str = "fps", wz_lo: float = 0.0
+) -> torch.Tensor:
+    """K conditioning modes drawn from the dataset's own bend labels. The
+    augmentation only kept labels whose sim-replay succeeded, so the set is
+    on-manifold and execution-validated — no hand-tuned grid needed. `reduce`:
+    "fps" (max coverage, favours extremes) or "kmeans" (central modes). `wz_lo`
+    drops low-wrist modes (diagnostic: they clip the wall top near an obstacle)."""
+    bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
+    modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
+    if wz_lo > 0:
+        modes = modes[modes[:, 3] >= wz_lo]
+    if len(modes) <= k:
+        return torch.tensor(modes, dtype=torch.float32, device=device)
+    seed = int(np.linalg.norm(modes - modes.mean(0), axis=1).argmin())
+    if reduce == "kmeans":  # cluster centroids snapped back onto real labels
+        cen = modes[fps_idx(modes, k, seed)]
+        for _ in range(50):
+            a = np.linalg.norm(modes[:, None] - cen[None], axis=2).argmin(1)
+            cen = np.stack(
+                [modes[a == j].mean(0) if (a == j).any() else cen[j] for j in range(k)]
+            )
+        idx = [int(np.linalg.norm(modes - c, axis=1).argmin()) for c in cen]
+    else:
+        idx = fps_idx(modes, k, seed)
     return torch.tensor(modes[idx], dtype=torch.float32, device=device)
 
 
@@ -131,7 +155,9 @@ def main(cfg: Config):
                 ]
                 cand = torch.tensor(grid, device=device)
             else:  # scalable: sample execution-validated modes from the data itself
-                cand = data_cond_candidates(dataset, cfg.n_cond, device)
+                cand = data_cond_candidates(
+                    dataset, cfg.n_cond, device, cfg.cond_reduce, cfg.cond_wz_lo
+                )
             policy.cond_candidates = cand
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
 
