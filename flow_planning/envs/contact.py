@@ -20,6 +20,7 @@ def obstacle_contact_kernel(
     body_q: wp.array(dtype=wp.transform),
     # outputs
     contacted: wp.array(dtype=wp.int32),
+    contact_shape: wp.array(dtype=wp.int32),
 ):
     tid = wp.tid()
     if tid >= contact_count[0]:
@@ -48,8 +49,10 @@ def obstacle_contact_kernel(
 
     if shape_is_obstacle[s0] == 1:
         contacted[shape_world[s1]] = 1
+        contact_shape[shape_world[s1]] = s1
     else:
         contacted[shape_world[s0]] = 1
+        contact_shape[shape_world[s0]] = s0
 
 
 class ObstacleContactSensor:
@@ -61,8 +64,10 @@ class ObstacleContactSensor:
             np.int32,
         )
         self.model = model
+        self.labels = [label.split("/")[-1] for label in model.shape_label]
         self.shape_is_obstacle = wp.array(is_obstacle, dtype=wp.int32)
         self.contacted = wp.zeros(model.world_count, dtype=wp.int32)
+        self.contact_shape = wp.full(model.world_count, -1, dtype=wp.int32)
 
     def update(self, contacts, body_q):
         wp.launch(
@@ -82,11 +87,17 @@ class ObstacleContactSensor:
                 self.model.shape_body,
                 body_q,
             ],
-            outputs=[self.contacted],
+            outputs=[self.contacted, self.contact_shape],
         )
 
     def read(self):
         return self.contacted.numpy().astype(bool)
 
+    def read_labels(self):
+        """Per-world label of the shape that hit the obstacle ("" if none)."""
+        s = self.contact_shape.numpy()
+        return np.array([self.labels[i] if i >= 0 else "" for i in s])
+
     def reset(self):
         self.contacted.zero_()
+        self.contact_shape.fill_(-1)

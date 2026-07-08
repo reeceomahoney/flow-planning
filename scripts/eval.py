@@ -44,7 +44,6 @@ class Config:
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
-    warm_start_mask_tail: bool = False  # fresh noise past the re-anchored plan end
 
 
 def fps_idx(pts: np.ndarray, k: int, seed: int) -> list[int]:
@@ -100,7 +99,6 @@ def main(cfg: Config):
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
     policy.warm_start_t = cfg.warm_start_t
-    policy.warm_start_mask_tail = cfg.warm_start_mask_tail
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -257,6 +255,12 @@ def main(cfg: Config):
             f"failure {fail.mean():.3f} timeout {stuck.mean():.3f} "
             f"accel_p95 {accel_p95:.4f} "
         )
+        if hasattr(env, "contact_labels") and fail.any():  # what hit the wall
+            labs = env.contact_labels()[fail]
+            uniq, cnt = np.unique(labs, return_counts=True)
+            order = np.argsort(-cnt)
+            hits = "  ".join(f"{uniq[i]}:{cnt[i]}" for i in order)
+            print(f"  wall contacts (n={fail.sum()}): {hits}")
         lc = policy.latched_cond
         if searching and lc is not None:  # latent distribution, for diagnosis
             lc = lc.cpu().numpy()

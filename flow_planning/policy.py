@@ -227,7 +227,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
-        self.warm_start_mask_tail = False  # fresh noise past the shifted plan end
         # and integrate t..1, keeping timing/mode continuity across replans
         self.reset()
 
@@ -336,19 +335,14 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             # stalls there) whenever execution lags the plan's schedule
             na, h = self.config.n_action_steps, last.shape[1]
             cur = state[::k, :sd]  # one row per world
-            ww = min(2 * na, h - 1)
-            d = (last[:, :ww, :sd] - cur[:, None]).norm(dim=-1)
+            w = min(2 * na, h - 1)
+            d = (last[:, :w, :sd] - cur[:, None]).norm(dim=-1)
             shift = d.argmin(dim=1)  # (n_worlds,)
-            raw = torch.arange(h, device=x.device)[None] + shift[:, None]
-            idx = raw.clamp(max=h - 1)
+            idx = (torch.arange(h, device=x.device)[None] + shift[:, None]).clamp(
+                max=h - 1
+            )
             prev = last.gather(1, idx[..., None].expand(-1, -1, last.shape[-1]))
-            w = t0
-            if self.warm_start_mask_tail:
-                # frames shifted past the plan end clamp to the goal, biasing the
-                # warm start toward a hover; leave them as fresh noise instead
-                valid = (raw < h).float()[..., None].repeat_interleave(k, dim=0)
-                w = t0 * valid
-            x = (1 - w) * x + w * prev.repeat_interleave(k, dim=0)
+            x = (1 - t0) * x + t0 * prev.repeat_interleave(k, dim=0)
 
         mb = 4096  # micro-batch cap sized for a 24GB card at horizon 600
         x = torch.cat(

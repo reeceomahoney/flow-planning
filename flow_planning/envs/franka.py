@@ -612,6 +612,12 @@ class FrankaEnv:
             return np.zeros(self.cfg.world_count, dtype=bool)
         return self.obstacle_sensor.read()
 
+    def contact_labels(self):
+        """Per-world label of the shape that first hit the obstacle ("" if none)."""
+        if self.obstacle_sensor is None:
+            return np.full(self.cfg.world_count, "", dtype=object)
+        return self.obstacle_sensor.read_labels()
+
     # -------------------------------------------------------------- selector
     @property
     def obstacle_geometry(self):
