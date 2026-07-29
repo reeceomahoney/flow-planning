@@ -34,13 +34,13 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 3: fixed horizon means a longer detour is a faster one. Penalize plans
-  # demanding joint speeds the demos never did. Arm 1 is the grid reference with
-  # the new diagnostic — if its overspeed is low and the data arms' is high, the
-  # selector is picking untrackable plans and that is the whole gap.
-  echo "=== grid reference (diagnostic only) ==="
-  $E --cond_grid=$GRID --selector_cap 0.10 --selector_prog 0.01
-  for SP in 0.05 0.20 0.50; do
-    echo "=== data speed $SP ==="
-    $E --n_cond 6 --selector_cap 0.10 --selector_prog 0.01 --selector_speed $SP
+  # round 4: measure, don't guess. Fix the latent (no search, still best-of-16)
+  # so mode geometry is isolated from selection. Modes 2-4 are actual members of
+  # the whitened FPS candidate set: 2 is its grid-like mode, 3-4 are the high-arc
+  # modes the selector keeps latching. If 2 alone scores ~0.78 then the good mode
+  # is already on the menu and the entire gap is which one gets picked.
+  S="--selector_cap 0.10 --selector_prog 0.01 --best_of 16"
+  for C in "-0.85,0,0.45,0.28" "-0.88,0.06,0.11,0.32" "-0.88,0.74,0.47,0.32" "0.85,0.78,0.67,0.14"; do
+    echo "=== fixed cond $C ==="
+    $E --cond "$C" $S
   done
