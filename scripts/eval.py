@@ -39,6 +39,7 @@ class Config:
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
+    mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
@@ -134,6 +135,7 @@ def main(cfg: Config):
         if cfg.best_of > 1 or searching:
             policy.selector_fn = sel.score
             policy.n_samples = cfg.best_of
+            policy.mode_reduce = cfg.mode_reduce
     if getattr(policy.config, "cond_dim", 0):
         if cfg.cond == "zero":
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)

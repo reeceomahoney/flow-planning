@@ -34,13 +34,12 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 1: can scoring alone close the data-candidate gap (0.586 vs grid 0.781)?
-  # tighter cap saturates clearance sooner, handing the pick to progress.
-  for CP in 0.04 0.06; do
-    echo "=== cap $CP prog 0.01 ==="
-    $E --n_cond 6 --selector_cap $CP --selector_prog 0.01
+  # round 2: modes were ranked by their luckiest sample (flat argmin over
+  # n_modes*16). Rank by an order statistic instead, then best sample within.
+  for MR in median max; do
+    echo "=== reduce $MR cap 0.10 ==="
+    $E --n_cond 6 --selector_cap 0.10 --selector_prog 0.01 --mode_reduce $MR
   done
-  for PR in 0.10 0.30; do
-    echo "=== cap 0.10 prog $PR ==="
-    $E --n_cond 6 --selector_cap 0.10 --selector_prog $PR
-  done
+  # median + the cap that fixed round 1's timeouts (0.215 -> 0.082)
+  echo "=== reduce median cap 0.04 ==="
+  $E --n_cond 6 --selector_cap 0.04 --selector_prog 0.01 --mode_reduce median

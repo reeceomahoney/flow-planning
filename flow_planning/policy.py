@@ -151,6 +151,21 @@ class EncoderLayer(nn.Module):
         return x + g2 * self.ff(self.norm2(x) * (1 + sc2) + sh2)
 
 
+def pick_plan(s: Tensor, ns: int, reduce: str = "min") -> Tensor:
+    """Index of the chosen plan per world, from scores (n_worlds, n_modes * ns).
+
+    "min" is a flat argmin, so a mode wins on its luckiest sample. Ranking modes
+    by median/max of their samples first removes that optimism, then the best
+    sample within the won mode is executed."""
+    if reduce == "min":
+        return s.argmin(dim=1)
+    sm = s.view(s.shape[0], -1, ns)
+    agg = sm.median(dim=2).values if reduce == "median" else sm.amax(dim=2)
+    rows = torch.arange(s.shape[0], device=s.device)
+    best = agg.argmin(dim=1)
+    return best * ns + sm[rows, best].argmin(dim=1)
+
+
 class FlowTransformer(nn.Module):
     """Unconditional velocity field v(x_t, t) over a chunk of [state, action] steps.
 
@@ -223,6 +238,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.action_clip = None  # optional (low, high) normalized action bounds
         self.selector_fn = None  # optional plan scorer for best-of-N selection
         self.n_samples = 1  # plans sampled per world when selector_fn is set
+        self.mode_reduce = "min"  # rank candidate modes by "min"|"median"|"max" sample
         self.guidance_fn = None  # optional differentiable collision cost (guidance)
         self.guidance_scale = 0.0  # step size for the guidance gradient
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
@@ -366,7 +382,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             ]
         )
         if sel is not None and k > 1:  # best-of-N: lowest-scoring plan per world
-            pick = sel(x).view(-1, k).argmin(dim=1)
+            red = self.mode_reduce if searching else "min"
+            pick = pick_plan(sel(x).view(n_worlds, k), ns, red)
             rows = torch.arange(len(pick), device=x.device)
             x = x.view(-1, k, *x.shape[1:])[rows, pick]
             if searching:  # commit to the picked bend mode for later replans
