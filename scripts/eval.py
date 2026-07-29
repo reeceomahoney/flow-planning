@@ -40,6 +40,7 @@ class Config:
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
     mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
+    selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
@@ -56,6 +57,17 @@ def fps_idx(pts: np.ndarray, k: int, seed: int) -> list[int]:
         idx.append(i)
         d = np.minimum(d, np.linalg.norm(pts - pts[i], axis=1))
     return idx
+
+
+def demo_speed_limit(dataset, n_arm: int = 7, q: float = 99.0) -> np.ndarray:
+    """Per-joint step speed the demos stay under — the plan's feasibility bar.
+    A statistic of the free-space training set, like the action stats; no extra
+    rollouts and nothing obstacle-specific."""
+    hf = dataset.hf_dataset.with_format("numpy")
+    act = np.asarray(hf[ACTION])[:, :n_arm]
+    ep = np.asarray(hf["episode_index"])
+    dq = np.abs(np.diff(act, axis=0))[ep[1:] == ep[:-1]]  # drop episode seams
+    return np.percentile(dq, q, axis=0)
 
 
 def data_cond_candidates(dataset, k: int, device, whiten: bool = True) -> torch.Tensor:
@@ -128,6 +140,8 @@ def main(cfg: Config):
             cube_size=env.cube_size,
             cap=cfg.selector_cap,
             prog=cfg.selector_prog,
+            speed=cfg.selector_speed,
+            vlim=demo_speed_limit(dataset),
         )
         if cfg.guidance_scale > 0:  # ablation: guidance instead of best-of-N selection
             policy.guidance_fn = lambda t: sel.penalty(t, cfg.guidance_margin)
@@ -254,6 +268,9 @@ def main(cfg: Config):
             order = np.argsort(-cnt)
             hits = "  ".join(f"{uniq[i]}:{cnt[i]}" for i in order)
             print(f"  wall contacts (n={fail.sum()}): {hits}")
+        if want_sel and policy.last_traj is not None:  # is the picked plan trackable?
+            ov = sel.overspeed(policy.last_traj).cpu().numpy()
+            print(f"  overspeed mean {ov.mean():.3f} p90 {np.percentile(ov, 90):.3f}")
         lc = policy.latched_cond
         if searching and lc is not None:  # latent distribution, for diagnosis
             lc = lc.cpu().numpy()

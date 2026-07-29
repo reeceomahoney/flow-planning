@@ -80,6 +80,8 @@ class AnalyticSelector:
         n_arm: int = 7,
         cap: float = 0.08,  # clearance beyond this buys nothing
         prog: float = 0.03,  # weight of the mean cube-to-goal progress term
+        speed: float = 0.0,  # weight of the overspeed hinge (0 disables)
+        vlim=None,  # (n_arm,) per-step joint speed the demos never exceed
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.fc = FrankaCollision(device, base_pos, cube_size)
@@ -94,7 +96,8 @@ class AnalyticSelector:
         self.cm = torch.as_tensor(obs_stats["mean"], **f32)[ci : ci + 3]
         self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
-        self.cap, self.prog = cap, prog
+        self.cap, self.prog, self.speed = cap, prog, speed
+        self.vlim = None if vlim is None else torch.as_tensor(vlim, **f32)
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
@@ -104,7 +107,20 @@ class AnalyticSelector:
         clear = torch.cat(out)
         cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
         prog = (cube - cube[:, -1:]).norm(dim=-1).mean(dim=1)  # mean dist to goal
-        return -clear.clamp(max=self.cap) + self.prog * prog
+        s = -clear.clamp(max=self.cap) + self.prog * prog
+        if self.speed and self.vlim is not None:
+            s = s + self.speed * self.overspeed(traj)
+        return s
+
+    def overspeed(self, traj: Tensor) -> Tensor:
+        """Peak fraction by which a plan's demanded joint speed exceeds anything
+        the demos asked for. Horizon is fixed, so a longer detour is a faster one
+        — past what the arm can track, execution lags and the plan is fiction."""
+        assert self.vlim is not None
+        j = self.joint_start
+        q = traj[..., j : j + self.n_arm] * self.js + self.jm
+        dq = (q[:, 1:] - q[:, :-1]).abs()
+        return (dq / self.vlim - 1.0).clamp(min=0.0).amax(dim=2).amax(dim=1)
 
     def clearance(self, traj: Tensor) -> Tensor:
         """Worst clearance per plan (min over time and points)."""
