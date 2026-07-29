@@ -34,12 +34,11 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 5: flip the optimization. Clearance becomes a hard constraint and
-  # joint-space path length the objective — shortest route that clears. No
-  # weight between the two, so this cannot reproduce the collision/timeout
-  # trade every weighted term has traced. prog rewarded the arc for closing
-  # distance early; path length charges it for going up and over.
-  for M in 0.04 0.06 0.08 0.10; do
+  # round 6: margin 0.04 was best (0.664) and failure was PINNED at 0.203 across
+  # 0.04-0.10 — plan clearance does not move collisions, only timeouts. Push the
+  # constraint looser still: if failure stays pinned, shorter paths keep buying
+  # timeout back. Where it breaks is where plan clearance starts to matter.
+  for M in 0.005 0.01 0.02 0.03; do
     echo "=== data, margin $M, min path length ==="
     $E --n_cond 6 --best_of 16 --selector_margin $M
   done
