@@ -20,25 +20,33 @@ clusters:
     partition: short
     priority: true
 
-envs:
-  - WANDB_API_KEY
-  - HF_TOKEN
-  - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  civo:
+    host: civo
+    remote_path: /users/kebl6123/flow-planning
+    time: 12
+    gpu: nvidia_b200
+    ngpu: 1
+    cpus: 27
+    mem: 11G
+    partition: allgpus
 
-  # cpu thread limits
-  - OPENBLAS_NUM_THREADS: 8
-  - OMP_NUM_THREADS: 8
-  - MKL_NUM_THREADS: 8
-
-  # cache directories
-  - TORCHINDUCTOR_CACHE_DIR: $HOME/.cache/torchinductor
-  - TRITON_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/triton
-  - UV_PROJECT_ENVIRONMENT: /scratch/u6jz/reece.u6jz/flow-planning/.venv
-  - UV_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/uv
-  - HF_HOME: /scratch/u6jz/reece.u6jz/.cache/huggingface
-  - RATTLER_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/rattler
+# envs:
+#   - WANDB_API_KEY
+#   - HF_TOKEN
+#   - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+#
+#   # cpu thread limits
+#   - OPENBLAS_NUM_THREADS: 8
+#   - OMP_NUM_THREADS: 8
+#   - MKL_NUM_THREADS: 8
+#
+#   # cache directories
+#   - TORCHINDUCTOR_CACHE_DIR: $HOME/.cache/torchinductor
+#   - TRITON_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/triton
+#   - UV_PROJECT_ENVIRONMENT: /scratch/u6jz/reece.u6jz/flow-planning/.venv
+#   - UV_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/uv
+#   - HF_HOME: /scratch/u6jz/reece.u6jz/.cache/huggingface
+#   - RATTLER_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/rattler
 
 command: |-
-  # rm -rf /scratch/u6jz/reece.u6jz/.cache/huggingface/lerobot/reece-omahoney/particle
-  # uv run scripts/record.py
-  uv run scripts/train.py
+  nvidia-smi

@@ -34,10 +34,13 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # can the hand grid be deleted? 6 candidates each, only their source differs.
-  echo "=== A: hand grid (reference ~0.785) ==="
-  $E --cond_grid=$GRID
-  echo "=== B: data FPS, whitened ==="
-  $E --n_cond 6
-  echo "=== C: data FPS, raw (pre-fix: lat dominates, wz ignored) ==="
-  $E --n_cond 6 --cond_whiten false
+  # round 1: can scoring alone close the data-candidate gap (0.586 vs grid 0.781)?
+  # tighter cap saturates clearance sooner, handing the pick to progress.
+  for CP in 0.04 0.06; do
+    echo "=== cap $CP prog 0.01 ==="
+    $E --n_cond 6 --selector_cap $CP --selector_prog 0.01
+  done
+  for PR in 0.10 0.30; do
+    echo "=== cap 0.10 prog $PR ==="
+    $E --n_cond 6 --selector_cap 0.10 --selector_prog $PR
+  done
