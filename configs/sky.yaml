@@ -34,13 +34,12 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 4: measure, don't guess. Fix the latent (no search, still best-of-16)
-  # so mode geometry is isolated from selection. Modes 2-4 are actual members of
-  # the whitened FPS candidate set: 2 is its grid-like mode, 3-4 are the high-arc
-  # modes the selector keeps latching. If 2 alone scores ~0.78 then the good mode
-  # is already on the menu and the entire gap is which one gets picked.
-  S="--selector_cap 0.10 --selector_prog 0.01 --best_of 16"
-  for C in "-0.85,0,0.45,0.28" "-0.88,0.06,0.11,0.32" "-0.88,0.74,0.47,0.32" "0.85,0.78,0.67,0.14"; do
-    echo "=== fixed cond $C ==="
-    $E --cond="$C" $S  # '=' form: a leading - would parse as a new flag
+  # round 5: flip the optimization. Clearance becomes a hard constraint and
+  # joint-space path length the objective — shortest route that clears. No
+  # weight between the two, so this cannot reproduce the collision/timeout
+  # trade every weighted term has traced. prog rewarded the arc for closing
+  # distance early; path length charges it for going up and over.
+  for M in 0.04 0.06 0.08 0.10; do
+    echo "=== data, margin $M, min path length ==="
+    $E --n_cond 6 --best_of 16 --selector_margin $M
   done

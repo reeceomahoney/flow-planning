@@ -41,6 +41,7 @@ class Config:
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
     mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
     selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
+    selector_margin: float = 0.0  # >0: shortest path among plans clearing this much
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
@@ -142,6 +143,7 @@ def main(cfg: Config):
             prog=cfg.selector_prog,
             speed=cfg.selector_speed,
             vlim=demo_speed_limit(dataset),
+            margin=cfg.selector_margin,
         )
         if cfg.guidance_scale > 0:  # ablation: guidance instead of best-of-N selection
             policy.guidance_fn = lambda t: sel.penalty(t, cfg.guidance_margin)
