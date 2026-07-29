@@ -223,6 +223,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.action_clip = None  # optional (low, high) normalized action bounds
         self.selector_fn = None  # optional plan scorer for best-of-N selection
         self.n_samples = 1  # plans sampled per world when selector_fn is set
+        self.guidance_fn = None  # optional differentiable collision cost (guidance)
+        self.guidance_scale = 0.0  # step size for the guidance gradient
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
@@ -292,6 +294,14 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             x[:, 0, :sd] = state
             x[:, -1, gs : gs + gd] = goal
             x = x + dt * self.model(x, t, cond)
+            if self.guidance_fn is not None:  # gradient descent on the collision cost
+                g = torch.zeros_like(x)
+                with torch.enable_grad():  # chunk: FK autograd graph is memory-heavy
+                    for j in range(0, x.shape[0], 32):
+                        xg = x[j : j + 32].detach().requires_grad_(True)
+                        (gj,) = torch.autograd.grad(self.guidance_fn(xg).sum(), xg)
+                        g[j : j + 32] = gj
+                x = x - self.guidance_scale * g
         return x
 
     @torch.no_grad()

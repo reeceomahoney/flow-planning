@@ -40,6 +40,8 @@ class Config:
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
+    guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
+    guidance_margin: float = 0.1  # keep-out margin for the guidance hinge
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
@@ -109,7 +111,8 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     searching = cfg.cond == "search"
-    if (cfg.best_of > 1 or searching) and hasattr(env, "ee_state_index"):
+    want_sel = cfg.best_of > 1 or searching or cfg.guidance_scale > 0
+    if want_sel and hasattr(env, "ee_state_index"):
         geom = env.obstacle_geometry
         sel = AnalyticSelector(
             geom["center"] + geom["half_extents"],
@@ -122,8 +125,12 @@ def main(cfg: Config):
             cap=cfg.selector_cap,
             prog=cfg.selector_prog,
         )
-        policy.selector_fn = sel.score
-        policy.n_samples = cfg.best_of
+        if cfg.guidance_scale > 0:  # ablation: guidance instead of best-of-N selection
+            policy.guidance_fn = lambda t: sel.penalty(t, cfg.guidance_margin)
+            policy.guidance_scale = cfg.guidance_scale
+        if cfg.best_of > 1 or searching:
+            policy.selector_fn = sel.score
+            policy.n_samples = cfg.best_of
     if getattr(policy.config, "cond_dim", 0):
         if cfg.cond == "zero":
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)

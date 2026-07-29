@@ -107,6 +107,12 @@ class AnalyticSelector:
         return -clear.clamp(max=self.cap) + self.prog * prog
 
     def clearance(self, traj: Tensor) -> Tensor:
+        """Worst clearance per plan (min over time and points)."""
+        return self.clearance_t(traj).amin(dim=1)
+
+    def clearance_t(self, traj: Tensor) -> Tensor:
+        """Per-timestep worst clearance (b, t): min over arm points, the cube, and
+        both joint sources. Differentiable — the guidance penalty rides on this."""
         s, n = self.joint_start, self.n_arm
         center, half = self.box[:, :3], self.box[:, None, None, 3:]
         cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
@@ -118,7 +124,12 @@ class AnalyticSelector:
             b, t = q.shape[:2]
             pts = self.fc.arm_points(q.reshape(-1, n).float()).reshape(b, t, -1, 3)
             d = box_sdf(pts + self.fc.base_pos, center[:, None, None], half)
-            worst.append(d.amin(dim=(1, 2)))
+            worst.append(d.amin(dim=2))  # (b, t)
         dc = box_sdf(cube[:, :, None].float(), center[:, None, None], half)
-        worst.append(dc.amin(dim=(1, 2)) - self.fc.cube_half)
+        worst.append(dc.amin(dim=2) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)
+
+    def penalty(self, traj: Tensor, margin: float) -> Tensor:
+        """Differentiable per-plan collision cost for guidance: hinge below the
+        keep-out margin, summed over time. Its gradient pushes near-wall frames out."""
+        return (margin - self.clearance_t(traj)).clamp(min=0.0).sum(dim=1)
