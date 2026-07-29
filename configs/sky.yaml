@@ -29,9 +29,15 @@ run: |
 
   CKPT=/home/sky/v12job/outputs/franka/2026-07-06/18-21-13
   GRID="0,0,0.15,0.28;0,0,0.45,0.28;-0.85,0,0.15,0.28;-0.85,0,0.45,0.28;0,0.6,0.45,0.28;0,0.6,0.15,0.28"
-  # reference: current best obstacle config (~0.77)
-  uv run scripts/eval.py --repo_id reece-omahoney/franka --episodes 2 \
+  E="uv run scripts/eval.py --repo_id reece-omahoney/franka --episodes 2 \
     --env.type franka --env.task_time 1.5 --episode_seconds 30 --checkpoint $CKPT \
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
-    --warm_start_t 0.6 --cond search --cond_grid=$GRID \
-    --selector_cap 0.10 --selector_prog 0.01 --best_of 16
+    --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
+    --best_of 16"
+  # can the hand grid be deleted? 6 candidates each, only their source differs.
+  echo "=== A: hand grid (reference ~0.785) ==="
+  $E --cond_grid=$GRID
+  echo "=== B: data FPS, whitened ==="
+  $E --n_cond 6
+  echo "=== C: data FPS, raw (pre-fix: lat dominates, wz ignored) ==="
+  $E --n_cond 6 --cond_whiten false

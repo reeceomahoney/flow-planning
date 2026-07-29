@@ -38,6 +38,7 @@ class Config:
     cond: str = "null"  # "null" | "zero" | "search" | "a,b,..." fixed
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
+    cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
@@ -56,7 +57,7 @@ def fps_idx(pts: np.ndarray, k: int, seed: int) -> list[int]:
     return idx
 
 
-def data_cond_candidates(dataset, k: int, device) -> torch.Tensor:
+def data_cond_candidates(dataset, k: int, device, whiten: bool = True) -> torch.Tensor:
     """K conditioning modes drawn from the dataset's own bend labels via FPS. The
     augmentation only kept labels whose sim-replay succeeded, so the set is
     on-manifold and execution-validated — no hand-tuned grid needed."""
@@ -64,8 +65,10 @@ def data_cond_candidates(dataset, k: int, device) -> torch.Tensor:
     modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
     if len(modes) <= k:
         return torch.tensor(modes, dtype=torch.float32, device=device)
-    seed = int(np.linalg.norm(modes - modes.mean(0), axis=1).argmin())
-    idx = fps_idx(modes, k, seed)
+    # whiten: raw dims span 2.0 (lat) vs 0.2 (wz), so FPS ignores wrist height
+    w = modes / (modes.std(0) + 1e-6) if whiten else modes
+    seed = int(np.linalg.norm(w - w.mean(0), axis=1).argmin())
+    idx = fps_idx(w, k, seed)
     return torch.tensor(modes[idx], dtype=torch.float32, device=device)
 
 
@@ -145,7 +148,9 @@ def main(cfg: Config):
                 ]
                 cand = torch.tensor(grid, device=device)
             else:  # scalable: sample execution-validated modes from the data itself
-                cand = data_cond_candidates(dataset, cfg.n_cond, device)
+                cand = data_cond_candidates(
+                    dataset, cfg.n_cond, device, cfg.cond_whiten
+                )
             policy.cond_candidates = cand
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
 
