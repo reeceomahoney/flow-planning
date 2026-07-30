@@ -47,6 +47,8 @@ class Config:
     selector_prog: float = 0.03  # progress-term weight
     guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
     guidance_margin: float = 0.1  # keep-out margin for the guidance hinge
+    guidance_len: float = 0.0  # path-length weight in the guidance cost
+    guidance_target: str = "x1"  # guide the predicted clean traj, or raw "xt"
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
@@ -164,8 +166,11 @@ def main(cfg: Config):
             margin=cfg.selector_margin,
         )
         if cfg.guidance_scale > 0:  # ablation: guidance instead of best-of-N selection
-            policy.guidance_fn = lambda t: sel.penalty(t, cfg.guidance_margin)
+            policy.guidance_fn = lambda t: sel.guidance_cost(
+                t, cfg.guidance_margin, cfg.guidance_len
+            )
             policy.guidance_scale = cfg.guidance_scale
+            policy.guidance_target = cfg.guidance_target
         if cfg.best_of > 1 or searching:
             policy.selector_fn = sel.score
             policy.n_samples = cfg.best_of

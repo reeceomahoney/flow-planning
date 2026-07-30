@@ -241,6 +241,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.mode_reduce = "min"  # rank candidate modes by "min"|"median"|"max" sample
         self.guidance_fn = None  # optional differentiable collision cost (guidance)
         self.guidance_scale = 0.0  # step size for the guidance gradient
+        self.guidance_target = "x1"  # cost on "x1" (predicted clean) or raw "xt"
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
@@ -309,15 +310,22 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             x = x.clone()
             x[:, 0, :sd] = state
             x[:, -1, gs : gs + gd] = goal
-            x = x + dt * self.model(x, t, cond)
+            v = self.model(x, t, cond)
             if self.guidance_fn is not None:  # gradient descent on the collision cost
+                b = 1.0 - (t0 + i * dt)  # optimal-transport path: x1 = x + (1-t)v
+                # cost on the predicted CLEAN trajectory, not the noisy x_t —
+                # guiding an intermediate pushes samples off-manifold
+                tgt = (x + b * v if self.guidance_target == "x1" else x).detach()
                 g = torch.zeros_like(x)
                 with torch.enable_grad():  # chunk: FK autograd graph is memory-heavy
                     for j in range(0, x.shape[0], 32):
-                        xg = x[j : j + 32].detach().requires_grad_(True)
+                        xg = tgt[j : j + 32].detach().requires_grad_(True)
                         (gj,) = torch.autograd.grad(self.guidance_fn(xg).sum(), xg)
                         g[j : j + 32] = gj
-                x = x - self.guidance_scale * g
+                w = self.guidance_scale * (b if self.guidance_target == "x1" else 1.0)
+                x = x + dt * v - w * g
+            else:
+                x = x + dt * v
         return x
 
     @torch.no_grad()

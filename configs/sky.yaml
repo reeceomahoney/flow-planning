@@ -34,15 +34,19 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 8: half the FPS candidate set has lift <= 0.11 and those modes score
-  # 0.012 standalone, while the best mode on the menu is 0.754. So the gap is a
-  # poisoned menu, not a bad scorer. Dense picking = FPS over the well-supported
-  # region only. Arm 3 is a hand-pruned oracle: FPS set minus the three low-lift
-  # rows, to establish what exclusion is worth if the density filter is imperfect.
-  M4="--selector_margin 0.04 --best_of 16"
-  echo "=== A: fps (baseline 0.664) ==="
-  $E --n_cond 6 $M4
-  echo "=== B: dense picking ==="
-  $E --n_cond 6 $M4 --cond_pick dense
-  echo "=== C: oracle, poison rows removed (diagnostic) ==="
-  $E --cond_grid="0.09,0.27,0.37,0.22;0.85,0.78,0.67,0.14;-0.88,0.74,0.47,0.32" $M4
+  # round 9: guidance, retuned with what rounds 5-7 established. July's peak was
+  # 0.727 (collision 0.027 — five times better than any selector floor) but it
+  # stalled at timeout 0.25. Two fixes: margin at the measured saturation point
+  # (0.04, was 0.10 — it was buying clearance that buys nothing) and a path-length
+  # term so the gradient cannot pay for clearance with unbounded detour. Also
+  # guide the predicted CLEAN trajectory with (1-t) scaling, as the source paper
+  # did and the lit calls most robust, instead of the raw noisy x_t.
+  G="--cond search --n_cond 6 --best_of 1 --selector_margin 0.04 --guidance_margin 0.04"
+  echo "=== A: x1 target, no length, scale 0.3 ==="
+  $E $G --guidance_target x1 --guidance_scale 0.3
+  echo "=== B: x1 target, no length, scale 1.0 ==="
+  $E $G --guidance_target x1 --guidance_scale 1.0
+  echo "=== C: x1 target, length 0.3, scale 1.0 ==="
+  $E $G --guidance_target x1 --guidance_scale 1.0 --guidance_len 0.3
+  echo "=== D: xt target (old), no length, scale 0.3 — isolates the margin change ==="
+  $E $G --guidance_target xt --guidance_scale 0.3

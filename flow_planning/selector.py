@@ -156,6 +156,13 @@ class AnalyticSelector:
         worst.append(dc.amin(dim=2) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)
 
+    def guidance_cost(self, traj: Tensor, margin: float, w_len: float = 0.0) -> Tensor:
+        """Clearance hinge plus a path-length term. Without the length term the
+        gradient buys clearance with unbounded detour, which is why guidance
+        over-avoided and stalled; clearance saturates at ~0.04 anyway."""
+        c = self.penalty(traj, margin)
+        return c + w_len * self.path_length(traj) if w_len else c
+
     def penalty(self, traj: Tensor, margin: float) -> Tensor:
         """Differentiable per-plan collision cost for guidance: hinge below the
         keep-out margin, summed over time. Its gradient pushes near-wall frames out."""
