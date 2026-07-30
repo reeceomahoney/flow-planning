@@ -34,14 +34,15 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 7: the blocking question. margin 0.04 (0.664) is the ceiling of
-  # score-side fixes; the residual 0.203 collision floor vs the grid's 0.145 is
-  # a MODE property. Fix the latent (no search, still best-of-16) to get each
-  # mode's standalone rate. Mode 2 is a real FPS candidate geometrically close
-  # to the grid's winner: if it alone hits ~0.78 the gap is pure selection, if
-  # it sits at ~0.60 the data modes are intrinsically worse and it is supply.
-  S2="--selector_margin 0.04 --best_of 16"
-  for C in "-0.85,0,0.45,0.28" "-0.88,0.06,0.11,0.32" "-0.88,0.74,0.47,0.32" "0.85,0.78,0.67,0.14"; do
-    echo "=== fixed cond $C ==="
-    $E --cond="$C" $S2  # '=' form: a leading - would parse as a flag
-  done
+  # round 8: half the FPS candidate set has lift <= 0.11 and those modes score
+  # 0.012 standalone, while the best mode on the menu is 0.754. So the gap is a
+  # poisoned menu, not a bad scorer. Dense picking = FPS over the well-supported
+  # region only. Arm 3 is a hand-pruned oracle: FPS set minus the three low-lift
+  # rows, to establish what exclusion is worth if the density filter is imperfect.
+  M4="--selector_margin 0.04 --best_of 16"
+  echo "=== A: fps (baseline 0.664) ==="
+  $E --n_cond 6 $M4
+  echo "=== B: dense picking ==="
+  $E --n_cond 6 $M4 --cond_pick dense
+  echo "=== C: oracle, poison rows removed (diagnostic) ==="
+  $E --cond_grid="0.09,0.27,0.37,0.22;0.85,0.78,0.67,0.14;-0.88,0.74,0.47,0.32" $M4

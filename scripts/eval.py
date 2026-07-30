@@ -39,6 +39,7 @@ class Config:
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
+    cond_pick: str = "fps"  # "fps" (spread, hits degenerate extremes) | "dense"
     mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
     selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
     selector_margin: float = 0.0  # >0: shortest path among plans clearing this much
@@ -60,6 +61,18 @@ def fps_idx(pts: np.ndarray, k: int, seed: int) -> list[int]:
     return idx
 
 
+def dense_idx(pts: np.ndarray, k: int, keep: float = 0.7, m: int = 5) -> list[int]:
+    """FPS restricted to the well-supported region. Plain FPS seeks the extremes
+    of this space, and those are degenerate modes (cube barely lifts), so drop
+    isolated labels by m-NN distance first. k-means is no good here: a lone
+    outlier forms a singleton cluster whose centroid is the outlier itself."""
+    d = np.sort(np.linalg.norm(pts[:, None] - pts[None], axis=-1), axis=1)[:, m]
+    keep_i = np.argsort(d)[: max(k, int(keep * len(pts)))]
+    sub = pts[keep_i]
+    seed = int(np.linalg.norm(sub - sub.mean(0), axis=1).argmin())
+    return [int(keep_i[i]) for i in fps_idx(sub, k, seed)]
+
+
 def demo_speed_limit(dataset, n_arm: int = 7, q: float = 99.0) -> np.ndarray:
     """Per-joint step speed the demos stay under — the plan's feasibility bar.
     A statistic of the free-space training set, like the action stats; no extra
@@ -71,7 +84,9 @@ def demo_speed_limit(dataset, n_arm: int = 7, q: float = 99.0) -> np.ndarray:
     return np.percentile(dq, q, axis=0)
 
 
-def data_cond_candidates(dataset, k: int, device, whiten: bool = True) -> torch.Tensor:
+def data_cond_candidates(
+    dataset, k: int, device, whiten: bool = True, pick: str = "fps"
+) -> torch.Tensor:
     """K conditioning modes drawn from the dataset's own bend labels via FPS. The
     augmentation only kept labels whose sim-replay succeeded, so the set is
     on-manifold and execution-validated — no hand-tuned grid needed."""
@@ -81,8 +96,11 @@ def data_cond_candidates(dataset, k: int, device, whiten: bool = True) -> torch.
         return torch.tensor(modes, dtype=torch.float32, device=device)
     # whiten: raw dims span 2.0 (lat) vs 0.2 (wz), so FPS ignores wrist height
     w = modes / (modes.std(0) + 1e-6) if whiten else modes
-    seed = int(np.linalg.norm(w - w.mean(0), axis=1).argmin())
-    idx = fps_idx(w, k, seed)
+    if pick == "dense":
+        idx = dense_idx(w, k)
+    else:
+        seed = int(np.linalg.norm(w - w.mean(0), axis=1).argmin())
+        idx = fps_idx(w, k, seed)
     return torch.tensor(modes[idx], dtype=torch.float32, device=device)
 
 
@@ -167,7 +185,7 @@ def main(cfg: Config):
                 cand = torch.tensor(grid, device=device)
             else:  # scalable: sample execution-validated modes from the data itself
                 cand = data_cond_candidates(
-                    dataset, cfg.n_cond, device, cfg.cond_whiten
+                    dataset, cfg.n_cond, device, cfg.cond_whiten, cfg.cond_pick
                 )
             policy.cond_candidates = cand
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
