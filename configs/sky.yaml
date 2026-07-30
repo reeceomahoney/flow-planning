@@ -34,19 +34,17 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 11: REPRODUCTION CHECK. Rounds 9-10 were measured against a moved
-  # baseline — July's 0.727 used the HAND GRID for the latch and cap/prog
-  # scoring, while every arm today used data candidates and (in r10) the
-  # path-length constraint score. Arm A is July's exact invocation; it must
-  # return ~0.727 / collision 0.027 before any other guidance number means
-  # anything. B-D then change exactly one thing each against it.
-  J="--cond search --cond_grid=$GRID --selector_cap 0.10 --selector_prog 0.01 --best_of 1 --guidance_margin 0.1 --guidance_scale 0.3"
-  echo "=== A: July exact (expect 0.727, collision 0.027) ==="
-  $E $J --guidance_target xt
-  echo "=== B: + data candidates instead of the grid ==="
-  $E --cond search --n_cond 6 --selector_cap 0.10 --selector_prog 0.01 --best_of 1 \
-     --guidance_margin 0.1 --guidance_scale 0.3 --guidance_target xt
-  echo "=== C: + length term only ==="
-  $E $J --guidance_target xt --guidance_len 0.3
-  echo "=== D: + x1 target only ==="
-  $E $J --guidance_target x1
+  # round 12: divide the labour. Round 11 confirms guidance owns COLLISION
+  # (0.023-0.051 on any menu, vs a selector floor of 0.145 nothing penetrated)
+  # while round 5 showed path-length SELECTION owns timeout (0.133, best of any
+  # data config). They currently fight: cap/prog latching picks an evasive mode
+  # and guidance piles on more. Here selection picks the SHORTEST mode and
+  # leaves clearance entirely to guidance. Note round 11C: length as a guidance
+  # GRADIENT is harmful, so the length pressure must live in selection only.
+  GU="--guidance_margin 0.1 --guidance_scale 0.3 --guidance_target xt"
+  for M in 0.005 0.02 0.04; do
+    echo "=== data, shortest-path latch margin $M + guidance ==="
+    $E --cond search --n_cond 6 --best_of 1 --selector_margin $M $GU
+  done
+  echo "=== same on the hand grid, for the ceiling ==="
+  $E --cond search --cond_grid=$GRID --best_of 1 --selector_margin 0.04 $GU
