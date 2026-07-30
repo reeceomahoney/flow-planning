@@ -34,19 +34,19 @@ run: |
     --n_action_steps 75 --env.obstacle true --env.sample_wall_margin 0.15 \
     --warm_start_t 0.6 --cond search --selector_cap 0.10 --selector_prog 0.01 \
     --best_of 16"
-  # round 9: guidance, retuned with what rounds 5-7 established. July's peak was
-  # 0.727 (collision 0.027 — five times better than any selector floor) but it
-  # stalled at timeout 0.25. Two fixes: margin at the measured saturation point
-  # (0.04, was 0.10 — it was buying clearance that buys nothing) and a path-length
-  # term so the gradient cannot pay for clearance with unbounded detour. Also
-  # guide the predicted CLEAN trajectory with (1-t) scaling, as the source paper
-  # did and the lit calls most robust, instead of the raw noisy x_t.
-  G="--cond search --n_cond 6 --best_of 1 --selector_margin 0.04 --guidance_margin 0.04"
-  echo "=== A: x1 target, no length, scale 0.3 ==="
+  # round 10: margin 0.04 was a category error — for SELECTION it is a filter
+  # threshold (saturates at 0.04); for GUIDANCE it is a push target and must sit
+  # ABOVE the needed clearance so execution drift does not eat it. Round 9 at
+  # 0.04 gave failure 0.40 vs July's 0.027 at margin 0.10. Back to 0.10, keeping
+  # the one change that worked (x1 target beat xt 0.508 vs 0.164 at matched
+  # margin). Arm D is July's exact peak config plus ONLY the length term, which
+  # isolates whether the length term fixes its 0.25 timeout.
+  G="--cond search --n_cond 6 --best_of 1 --selector_margin 0.04 --guidance_margin 0.10"
+  echo "=== A: x1, scale 0.3, no length ==="
   $E $G --guidance_target x1 --guidance_scale 0.3
-  echo "=== B: x1 target, no length, scale 1.0 ==="
-  $E $G --guidance_target x1 --guidance_scale 1.0
-  echo "=== C: x1 target, length 0.3, scale 1.0 ==="
+  echo "=== B: x1, scale 0.3, length 0.3 ==="
+  $E $G --guidance_target x1 --guidance_scale 0.3 --guidance_len 0.3
+  echo "=== C: x1, scale 1.0, length 0.3 ==="
   $E $G --guidance_target x1 --guidance_scale 1.0 --guidance_len 0.3
-  echo "=== D: xt target (old), no length, scale 0.3 — isolates the margin change ==="
-  $E $G --guidance_target xt --guidance_scale 0.3
+  echo "=== D: xt scale 0.3 + length 0.3 — July's peak config, length term only ==="
+  $E $G --guidance_target xt --guidance_scale 0.3 --guidance_len 0.3
