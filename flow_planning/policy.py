@@ -311,21 +311,20 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             x[:, 0, :sd] = state
             x[:, -1, gs : gs + gd] = goal
             v = self.model(x, t, cond)
+            x = x + dt * v
             if self.guidance_fn is not None:  # gradient descent on the collision cost
                 b = 1.0 - (t0 + i * dt)  # optimal-transport path: x1 = x + (1-t)v
-                # cost on the predicted CLEAN trajectory, not the noisy x_t —
-                # guiding an intermediate pushes samples off-manifold
-                tgt = (x + b * v if self.guidance_target == "x1" else x).detach()
+                # "x1": cost on the predicted CLEAN trajectory rather than the
+                # noisy x_t, which is what pushes samples off-manifold
+                x1 = self.guidance_target == "x1"
+                tgt = (x + b * v if x1 else x).detach()
                 g = torch.zeros_like(x)
                 with torch.enable_grad():  # chunk: FK autograd graph is memory-heavy
                     for j in range(0, x.shape[0], 32):
                         xg = tgt[j : j + 32].detach().requires_grad_(True)
                         (gj,) = torch.autograd.grad(self.guidance_fn(xg).sum(), xg)
                         g[j : j + 32] = gj
-                w = self.guidance_scale * (b if self.guidance_target == "x1" else 1.0)
-                x = x + dt * v - w * g
-            else:
-                x = x + dt * v
+                x = x - self.guidance_scale * (b if x1 else 1.0) * g
         return x
 
     @torch.no_grad()
