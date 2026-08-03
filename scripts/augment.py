@@ -34,6 +34,8 @@ class Config:
     dst_repo: str = "reece-omahoney/franka"
     copies: int = 2  # bent copies per episode; the original is always kept
     bend_amp: float = 1.0  # scales the sampled arc, as in the online recorder
+    retime: bool = False  # stretch bent segments so a detour costs TIME not speed
+    retime_carry_only: bool = True  # leave the approach clock alone (grasp precision)
     wrist_lo: float = 0.12  # wrist-carriage height range above the EE
     wrist_hi: float = 0.32
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
@@ -68,6 +70,7 @@ def bend_delta(ee, close, opened, lat, vert, clear=0.1):
         segs.append((0, int(hi1[-1])))  # home -> just above the grasp
     if len(hi2) and len(lifted2):  # lift done -> just above the place
         segs.append((int(lifted2[0]), int(hi2[-1])))
+    used = []
     for s0, s1 in segs:
         if s1 - s0 < 4:
             continue
@@ -79,7 +82,42 @@ def bend_delta(ee, close, opened, lat, vert, clear=0.1):
         prof = np.minimum(1.0, 2.0 * np.sin(np.pi * t))
         arc = lat * latd + vert * up
         d[s0:s1] = np.linalg.norm(chord) * prof[:, None] * arc
-    return d
+        used.append((s0, s1))
+    return d, used
+
+
+def retime_map(n, segs, stretch):
+    """New->old fractional frame indices; total length is EXACTLY round(n*stretch),
+    with the extra frames split across the bent segments in proportion to their
+    length. Only those stretch: a global resampler eats the grasp/place dwell.
+
+    Duration must be a function of the conditioning label ALONE. Deriving it from
+    each episode's own path growth (the obvious choice) gives two episodes with
+    the same bend different durations; that variance is unexplained by cond and
+    the flow averages it into slow-motion plans that never finish -- free space
+    0.910 -> 0.461, every point of it timeout. Even a fixed per-SEGMENT factor
+    leaks, because the segments are 20-30% of frames and that share varies."""
+    total = sum(s1 - s0 for s0, s1 in segs)
+    extra = max(0, int(round(n * stretch)) - n)
+    u, prev, left = [], 0, extra
+    for i, (s0, s1) in enumerate(segs):
+        u.extend(range(prev, s0))
+        seg = s1 - s0
+        add = left if i == len(segs) - 1 else int(round(extra * seg / total))
+        left -= add
+        m = seg + add
+        u.extend(s0 + seg * np.arange(m) / m)
+        prev = s1
+    u.extend(range(prev, n))
+    return np.asarray(u, np.float64)
+
+
+def interp_rows(a, u):
+    """Linear resample of (T, d) at fractional indices u."""
+    lo = np.floor(u).astype(int).clip(0, len(a) - 1)
+    hi = np.minimum(lo + 1, len(a) - 1)
+    w = (u - lo)[:, None]
+    return a[lo] * (1 - w) + a[hi] * w
 
 
 class IKRig:
@@ -181,6 +219,13 @@ def main(cfg: Config):
         write(obs, act, np.array([0.0, 0.0, lift, wz_src]))
         if opened - close < 4:
             continue
+        # segments depend only on the EE height profile, not on lat/vert, so
+        # settle this once: retiming the carry needs a carry to retime, and
+        # an episode silently left unstretched is duration the label does not
+        # explain (4.3% of episodes; keep them as originals only)
+        if cfg.retime and cfg.retime_carry_only:
+            if len(bend_delta(obs[:, EE], close, opened, 1.0, 1.0)[1]) < 2:
+                continue
         act_ee, act_quat, al7 = fk(act[:, :7])
         todo.append(
             dict(
@@ -198,9 +243,12 @@ def main(cfg: Config):
         return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
 
     def targets(grp, wzs, tm):
-        """Bent EE/rot/wrist target stacks (tm, n, .) for the action IK pass."""
+        """Bent EE/rot/wrist target stacks (tm, n, .) for the action IK pass.
+        With retiming each copy has its own length: everything is resampled onto
+        the copy's timebase here, and x["u"] carries it to the gripper and the
+        phase indices so the whole episode stays on one clock."""
         out: dict[str, list] = {"e": [], "q": [], "w": []}
-        for x, d, wz in zip(grp, (x["d"] for x in grp), wzs):
+        for x, wz in zip(grp, wzs):
             carr = x["awz0"].copy()
             z = x["obs"][:, EE.start + 2]
             up = np.nonzero(z[x["close"] :] > z[x["close"]] + 0.1)[0]
@@ -210,10 +258,16 @@ def main(cfg: Config):
             carr[c : c + r] = (
                 carr[c] + (wz - carr[c]) * np.arange(r)[: len(carr) - c] / r
             )
-            e = x["act_ee"] + d
+            e = x["act_ee"] + x["d"]
             w = e.copy()
             w[:, 2] += carr
-            for k, v in zip(out, (e, x["act_quat"], w)):
+            q = x["act_quat"]
+            u = x["u"]
+            if u is not None:
+                e, w = interp_rows(e, u), interp_rows(w, u)
+                q = interp_rows(q, u)
+                q /= np.linalg.norm(q, axis=1, keepdims=True).clip(1e-8)
+            for k, v in zip(out, (e, q, w)):
                 out[k].append(tpad(v, tm))
         e, q, w = (np.stack(out[k], axis=1) for k in out)
         return e, q, w
@@ -257,29 +311,71 @@ def main(cfg: Config):
         rejected = []
         for g in tqdm(range(0, len(pending), rig.W), desc=f"bend (try {attempt})"):
             grp = pending[g : g + rig.W]
-            n, tm = len(grp), max(len(x["obs"]) for x in grp)
+            n = len(grp)
             lats = cfg.bend_amp * rng.uniform(-1.0, 1.0, n)
             verts = cfg.bend_amp * rng.uniform(0.0, 0.8, n)
             wzs = rng.uniform(cfg.wrist_lo, cfg.wrist_hi, n)
             for x, lat, vert, wz in zip(grp, lats, verts, wzs):
-                x["d"] = bend_delta(x["obs"][:, EE], x["close"], x["opened"], lat, vert)
-                x["label"] = np.array([lat, vert, 0.0, wz])
+                d, segs = bend_delta(
+                    x["obs"][:, EE], x["close"], x["opened"], lat, vert
+                )
+                x["d"], x["label"] = d, np.array([lat, vert, 0.0, wz])
+                src_ee = x["act_ee"]  # NOT `base`: fk() closes over that
+                # Stretch only the CARRY segment (post-lift -> above the place).
+                # Both segments still BEND; only the timing of the second moves.
+                # Retiming the approach too cost 0.22 free space, all of it at
+                # the grasp (21% never picked the cube up vs 6%): the same grasp
+                # then appears at varying approach speeds, and multimodal grasp
+                # targets interpolate into misses (cf grasp_symmetry, 0.76->0.96
+                # when removed). The detour that has to dodge an obstacle happens
+                # during the carry anyway.
+                # The carry is ~18% of frames and absorbs the whole stretch,
+                # so 0.18 total gives it ~(1 + |bend|) growth; 0.5 would make
+                # it 3.8x. Episodes without a carry segment are excluded in
+                # pass 1, so total duration stays exact in the label.
+                rt = segs[1:] if cfg.retime_carry_only else segs
+                k = 0.18 if cfg.retime_carry_only else 0.25
+                stretch = 1.0 + k * float(np.hypot(lat, vert))
+                x["u"] = (
+                    retime_map(len(src_ee), rt, stretch) if cfg.retime and rt else None
+                )
+                x["nf"] = len(x["u"]) if x["u"] is not None else len(src_ee)
+                u = x["u"]
+                x["c_n"], x["o_n"] = (
+                    (
+                        int(np.searchsorted(u, x["close"])),
+                        int(np.searchsorted(u, x["opened"])),
+                    )
+                    if u is not None
+                    else (x["close"], x["opened"])
+                )
+                # target EE on the copy's own clock, for the IK tracking gate
+                x["ee_t"] = (
+                    interp_rows(src_ee + d, x["u"])
+                    if x["u"] is not None
+                    else src_ee + d
+                )
+            tm = max(x["nf"] for x in grp)
             aseed = np.stack([x["act"][0, [0, 1, 2, 3, 4, 5, 6, 7, 7]] for x in grp])
             ae, aq, aw = targets(grp, wzs, tm)
             na_j = rig.solve_seq(ae, aq, aw, aseed)
 
             ready = []
             for i, x in enumerate(grp):
-                nf = len(x["obs"])
+                nf = x["nf"]
                 achieved, _, _ = fk(na_j[:nf, i])
-                err = np.linalg.norm(achieved - (x["act_ee"] + x["d"]), axis=1)
+                err = np.linalg.norm(achieved - x["ee_t"], axis=1)
                 jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
                 if err.max() > 0.05 or jerk > 0.6:
                     rejected.append(x)
                     continue
-                na = x["act"].copy()
+                na = (
+                    interp_rows(x["act"], x["u"])
+                    if x["u"] is not None
+                    else x["act"].copy()
+                )
                 na[:, :7] = na_j[:nf, i]
-                x["na"], x["err"] = na, err
+                x["na"], x["err"] = na.astype(np.float32), err
                 ready.append(x)
 
             if not ready:
@@ -291,8 +387,8 @@ def main(cfg: Config):
                     continue
                 nf = len(x["na"])
                 no = obs_seq[:nf, i]
-                held = slice(x["close"], x["opened"])
-                x["label"][2] = no[held, EE][:, 2].max() - no[x["close"], EE.start + 2]
+                held = slice(x["c_n"], x["o_n"])
+                x["label"][2] = no[held, EE][:, 2].max() - no[x["c_n"], EE.start + 2]
                 write(no, x["na"], x["label"])
                 written += 1
                 ee_err.append(x["err"])
