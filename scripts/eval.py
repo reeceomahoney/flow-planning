@@ -40,9 +40,12 @@ class Config:
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
     cond_pick: str = "fps"  # "fps" (spread, hits degenerate extremes) | "dense"
+    cond_support: bool = False  # clip candidates to the recorder's commanded lift/wz
     mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
     selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
     selector_margin: float = 0.0  # >0: shortest path among plans clearing this much
+    selector_obj: str = "path"  # objective under selector_margin: "path"|"speed"
+    selector_radii: bool = False  # clearance to the link MESH, not the centreline
     selector_cap: float = 0.08  # clearance sufficiency cap
     selector_prog: float = 0.03  # progress-term weight
     guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
@@ -87,13 +90,33 @@ def demo_speed_limit(dataset, n_arm: int = 7, q: float = 99.0) -> np.ndarray:
 
 
 def data_cond_candidates(
-    dataset, k: int, device, whiten: bool = True, pick: str = "fps"
+    dataset,
+    k: int,
+    device,
+    whiten: bool = True,
+    pick: str = "fps",
+    support: bool = False,
 ) -> torch.Tensor:
     """K conditioning modes drawn from the dataset's own bend labels via FPS. The
     augmentation only kept labels whose sim-replay succeeded, so the set is
     on-manifold and execution-validated — no hand-tuned grid needed."""
     bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
     modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
+    if support:
+        # FPS maximizes spread, so it lands on the boundary of the label cloud --
+        # and lift is the one dim NOTHING commands: augment.py samples lat/vert/wz
+        # but measures lift post-replay, so its labels tail past anything the
+        # recorder asked for (FPS picked 0.62 vs lift_max 0.5). Conditioning there
+        # extrapolates into unexecutable plans. Clip lift to the unbent episodes'
+        # range; leave the commanded dims alone (clipping wz to the recorder's
+        # {0.12, 0.28} would discard wz=0.32, the best mode measured, 0.754).
+        src = modes[(modes[:, 0] == 0) & (modes[:, 1] == 0), 2]
+        keep = (modes[:, 2] >= src.min()) & (modes[:, 2] <= src.max())
+        print(
+            f"support clip: {keep.sum()}/{len(modes)} modes, "
+            f"lift in {src.min():.3f}-{src.max():.3f}"
+        )
+        modes = modes[keep]
     if len(modes) <= k:
         return torch.tensor(modes, dtype=torch.float32, device=device)
     # whiten: raw dims span 2.0 (lat) vs 0.2 (wz), so FPS ignores wrist height
@@ -164,7 +187,10 @@ def main(cfg: Config):
             speed=cfg.selector_speed,
             vlim=demo_speed_limit(dataset),
             margin=cfg.selector_margin,
+            obj=cfg.selector_obj,
+            radii=cfg.selector_radii,
         )
+        sel.n_worlds = cfg.env.world_count
         if cfg.guidance_scale > 0:  # ablation: guidance instead of best-of-N selection
             policy.guidance_fn = lambda t: sel.guidance_cost(
                 t, cfg.guidance_margin, cfg.guidance_len
@@ -190,7 +216,12 @@ def main(cfg: Config):
                 cand = torch.tensor(grid, device=device)
             else:  # scalable: sample execution-validated modes from the data itself
                 cand = data_cond_candidates(
-                    dataset, cfg.n_cond, device, cfg.cond_whiten, cfg.cond_pick
+                    dataset,
+                    cfg.n_cond,
+                    device,
+                    cfg.cond_whiten,
+                    cfg.cond_pick,
+                    cfg.cond_support,
                 )
             policy.cond_candidates = cand
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
@@ -210,6 +241,8 @@ def main(cfg: Config):
     accels = []  # per-step action accel magnitudes (smoothness proxy)
     stages = getattr(env, "STAGES", None)  # franka pick-place stage ladder
     stage_hist = np.zeros(len(stages) if stages else 0, int)
+    nz = len(stages) if stages else 0
+    stuck_hist = {k: np.zeros(nz, int) for k in ("timeout", "failure")}
     episodes = range(cfg.episodes) if cfg.episodes > 0 else itertools.count()
     for ep in episodes:
         if not viewer.is_running():
@@ -221,6 +254,7 @@ def main(cfg: Config):
         acts = []
         plan_low = np.full(n, np.inf)  # closest interior plan-cube approach to goal
         term_jumps, max_jumps = [], []
+        shifts = []  # warm-start re-anchor offset per replan
         frame = 0
         pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
         while frame < frames and viewer.is_running():
@@ -237,6 +271,8 @@ def main(cfg: Config):
                         torch.cuda.synchronize()
                     plan_t += time.perf_counter() - t0
                     n_plan += 1
+                    if policy.last_shift is not None:
+                        shifts.append(policy.last_shift.cpu().numpy())
                     if arm and policy.last_traj is not None:
                         # hover diagnostics: does the plan descend to the goal
                         # before the clamped final frame, or teleport into it?
@@ -287,6 +323,17 @@ def main(cfg: Config):
             f"failure {fail.mean():.3f} timeout {stuck.mean():.3f} "
             f"accel_p95 {accel_p95:.4f} "
         )
+        if shifts:  # re-anchor advance vs the n_action_steps it should be
+            s = np.stack(shifts)  # (replans, n_worlds)
+            print(
+                f"  re-anchor shift: median {np.median(s):.0f} "
+                f"frac_zero {(s == 0).mean():.2f} of {len(s)} replans"
+            )
+            if n <= 4:
+                print(f"    per-world seq: {s.T.tolist()}")
+        if n <= 16:  # which world is which, for picking one out in the viewer
+            tag = np.where(succ, "succ", np.where(fail, "FAIL", "stuck"))
+            print("  per-world: " + "  ".join(f"{i}:{t}" for i, t in enumerate(tag)))
         if hasattr(env, "contact_labels") and fail.any():  # what hit the wall
             labs = env.contact_labels()[fail]
             uniq, cnt = np.unique(labs, return_counts=True)
@@ -296,6 +343,13 @@ def main(cfg: Config):
         if want_sel and policy.last_traj is not None:  # is the picked plan trackable?
             ov = sel.overspeed(policy.last_traj).cpu().numpy()
             print(f"  overspeed mean {ov.mean():.3f} p90 {np.percentile(ov, 90):.3f}")
+        if want_sel and sel.feas_calls:  # supply or execution?
+            print(
+                f"  plans clearing margin {sel.feas_ok / sel.feas_n:.3f}; "
+                f"mean fraction of WORLDS with no feasible candidate "
+                f"{sel.feas_none / sel.feas_calls:.3f} ({int(sel.feas_calls)} replans)"
+            )
+            sel.feas_n = sel.feas_ok = sel.feas_none = sel.feas_calls = 0.0
         lc = policy.latched_cond
         if searching and lc is not None:  # latent distribution, for diagnosis
             lc = lc.cpu().numpy()
@@ -321,6 +375,14 @@ def main(cfg: Config):
                 "  stage: "
                 + "  ".join(f"{name} {c / n:.2f}" for name, c in zip(stages, counts))
             )
+            for name, m in (("timeout", stuck), ("failure", fail)):
+                if m.any():
+                    c = np.bincount(max_stage[m], minlength=len(stages))
+                    stuck_hist[name] += c
+                    print(
+                        f"  stage|{name} (n={m.sum()}): "
+                        + "  ".join(f"{s} {v / m.sum():.2f}" for s, v in zip(stages, c))
+                    )
 
     if total:
         ac = np.concatenate(accels)
@@ -342,6 +404,12 @@ def main(cfg: Config):
                 f"{name} {c / total:.3f}" for name, c in zip(stages, stage_hist)
             )
         )
+        for k, h in stuck_hist.items():
+            if h.sum():
+                print(
+                    f"overall stage|{k} (n={h.sum()}): "
+                    + "  ".join(f"{s} {v / h.sum():.3f}" for s, v in zip(stages, h))
+                )
     if n_plan:
         print(f"plan latency: {1e3 * plan_t / n_plan:.1f} ms/replan ({n_plan} replans)")
     viewer.close()

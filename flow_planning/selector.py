@@ -10,6 +10,13 @@ from flow_planning.kinematics import build_franka_chain
 # arm frames FK'd for collision; hand carries a few extra offset points so a
 # wrist roll moves the fingertips relative to the wall
 ARM_FRAMES = ["link2", "link3", "link4", "link5", "link6", "link7", "hand"]
+# per-segment collision radius: the spine is a CENTRELINE, so without these a
+# "4cm clearance" plan already has the mesh touching. Non-uniform matters --
+# a uniform radius is just a margin shift (same feasible set, same ranking),
+# but the thick forearm and the thin fingers need opposite standoffs: the arm
+# must clear the wall while the hand reaches a cube sitting right next to it.
+SEGMENT_RADII = [0.06, 0.06, 0.05, 0.05, 0.04, 0.04]  # link2-3 .. link7-hand
+HAND_RADIUS = 0.02
 HAND_OFFSETS = [
     [0.0, 0.0, 0.0],
     [0.0, 0.0, 0.10],
@@ -46,6 +53,13 @@ class FrankaCollision:
         self.hand_off = torch.as_tensor(
             HAND_OFFSETS, dtype=torch.float32, device=device
         )
+        seg = torch.as_tensor(SEGMENT_RADII, dtype=torch.float32, device=device)
+        self.radii = torch.cat(
+            [
+                seg.repeat_interleave(interp + 1),
+                torch.full((len(HAND_OFFSETS),), HAND_RADIUS, device=device),
+            ]
+        )  # (K,), aligned with arm_points
 
     def arm_points(self, q: Tensor) -> Tensor:
         """q (m, 7) arm joints -> (m, K, 3) collision points in the base frame."""
@@ -83,6 +97,8 @@ class AnalyticSelector:
         speed: float = 0.0,  # weight of the overspeed hinge (0 disables)
         vlim=None,  # (n_arm,) per-step joint speed the demos never exceed
         margin: float = 0.0,  # >0: shortest path among plans clearing this much
+        obj: str = "path",  # objective inside the margin constraint: path|speed
+        radii: bool = False,  # subtract per-segment link radii from clearance
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.fc = FrankaCollision(device, base_pos, cube_size)
@@ -99,6 +115,10 @@ class AnalyticSelector:
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
         self.cap, self.prog, self.speed, self.margin = cap, prog, speed, margin
         self.vlim = None if vlim is None else torch.as_tensor(vlim, **f32)
+        self.obj = obj
+        self.rad = self.fc.radii if radii else 0.0  # broadcast scalar when off
+        self.feas_n = self.feas_ok = self.feas_none = self.feas_calls = 0.0
+        self.n_worlds = 1  # set by eval; score() sees worlds and candidates flat
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
@@ -106,9 +126,30 @@ class AnalyticSelector:
         that never approaches the cube/goal at all — hence cap + progress."""
         out = [self.clearance(traj[i : i + 1024]) for i in range(0, len(traj), 1024)]
         clear = torch.cat(out)
-        if self.margin > 0:  # constrained: shortest path among plans that clear
+        if self.margin > 0:
+            # Constrained form: clearance is a requirement, not a thing to
+            # maximize. Unconstrained, capped clearance ties every clearing plan
+            # and `prog` breaks the tie -- and prog rewards covering ground early,
+            # so it picks the FASTEST arc (data-menu plans demand 5.6-9.3x
+            # overspeed vs the grid's 1.8-2.3x, tracking the timeout gap).
             ok = clear >= self.margin
-            return torch.where(ok, self.path_length(traj), 1e3 - clear)
+            # supply vs execution: if NO candidate ever clears, the policy cannot
+            # generate a clearing plan and the fix is in augment.py; if candidates
+            # clear and the arm still hits, the fix is downstream of selection.
+            # Accumulate over replans -- a single call is one snapshot, and the
+            # last one lands after the episode is effectively decided.
+            self.feas_n += ok.numel()
+            self.feas_ok += float(ok.sum())
+            # per WORLD: flat .all() asks whether every candidate in every
+            # world failed, which is never true and reads as a clean 0.000
+            self.feas_none += float(
+                (~ok.view(self.n_worlds, -1)).all(dim=1).float().mean()
+            )
+            self.feas_calls += 1
+            obj = (
+                self.overspeed(traj) if self.obj == "speed" else self.path_length(traj)
+            )
+            return torch.where(ok, obj, 1e3 - clear)
         cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
         prog = (cube - cube[:, -1:]).norm(dim=-1).mean(dim=1)  # mean dist to goal
         s = -clear.clamp(max=self.cap) + self.prog * prog
@@ -143,15 +184,18 @@ class AnalyticSelector:
         s, n = self.joint_start, self.n_arm
         center, half = self.box[:, :3], self.box[:, None, None, 3:]
         cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
-        worst = []
-        for q in (  # joint targets AND predicted joint states must both clear
+        # require both the joint targets and the plan's own predicted states to
+        # clear: the two disagree by the controller's tracking lag
+        sources = (
             traj[..., s : s + n] * self.js + self.jm,
             traj[..., :n] * self.ss + self.sm,
-        ):
+        )
+        worst = []
+        for q in sources:
             b, t = q.shape[:2]
             pts = self.fc.arm_points(q.reshape(-1, n).float()).reshape(b, t, -1, 3)
             d = box_sdf(pts + self.fc.base_pos, center[:, None, None], half)
-            worst.append(d.amin(dim=2))  # (b, t)
+            worst.append((d - self.rad).amin(dim=2))  # (b, t), mesh not centreline
         dc = box_sdf(cube[:, :, None].float(), center[:, None, None], half)
         worst.append(dc.amin(dim=2) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)

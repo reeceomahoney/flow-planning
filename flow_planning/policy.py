@@ -259,6 +259,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.last_chunk = None
         self.last_traj = None
         self.lpf_state = None  # EMA state for the executed-action low-pass
+        self.last_shift = None
         self.latched_cond = None  # per-world bend picked at the first replan
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -369,13 +370,17 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             w = min(2 * na, h - 1)
             d = (last[:, :w, :sd] - cur[:, None]).norm(dim=-1)
             shift = d.argmin(dim=1)  # (n_worlds,)
+            self.last_shift = shift  # diagnostic: 0 every replan == plan rewinds
             idx = (torch.arange(h, device=x.device)[None] + shift[:, None]).clamp(
                 max=h - 1
             )
             prev = last.gather(1, idx[..., None].expand(-1, -1, last.shape[-1]))
             x = (1 - t0) * x + t0 * prev.repeat_interleave(k, dim=0)
 
-        mb = 4096  # micro-batch cap sized for a 24GB card at horizon 600
+        # micro-batch cap for a 24GB card: memory scales with horizon, so hold
+        # plans x horizon constant instead of hard-coding a count (retiming took
+        # the horizon 599 -> 832 and OOM'd a fixed 4096)
+        mb = max(256, int(4096 * 600 / self.config.horizon))
         x = torch.cat(
             [
                 self.flow_integrate(
