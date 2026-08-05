@@ -9,7 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-def make_viewer(name: str, rrd: str = ""):
+def make_viewer(name: str, rrd: str = "", headless: bool = False):
     if rrd:
         import newton._src.viewer.viewer_rerun as vr
 
@@ -18,6 +18,8 @@ def make_viewer(name: str, rrd: str = ""):
     if name == "none":
         return newton.viewer.ViewerNull()
     if name == "opengl":
+        if headless:
+            return newton.viewer.ViewerGL(width=960, height=540, headless=True)
         return newton.viewer.ViewerGL()
     if name == "rerun":
         web_port = 9090

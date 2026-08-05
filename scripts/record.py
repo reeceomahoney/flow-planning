@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 
+import cv2
 import draccus
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -18,7 +19,7 @@ class Config:
     repo_id: str = "reece-omahoney/franka"
     task: str = "Pick up the cube and place it at the target"
     viewer: str = "opengl"  # "none", "rerun", or "opengl"; playback only
-    rrd: str = ""  # record a rerun .rrd to this path (view locally: `rerun <rrd>`)
+    video: str = ""
 
 
 def collect(cfg: Config, env):
@@ -83,22 +84,43 @@ def collect(cfg: Config, env):
         print(f"Pushed {cfg.repo_id} to the hub")
 
 
-@draccus.wrap()
-def main(cfg: Config):
-    if cfg.record:
-        env = make_env(cfg.env, make_viewer("none"))
-        collect(cfg, env)
-        return
-
-    viewer = make_viewer(cfg.viewer, cfg.rrd)
-    env = make_env(cfg.env, viewer)
+def play(cfg: Config, env, viewer):
+    writer = None
     done = 0
+    pbar = tqdm(total=cfg.episodes, desc="Playing episodes")
     while viewer.is_running() and done < cfg.episodes:
         if viewer.should_step():
             new_episode, _ = env.step()
             done += int(new_episode)
+            pbar.update(int(new_episode))
         env.render()
+        if cfg.video:
+            frame = viewer.get_frame().numpy()
+            if writer is None:
+                writer = cv2.VideoWriter(
+                    cfg.video,
+                    cv2.VideoWriter.fourcc(*"mp4v"),
+                    cfg.env.fps,
+                    (frame.shape[1], frame.shape[0]),
+                )
+            writer.write(frame[..., ::-1])
+    pbar.close()
+    if writer is not None:
+        writer.release()
+        print(f"Saved video to {cfg.video}")
     viewer.close()
+
+
+@draccus.wrap()
+def main(cfg: Config):
+    if cfg.record:
+        collect(cfg, make_env(cfg.env, make_viewer("none")))
+        return
+
+    viewer = make_viewer(
+        "opengl" if cfg.video else cfg.viewer, headless=bool(cfg.video)
+    )
+    play(cfg, make_env(cfg.env, viewer), viewer)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ libc = "2.31"
 
 [tool.pixi.pypi-dependencies]
 flow_planning = { path = ".", editable = true }
-lerobot = ">=0.5.1"
+lerobot = { version = ">=0.6.1, <0.7", extras = ["dataset"] }
 newton = { version = "*", extras = ["examples"] }
 pre-commit = ">=4.6.0"
 pytorch-volumetric = ">=0.6.0"
