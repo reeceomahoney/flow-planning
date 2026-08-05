@@ -5,38 +5,45 @@ description = "Flow Planning Project"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 
-dependencies = [
-  "lerobot>=0.5.1",
-  "newton[examples]",
-  "pre-commit>=4.6.0",
-  "pytorch-volumetric>=0.6.0",
-  "rerun-sdk>=0.26.2",
-  "scipy>=1.17",
-  "skypilot[kubernetes]>=0.12.3.post1",
-  "slurm-tools",
-  "torch>=2.11.0",
-  "torchcodec>=0.12",
-  "ty>=0.0.46",
-  "wandb>=0.24.2",
-]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-override-dependencies = ["torchcodec>=0.12", "torch>=2.11.0", "torchvision>=0.27"]
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
 
-[tool.uv.sources]
-torch = [{ index = "pytorch-cu126" }]
-torchcodec = [{ index = "pytorch-cu126" }]
-torchvision = [{ index = "pytorch-cu126" }]
+[tool.pixi.system-requirements]
+libc = "2.31"
+
+[tool.pixi.pypi-dependencies]
+flow_planning = { path = ".", editable = true }
+lerobot = ">=0.5.1"
+newton = { version = "*", extras = ["examples"] }
+pre-commit = ">=4.6.0"
+pytorch-volumetric = ">=0.6.0"
+rerun-sdk = ">=0.26.2"
+scipy = ">=1.17"
+skypilot = { version = ">=0.12.3.post1", extras = ["kubernetes"] }
 slurm-tools = { git = "https://github.com/reeceomahoney/slurm-tools.git" }
+torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu126" }
+ty = ">=0.0.46"
+wandb = ">=0.24.2"
 
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
+[tool.pixi.pypi-options.dependency-overrides]
+torch = { version = ">=2.11.0", index = "https://download.pytorch.org/whl/cu126" }
+torchvision = { version = ">=0.27", index = "https://download.pytorch.org/whl/cu126" }
+torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu126" }
+
+[tool.pixi.tasks.launch]
+args = [{ "arg" = "cluster_id", "default" = "" }]
+cmd = """
+{%- if cluster_id -%}
+sky exec {{ cluster_id }} configs/sky.yaml --env HF_TOKEN --env WANDB_API_KEY
+{%- else -%}
+sky launch configs/sky.yaml -c flow -y --env HF_TOKEN --env WANDB_API_KEY
+{%- endif -%}
+"""
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

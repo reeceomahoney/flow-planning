@@ -19,6 +19,6 @@ repos:
     hooks:
       - id: ty
         name: ty
-        entry: uv run ty check
+        entry: pixi run ty check
         language: system
         types: [python]

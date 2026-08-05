@@ -18,7 +18,7 @@ def test_pick_plan_batches_worlds_independently():
     assert pick_plan(s, ns=3, reduce="median").tolist() == [3, 0]
 
 
-if __name__ == "__main__":  # no pytest in this env: `uv run python tests/...`
+if __name__ == "__main__":  # no pytest in this env: `pixi run python tests/...`
     test_pick_plan_reductions()
     test_pick_plan_batches_worlds_independently()
     print("ok")
