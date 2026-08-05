@@ -40,7 +40,6 @@ class Config:
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
     cond_pick: str = "fps"  # "fps" (spread, hits degenerate extremes) | "dense"
-    cond_support: bool = False  # clip candidates to the recorder's commanded lift
     mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
     selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
     selector_margin: float = 0.0  # >0: shortest path among plans clearing this much
@@ -95,30 +94,15 @@ def data_cond_candidates(
     device,
     whiten: bool = True,
     pick: str = "fps",
-    support: bool = False,
 ) -> torch.Tensor:
     """K conditioning modes drawn from the dataset's own bend labels via FPS. The
     augmentation only kept labels whose sim-replay succeeded, so the set is
     on-manifold and execution-validated — no hand-tuned grid needed."""
     bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
     modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
-    if support:
-        # FPS maximizes spread, so it lands on the boundary of the label cloud --
-        # and lift is the one dim NOTHING commands: augment.py samples lat/vert
-        # but measures lift post-replay, so its labels tail past anything the
-        # recorder asked for (FPS picked 0.62 vs a fixed 0.25). Conditioning there
-        # extrapolates into unexecutable plans. Clip lift to the unbent episodes'
-        # range; leave the commanded dims alone.
-        src = modes[(modes[:, 0] == 0) & (modes[:, 1] == 0), 2]
-        keep = (modes[:, 2] >= src.min()) & (modes[:, 2] <= src.max())
-        print(
-            f"support clip: {keep.sum()}/{len(modes)} modes, "
-            f"lift in {src.min():.3f}-{src.max():.3f}"
-        )
-        modes = modes[keep]
     if len(modes) <= k:
         return torch.tensor(modes, dtype=torch.float32, device=device)
-    # whiten: raw dims span 2.0 (lat) vs 0.4 (lift), so FPS ignores the short dims
+    # whiten: raw dims span 2.0 (lat) vs 0.8 (vert), so FPS ignores the short dim
     w = modes / (modes.std(0) + 1e-6) if whiten else modes
     if pick == "dense":
         idx = dense_idx(w, k)
@@ -215,12 +199,7 @@ def main(cfg: Config):
                 cand = torch.tensor(grid, device=device)
             else:  # scalable: sample execution-validated modes from the data itself
                 cand = data_cond_candidates(
-                    dataset,
-                    cfg.n_cond,
-                    device,
-                    cfg.cond_whiten,
-                    cfg.cond_pick,
-                    cfg.cond_support,
+                    dataset, cfg.n_cond, device, cfg.cond_whiten, cfg.cond_pick
                 )
             policy.cond_candidates = cand
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")

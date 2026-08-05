@@ -398,15 +398,9 @@ class FrankaEnv:
 
         # policy conditioning = every per-episode latent of the demo generator:
         # unexplained latents smear the flow's plans into slow-motion averages.
-        # layout [lat, vert, lift]: bend dims are 0 in source demos and
-        # filled in by the offline augmentation (scripts/augment.py)
-        self.episode_cond = np.concatenate(
-            [
-                np.zeros((n, 2), np.float32),
-                np.full((n, 1), self.cfg.lift_height, np.float32),
-            ],
-            axis=1,
-        )
+        # layout [lat, vert]: 0 in source demos, filled in by the offline
+        # augmentation (scripts/augment.py)
+        self.episode_cond = np.zeros((n, 2), np.float32)
 
         jq = np.zeros((n, self.coords_per_world), np.float32)
         jq[:, :9] = HOME_Q

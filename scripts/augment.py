@@ -183,7 +183,7 @@ def main(cfg: Config):
             "names": None,
         },
         "action": {"dtype": "float32", "shape": act_all.shape[1:], "names": None},
-        "bend": {"dtype": "float32", "shape": (3,), "names": None},
+        "bend": {"dtype": "float32", "shape": (2,), "names": None},
     }
     dst = LeRobotDataset.create(
         repo_id=cfg.dst_repo, fps=src.fps, features=features, use_videos=False
@@ -201,15 +201,13 @@ def main(cfg: Config):
             )
         dst.save_episode()
 
-    # pass 1: write originals (measured lift label), FK-cache bendable episodes
+    # pass 1: write originals, FK-cache bendable episodes
     todo: list[dict[str, Any]] = []
     for e in tqdm(range(src.num_episodes), desc="originals"):
         sel = epi == e
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
-        held = slice(close, opened)
-        lift = float(obs[held, EE][:, 2].max() - obs[close, EE.start + 2])
-        write(obs, act, np.array([0.0, 0.0, lift]))
+        write(obs, act, np.zeros(2))
         if opened - close < 4:
             continue
         # segments depend only on the EE height profile, not on lat/vert, so
@@ -237,8 +235,8 @@ def main(cfg: Config):
     def targets(grp, tm):
         """Bent EE/rot target stacks (tm, n, .) for the action IK pass.
         With retiming each copy has its own length: everything is resampled onto
-        the copy's timebase here, and x["u"] carries it to the gripper and the
-        phase indices so the whole episode stays on one clock."""
+        the copy's timebase here, and x["u"] carries it to the gripper so the
+        whole episode stays on one clock."""
         out: dict[str, list] = {"e": [], "q": []}
         for x in grp:
             e = x["act_ee"] + x["d"]
@@ -298,7 +296,7 @@ def main(cfg: Config):
                 d, segs = bend_delta(
                     x["obs"][:, EE], x["close"], x["opened"], lat, vert
                 )
-                x["d"], x["label"] = d, np.array([lat, vert, 0.0])
+                x["d"], x["label"] = d, np.array([lat, vert])
                 src_ee = x["act_ee"]  # NOT `base`: fk() closes over that
                 # Stretch only the CARRY segment (post-lift -> above the place).
                 # Both segments still BEND; only the timing of the second moves.
@@ -319,15 +317,6 @@ def main(cfg: Config):
                     retime_map(len(src_ee), rt, stretch) if cfg.retime and rt else None
                 )
                 x["nf"] = len(x["u"]) if x["u"] is not None else len(src_ee)
-                u = x["u"]
-                x["c_n"], x["o_n"] = (
-                    (
-                        int(np.searchsorted(u, x["close"])),
-                        int(np.searchsorted(u, x["opened"])),
-                    )
-                    if u is not None
-                    else (x["close"], x["opened"])
-                )
                 # target EE on the copy's own clock, for the IK tracking gate
                 x["ee_t"] = (
                     interp_rows(src_ee + d, x["u"])
@@ -365,10 +354,7 @@ def main(cfg: Config):
                     rejected.append(x)
                     continue
                 nf = len(x["na"])
-                no = obs_seq[:nf, i]
-                held = slice(x["c_n"], x["o_n"])
-                x["label"][2] = no[held, EE][:, 2].max() - no[x["c_n"], EE.start + 2]
-                write(no, x["na"], x["label"])
+                write(obs_seq[:nf, i], x["na"], x["label"])
                 written += 1
                 ee_err.append(x["err"])
         pending = rejected
