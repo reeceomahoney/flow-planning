@@ -40,7 +40,7 @@ class Config:
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
     cond_pick: str = "fps"  # "fps" (spread, hits degenerate extremes) | "dense"
-    cond_support: bool = False  # clip candidates to the recorder's commanded lift/wz
+    cond_support: bool = False  # clip candidates to the recorder's commanded lift
     mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
     selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
     selector_margin: float = 0.0  # >0: shortest path among plans clearing this much
@@ -104,12 +104,11 @@ def data_cond_candidates(
     modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
     if support:
         # FPS maximizes spread, so it lands on the boundary of the label cloud --
-        # and lift is the one dim NOTHING commands: augment.py samples lat/vert/wz
+        # and lift is the one dim NOTHING commands: augment.py samples lat/vert
         # but measures lift post-replay, so its labels tail past anything the
         # recorder asked for (FPS picked 0.62 vs lift_max 0.5). Conditioning there
         # extrapolates into unexecutable plans. Clip lift to the unbent episodes'
-        # range; leave the commanded dims alone (clipping wz to the recorder's
-        # {0.12, 0.28} would discard wz=0.32, the best mode measured, 0.754).
+        # range; leave the commanded dims alone.
         src = modes[(modes[:, 0] == 0) & (modes[:, 1] == 0), 2]
         keep = (modes[:, 2] >= src.min()) & (modes[:, 2] <= src.max())
         print(
@@ -119,7 +118,7 @@ def data_cond_candidates(
         modes = modes[keep]
     if len(modes) <= k:
         return torch.tensor(modes, dtype=torch.float32, device=device)
-    # whiten: raw dims span 2.0 (lat) vs 0.2 (wz), so FPS ignores wrist height
+    # whiten: raw dims span 2.0 (lat) vs 0.4 (lift), so FPS ignores the short dims
     w = modes / (modes.std(0) + 1e-6) if whiten else modes
     if pick == "dense":
         idx = dense_idx(w, k)

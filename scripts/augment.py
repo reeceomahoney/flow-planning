@@ -1,7 +1,7 @@
 """Offline detour augmentation of a recorded dataset (teleop-compatible).
 
 Bends the transit segments of each episode in EE space (continuous lateral/
-vertical arcs + wrist-carriage posture) and re-IKs to joint actions; only the
+vertical arcs) and re-IKs to joint actions; only the
 gripper signal segments the episode, so the action-side augmentation applies
 to any pre-existing demo dataset. States come from REPLAYING the bent actions
 in sim: IK-synthesized states are kinematically right but dynamically sterile
@@ -36,8 +36,6 @@ class Config:
     bend_amp: float = 1.0  # scales the sampled arc, as in the online recorder
     retime: bool = False  # stretch bent segments so a detour costs TIME not speed
     retime_carry_only: bool = True  # leave the approach clock alone (grasp precision)
-    wrist_lo: float = 0.12  # wrist-carriage height range above the EE
-    wrist_hi: float = 0.32
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
     env: FrankaConfig = field(default_factory=FrankaConfig)  # IK rig only
@@ -136,7 +134,7 @@ class IKRig:
         p[: len(a)] = a
         return np.ascontiguousarray(p, np.float32)
 
-    def solve_seq(self, ee_t, quat_t, wrist_t, seed0):
+    def solve_seq(self, ee_t, quat_t, seed0):
         """(T, B, 3/4) target sequences + (B, 9) initial joints -> (T, B, 7)."""
         env = self.env
         T, B = ee_t.shape[:2]
@@ -149,7 +147,6 @@ class IKRig:
             env.rot_obj.set_target_rotations(
                 wp.array(self.pad(quat_t[t]), dtype=wp.vec4)
             )
-            wp.copy(env.wrist_target, wp.array(self.pad(wrist_t[t]), dtype=wp.vec3))
             env.ik_solver.step(env.joint_q_ik, env.joint_q_ik, iterations=self.iters)
             out[t] = env.joint_q_ik.numpy()[:B, :7]
         return out
@@ -163,24 +160,21 @@ def main(cfg: Config):
     rig = IKRig(env, cfg.ik_iters)
     base = np.asarray(env.robot_base_pos, np.float32)
     chain, njoints, _ = build_franka_chain(device)
-    link7 = next(n for n in chain.get_frame_names() if "link7" in n and "tcp" not in n)
 
-    def fk(q):  # (T, 7) joints -> world EE pos, quat xyzw, link7 z
+    def fk(q):  # (T, 7) joints -> world EE pos, quat xyzw
         th = torch.as_tensor(q, dtype=torch.float32, device=device)
         th = torch.cat([th, th.new_zeros(len(th), njoints - 7)], dim=1)
         tf = chain.forward_kinematics(th)
         m = tf[EE_FRAME].get_matrix()
         pos = m[:, :3, 3].cpu().numpy() + base
         quat = matrix_to_quaternion(m[:, :3, :3])[:, [1, 2, 3, 0]].cpu().numpy()
-        wz = tf[link7].get_matrix()[:, 2, 3].cpu().numpy() + base[2]
-        return pos, quat, wz
+        return pos, quat
 
     src = LeRobotDataset(cfg.src_repo)
     hf = src.hf_dataset.with_format("numpy")
     epi = np.asarray(hf["episode_index"])
     obs_all = np.asarray(hf["observation.state"])
     act_all = np.asarray(hf["action"])
-    src_bend = np.asarray(hf["bend"]) if "bend" in src.meta.features else None
 
     features = {
         "observation.state": {
@@ -189,7 +183,7 @@ def main(cfg: Config):
             "names": None,
         },
         "action": {"dtype": "float32", "shape": act_all.shape[1:], "names": None},
-        "bend": {"dtype": "float32", "shape": (4,), "names": None},
+        "bend": {"dtype": "float32", "shape": (3,), "names": None},
     }
     dst = LeRobotDataset.create(
         repo_id=cfg.dst_repo, fps=src.fps, features=features, use_videos=False
@@ -215,8 +209,7 @@ def main(cfg: Config):
         close, opened = transit_segments(act[:, 7])
         held = slice(close, opened)
         lift = float(obs[held, EE][:, 2].max() - obs[close, EE.start + 2])
-        wz_src = float(src_bend[sel][0, 3]) if src_bend is not None else 0.18
-        write(obs, act, np.array([0.0, 0.0, lift, wz_src]))
+        write(obs, act, np.array([0.0, 0.0, lift]))
         if opened - close < 4:
             continue
         # segments depend only on the EE height profile, not on lat/vert, so
@@ -226,7 +219,7 @@ def main(cfg: Config):
         if cfg.retime and cfg.retime_carry_only:
             if len(bend_delta(obs[:, EE], close, opened, 1.0, 1.0)[1]) < 2:
                 continue
-        act_ee, act_quat, al7 = fk(act[:, :7])
+        act_ee, act_quat = fk(act[:, :7])
         todo.append(
             dict(
                 obs=obs,
@@ -235,42 +228,29 @@ def main(cfg: Config):
                 opened=opened,
                 act_ee=act_ee,
                 act_quat=act_quat,
-                awz0=al7 - act_ee[:, 2],
             )
         )
 
     def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
         return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
 
-    def targets(grp, wzs, tm):
-        """Bent EE/rot/wrist target stacks (tm, n, .) for the action IK pass.
+    def targets(grp, tm):
+        """Bent EE/rot target stacks (tm, n, .) for the action IK pass.
         With retiming each copy has its own length: everything is resampled onto
         the copy's timebase here, and x["u"] carries it to the gripper and the
         phase indices so the whole episode stays on one clock."""
-        out: dict[str, list] = {"e": [], "q": [], "w": []}
-        for x, wz in zip(grp, wzs):
-            carr = x["awz0"].copy()
-            z = x["obs"][:, EE.start + 2]
-            up = np.nonzero(z[x["close"] :] > z[x["close"]] + 0.1)[0]
-            c = x["close"] + (int(up[0]) if len(up) else 0)  # lift done
-            r = 25  # original posture until the lift completes, then ramp in
-            carr[c + r :] = wz
-            carr[c : c + r] = (
-                carr[c] + (wz - carr[c]) * np.arange(r)[: len(carr) - c] / r
-            )
+        out: dict[str, list] = {"e": [], "q": []}
+        for x in grp:
             e = x["act_ee"] + x["d"]
-            w = e.copy()
-            w[:, 2] += carr
             q = x["act_quat"]
             u = x["u"]
             if u is not None:
-                e, w = interp_rows(e, u), interp_rows(w, u)
+                e = interp_rows(e, u)
                 q = interp_rows(q, u)
                 q /= np.linalg.norm(q, axis=1, keepdims=True).clip(1e-8)
-            for k, v in zip(out, (e, q, w)):
+            for k, v in zip(out, (e, q)):
                 out[k].append(tpad(v, tm))
-        e, q, w = (np.stack(out[k], axis=1) for k in out)
-        return e, q, w
+        return tuple(np.stack(out[k], axis=1) for k in out)
 
     def replay(grp):
         """Execute each copy's actions open-loop from its episode's initial
@@ -314,12 +294,11 @@ def main(cfg: Config):
             n = len(grp)
             lats = cfg.bend_amp * rng.uniform(-1.0, 1.0, n)
             verts = cfg.bend_amp * rng.uniform(0.0, 0.8, n)
-            wzs = rng.uniform(cfg.wrist_lo, cfg.wrist_hi, n)
-            for x, lat, vert, wz in zip(grp, lats, verts, wzs):
+            for x, lat, vert in zip(grp, lats, verts):
                 d, segs = bend_delta(
                     x["obs"][:, EE], x["close"], x["opened"], lat, vert
                 )
-                x["d"], x["label"] = d, np.array([lat, vert, 0.0, wz])
+                x["d"], x["label"] = d, np.array([lat, vert, 0.0])
                 src_ee = x["act_ee"]  # NOT `base`: fk() closes over that
                 # Stretch only the CARRY segment (post-lift -> above the place).
                 # Both segments still BEND; only the timing of the second moves.
@@ -357,13 +336,13 @@ def main(cfg: Config):
                 )
             tm = max(x["nf"] for x in grp)
             aseed = np.stack([x["act"][0, [0, 1, 2, 3, 4, 5, 6, 7, 7]] for x in grp])
-            ae, aq, aw = targets(grp, wzs, tm)
-            na_j = rig.solve_seq(ae, aq, aw, aseed)
+            ae, aq = targets(grp, tm)
+            na_j = rig.solve_seq(ae, aq, aseed)
 
             ready = []
             for i, x in enumerate(grp):
                 nf = x["nf"]
-                achieved, _, _ = fk(na_j[:nf, i])
+                achieved, _ = fk(na_j[:nf, i])
                 err = np.linalg.norm(achieved - x["ee_t"], axis=1)
                 jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
                 if err.max() > 0.05 or jerk > 0.6:
