@@ -57,8 +57,7 @@ class FrankaConfig(EnvConfig):
     table_height: float = 0.1
     jitter: float = 0.1  # +/- xy range for cube/goal sampling
     success_dist: float = 0.05  # cube-to-goal distance for success (m)
-    lift_min: float = 0.1
-    lift_max: float = 0.5
+    lift_height: float = 0.25
 
     # barrier bisecting cube start and goal
     obstacle_height: float = 0.2
@@ -79,7 +78,7 @@ def set_target_pose_kernel(
     t: float,
     drop_off_pos: wp.array(dtype=wp.vec3),
     off_approach: wp.vec3,
-    off_lift: wp.array(dtype=wp.vec3),
+    off_lift: wp.vec3,
     off_retract: wp.vec3,
     task_init_body_q: wp.array(dtype=wp.transform),
     body_q: wp.array(dtype=wp.transform),
@@ -118,11 +117,11 @@ def set_target_pose_kernel(
         ee_quat_target = ee_quat_prev
         t_gripper = t
     elif task == TaskType.LIFT.value:
-        ee_pos_target = ee_pos_prev + off_lift[tid]
+        ee_pos_target = ee_pos_prev + off_lift
         ee_quat_target = ee_quat_prev
         t_gripper = 1.0
     elif task == TaskType.MOVE_TO_DROP_OFF.value:
-        ee_pos_target = drop + off_approach
+        ee_pos_target = wp.vec3(drop[0], drop[1], ee_pos_prev[2])
         ee_quat_target = ee_quat_place
         t_gripper = 1.0
     elif task == TaskType.REFINE_DROP_OFF.value:
@@ -164,7 +163,7 @@ class FrankaEnv:
         top = wp.vec3(0.0, -0.5, h)
         self.robot_base_pos = wp.vec3(top[0] - 0.5, top[1], top[2])
         self.off_approach = wp.vec3(0.0, 0.0, 1.0 * self.cube_size)
-        self.off_lift = wp.zeros(cfg.world_count, dtype=wp.vec3)  # per-world, see reset
+        self.off_lift = wp.vec3(0.0, 0.0, cfg.lift_height)
         self.off_retract = wp.vec3(0.0, 0.0, 2.0 * self.cube_size)
         cube_z = top[2] + 0.5 * self.cube_size
         self.cube_center = np.array([top[0], top[1] + 0.15, cube_z], np.float32)
@@ -391,11 +390,6 @@ class FrankaEnv:
         self.cube_start_z = cube_start[:, 2].copy()  # for the lift/grasp stage check
         self.goal_pos = self.sample(self.goal_center)
 
-        # random per-world lift height
-        lift = np.zeros((n, 3), np.float32)
-        lift[:, 2] = self.rng.uniform(self.cfg.lift_min, self.cfg.lift_max, n)
-        wp.copy(self.off_lift, wp.array(lift, dtype=wp.vec3))
-
         # random cube yaw (xyzw quaternion)
         theta = self.rng.uniform(-0.9 * np.pi, 0.9 * np.pi, n)
         quat = np.zeros((n, 4), np.float32)
@@ -407,7 +401,11 @@ class FrankaEnv:
         # layout [lat, vert, lift]: bend dims are 0 in source demos and
         # filled in by the offline augmentation (scripts/augment.py)
         self.episode_cond = np.concatenate(
-            [np.zeros((n, 2), np.float32), lift[:, 2:3]], axis=1
+            [
+                np.zeros((n, 2), np.float32),
+                np.full((n, 1), self.cfg.lift_height, np.float32),
+            ],
+            axis=1,
         )
 
         jq = np.zeros((n, self.coords_per_world), np.float32)

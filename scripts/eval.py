@@ -106,7 +106,7 @@ def data_cond_candidates(
         # FPS maximizes spread, so it lands on the boundary of the label cloud --
         # and lift is the one dim NOTHING commands: augment.py samples lat/vert
         # but measures lift post-replay, so its labels tail past anything the
-        # recorder asked for (FPS picked 0.62 vs lift_max 0.5). Conditioning there
+        # recorder asked for (FPS picked 0.62 vs a fixed 0.25). Conditioning there
         # extrapolates into unexecutable plans. Clip lift to the unbent episodes'
         # range; leave the commanded dims alone.
         src = modes[(modes[:, 0] == 0) & (modes[:, 1] == 0), 2]
