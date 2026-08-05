@@ -1,4 +1,0 @@
-# particle-tuned settings; use with `--config_path configs/particle.yaml`
-repo_id: reece-omahoney/particle
-env:
-  type: particle

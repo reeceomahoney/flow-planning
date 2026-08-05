@@ -1,4 +1,0 @@
-# franka settings; use with `--config_path configs/franka.yaml`
-repo_id: reece-omahoney/franka
-env:
-  type: franka
