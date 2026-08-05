@@ -19,6 +19,9 @@ def make_viewer(name: str, rrd: str = "", headless: bool = False):
         return newton.viewer.ViewerNull()
     if name == "opengl":
         if headless:
+            import pyglet
+
+            pyglet.options["headless"] = True
             return newton.viewer.ViewerGL(width=960, height=540, headless=True)
         return newton.viewer.ViewerGL()
     if name == "rerun":

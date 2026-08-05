@@ -24,3 +24,4 @@ outputs/
 .envrc
 wandb/
 .pixi/
+.mp4

@@ -223,9 +223,12 @@ class FrankaEnv:
             self.viewer.set_world_offsets(wp.vec3(1.5, 1.5, 0.0))
         if hasattr(self.viewer, "picking_enabled"):
             self.viewer.picking_enabled = False
-        self.viewer.set_camera(pos=wp.vec3(2.0, -2.5, 2.0), pitch=-25.0, yaw=50.0)
+        focus = top + wp.vec3(0.0, 0.0, 0.3)
+        self.viewer.set_camera(
+            pos=focus + wp.vec3(1.0, -1.0, 0.8), pitch=-25.0, yaw=50.0
+        )
         if hasattr(self.viewer, "camera"):
-            self.viewer.camera.look_at(self.robot_base_pos)
+            self.viewer.camera.look_at(focus)
 
         self.episode_frames = self.num_tasks * round(cfg.task_time * cfg.fps)
         self.reset()

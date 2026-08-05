@@ -11,9 +11,9 @@ import newton.viewer
 import numpy as np
 import torch
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.feature_utils import dataset_to_policy_features
 
 import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
@@ -148,6 +148,7 @@ def main(cfg: Config):
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
+    assert dataset.meta.episodes is not None
     policy_cfg.horizon = max(dataset.meta.episodes["length"])
     stats = dataset.meta.stats
     assert stats is not None
