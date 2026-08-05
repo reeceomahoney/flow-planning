@@ -16,6 +16,7 @@ platforms = [{ platform = "linux-64", glibc = "2.31" }]
 [tool.pixi.dependencies]
 libegl = "*"
 libgl = "*"
+ffmpeg = ">=8.1.2,<9"
 
 [tool.pixi.pypi-dependencies]
 flow_planning = { path = ".", editable = true }

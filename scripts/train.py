@@ -29,7 +29,7 @@ from flow_planning.utils import make_run_dir
 @dataclass
 class Config:
     env: EnvConfig = field(default_factory=FrankaConfig)
-    repo_id: str = "reece-omahoney/particle"
+    repo_id: str = "reece-omahoney/franka"
     batch_size: int = 256
     num_iters: int = 50_000
     warmup_iters: int = 500

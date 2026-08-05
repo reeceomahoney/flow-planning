@@ -23,5 +23,5 @@ imgui.ini
 outputs/
 .envrc
 wandb/
-.pixi/
+.pixi/*
 *.mp4
