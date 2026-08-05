@@ -17,6 +17,10 @@ setup: |
   cd ~/sky_workdir && pixi install
 
 run: |
+  set -e
   export PATH="$HOME/.pixi/bin:$PATH"
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
-  pixi run python scripts/record.py --record False --episodes 1 --env.type franka --env.world_count 1 --video out.mp4
+
+  rm -rf ~/.cache/huggingface/lerobot/reece-omahoney/franka
+  pixi run python scripts/record.py --env.type franka --env.world_count 256 --env.task_time 1.5 --episodes 768
+  pixi run python scripts/train.py --num_iters 75000 --env.type franka --env.task_time 1.5
