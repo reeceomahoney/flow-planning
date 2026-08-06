@@ -80,6 +80,67 @@ def bend_delta(ee, close, opened, lat, vert, clear=0.1):
     return d
 
 
+def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
+    njoints = len(chain.get_joint_parameter_names())
+    th = torch.as_tensor(q, dtype=torch.float32, device=chain.device)
+    th = torch.cat([th, th.new_zeros(len(th), njoints - 7)], dim=1)
+    m = chain.forward_kinematics(th)[EE_FRAME].get_matrix()
+    pos = m[:, :3, 3].cpu().numpy() + base
+    quat = matrix_to_quaternion(m[:, :3, :3])[:, [1, 2, 3, 0]].cpu().numpy()
+    return pos, quat
+
+
+def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
+    return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
+
+
+def targets(grp, tm):
+    """Bent EE/rot target stacks (tm, n, .) for the action IK pass."""
+    e = np.stack([tpad(x["ee_t"], tm) for x in grp], axis=1)
+    q = np.stack([tpad(x["act_quat"], tm) for x in grp], axis=1)
+    return e, q
+
+
+def write(dst, obs, act, bend):
+    for f in range(len(obs)):
+        dst.add_frame(
+            {
+                "observation.state": obs[f],
+                "action": act[f],
+                "bend": bend.astype(np.float32),
+                "task": "pick_place",
+            }
+        )
+    dst.save_episode()
+
+
+def replay(env, rig, grp):
+    """Execute each copy's actions open-loop from its episode's initial
+    conditions; real dynamics produce the states (and a success filter)."""
+    n = env.cfg.world_count
+    tm = max(len(x["na"]) for x in grp)
+    acts = rig.pad(np.stack([tpad(x["na"], tm) for x in grp]))
+    jq = np.zeros((n, env.coords_per_world), np.float32)
+    o0 = rig.pad(np.stack([x["obs"][0] for x in grp]))
+    jq[:, :9] = o0[:, :9]
+    jq[:, 9:12] = o0[:, 18:21]
+    yaw = np.arctan2(o0[:, 21], o0[:, 22])
+    jq[:, 14] = np.sin(yaw / 2)
+    jq[:, 15] = np.cos(yaw / 2)
+    env.reset()
+    env.goal_pos = o0[:, 23:26]
+    env.cube_pos_prev = o0[:, 18:21].copy()
+    env.cube_start_z = o0[:, 20].copy()
+    wp.copy(env.state_0.joint_q, wp.array(jq.flatten(), dtype=wp.float32))
+    env.state_0.joint_qd.zero_()
+    newton.eval_fk(env.model, env.state_0.joint_q, env.state_0.joint_qd, env.state_0)
+    obs_seq = np.empty((tm, n, o0.shape[1]), np.float32)
+    for t in range(tm):
+        env.apply_action(acts[:, t])
+        obs_seq[t] = env.get_obs()
+    return obs_seq, env.success()
+
+
 class IKRig:
     """Re-IK through the env's solver, batched over episodes and SEQUENTIAL over
     frames: each frame warm-starts from the previous frame's solution, exactly
@@ -121,16 +182,7 @@ def main(cfg: Config):
     env = make_env(cfg.env, ViewerNull())
     rig = IKRig(env, cfg.ik_iters)
     base = np.asarray(env.robot_base_pos, np.float32)
-    chain, njoints, _ = build_franka_chain(device)
-
-    def fk(q):  # (T, 7) joints -> world EE pos, quat xyzw
-        th = torch.as_tensor(q, dtype=torch.float32, device=device)
-        th = torch.cat([th, th.new_zeros(len(th), njoints - 7)], dim=1)
-        tf = chain.forward_kinematics(th)
-        m = tf[EE_FRAME].get_matrix()
-        pos = m[:, :3, 3].cpu().numpy() + base
-        quat = matrix_to_quaternion(m[:, :3, :3])[:, [1, 2, 3, 0]].cpu().numpy()
-        return pos, quat
+    chain, _, _ = build_franka_chain(device)
 
     src = LeRobotDataset(cfg.src_repo)
     hf = src.hf_dataset.with_format("numpy")
@@ -151,28 +203,16 @@ def main(cfg: Config):
         repo_id=cfg.dst_repo, fps=src.fps, features=features, use_videos=False
     )
 
-    def write(obs, act, bend):
-        for f in range(len(obs)):
-            dst.add_frame(
-                {
-                    "observation.state": obs[f],
-                    "action": act[f],
-                    "bend": bend.astype(np.float32),
-                    "task": "pick_place",
-                }
-            )
-        dst.save_episode()
-
     # pass 1: write originals, FK-cache bendable episodes
     todo: list[dict[str, Any]] = []
     for e in tqdm(range(src.num_episodes), desc="originals"):
         sel = epi == e
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
-        write(obs, act, np.zeros(2))
+        write(dst, obs, act, np.zeros(2))
         if opened - close < 4:
             continue
-        act_ee, act_quat = fk(act[:, :7])
+        act_ee, act_quat = fk(chain, act[:, :7], base)
         todo.append(
             dict(
                 obs=obs,
@@ -183,43 +223,6 @@ def main(cfg: Config):
                 act_quat=act_quat,
             )
         )
-
-    def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
-        return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
-
-    def targets(grp, tm):
-        """Bent EE/rot target stacks (tm, n, .) for the action IK pass."""
-        e = np.stack([tpad(x["ee_t"], tm) for x in grp], axis=1)
-        q = np.stack([tpad(x["act_quat"], tm) for x in grp], axis=1)
-        return e, q
-
-    def replay(grp):
-        """Execute each copy's actions open-loop from its episode's initial
-        conditions; real dynamics produce the states (and a success filter)."""
-        n = env.cfg.world_count
-        tm = max(len(x["na"]) for x in grp)
-        acts = rig.pad(np.stack([tpad(x["na"], tm) for x in grp]))
-        jq = np.zeros((n, env.coords_per_world), np.float32)
-        o0 = rig.pad(np.stack([x["obs"][0] for x in grp]))
-        jq[:, :9] = o0[:, :9]
-        jq[:, 9:12] = o0[:, 18:21]
-        yaw = np.arctan2(o0[:, 21], o0[:, 22])
-        jq[:, 14] = np.sin(yaw / 2)
-        jq[:, 15] = np.cos(yaw / 2)
-        env.reset()
-        env.goal_pos = o0[:, 23:26]
-        env.cube_pos_prev = o0[:, 18:21].copy()
-        env.cube_start_z = o0[:, 20].copy()
-        wp.copy(env.state_0.joint_q, wp.array(jq.flatten(), dtype=wp.float32))
-        env.state_0.joint_qd.zero_()
-        newton.eval_fk(
-            env.model, env.state_0.joint_q, env.state_0.joint_qd, env.state_0
-        )
-        obs_seq = np.empty((tm, n, o0.shape[1]), np.float32)
-        for t in range(tm):
-            env.apply_action(acts[:, t])
-            obs_seq[t] = env.get_obs()
-        return obs_seq, env.success()
 
     # pass 2: bend + re-IK actions, then replay in sim for real states. Copies
     # that fail either gate — IK can't track the arc (unreachable / posture
@@ -247,7 +250,7 @@ def main(cfg: Config):
             ready = []
             for i, x in enumerate(grp):
                 nf = len(x["act"])
-                achieved, _ = fk(na_j[:nf, i])
+                achieved, _ = fk(chain, na_j[:nf, i], base)
                 err = np.linalg.norm(achieved - x["ee_t"], axis=1)
                 jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
                 if err.max() > 0.05 or jerk > 0.6:
@@ -260,13 +263,13 @@ def main(cfg: Config):
 
             if not ready:
                 continue
-            obs_seq, succ = replay(ready)
+            obs_seq, succ = replay(env, rig, ready)
             for i, x in enumerate(ready):
                 if not succ[i]:
                     rejected.append(x)
                     continue
                 nf = len(x["na"])
-                write(obs_seq[:nf, i], x["na"], x["label"])
+                write(dst, obs_seq[:nf, i], x["na"], x["label"])
                 written += 1
                 ee_err.append(x["err"])
         pending = rejected
