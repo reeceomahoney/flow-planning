@@ -1,12 +1,10 @@
 """Offline detour augmentation of a recorded dataset (teleop-compatible).
 
-Bends the transit segments of each episode in EE space (continuous lateral/
-vertical arcs) and re-IKs to joint actions; only the
-gripper signal segments the episode, so the action-side augmentation applies
-to any pre-existing demo dataset. States come from REPLAYING the bent actions
-in sim: IK-synthesized states are kinematically right but dynamically sterile
-(no tracking lag, no contact), and a policy trained on them collapses when
-eval clamps a real state into the plan.
+Bends each episode's transit segments into EE-space arcs and re-IKs to joint
+actions; only the gripper signal segments the episode, so this applies to any
+pre-existing demos. States come from REPLAYING the bent actions in sim —
+IK-synthesized states are kinematically right but dynamically sterile (no
+tracking lag, no contact) and collapse training silently.
 """
 
 from dataclasses import dataclass, field
@@ -33,7 +31,7 @@ class Config:
     src_repo: str = "reece-omahoney/franka-src"
     dst_repo: str = "reece-omahoney/franka"
     copies: int = 2  # bent copies per episode; the original is always kept
-    bend_amp: float = 1.0  # scales the sampled arc, as in the online recorder
+    bend_amp: float = 1.05  # max arc half-angle in rad (~60 deg, 1.21x path)
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
     env: FrankaConfig = field(default_factory=FrankaConfig)  # IK rig only
@@ -50,12 +48,15 @@ def transit_segments(gripper: np.ndarray) -> tuple[int, int]:
     return close, opened
 
 
-def bend_delta(ee, close, opened, lat, vert, clear=0.1):
-    """Per-frame EE displacement: plateau-profile arc on each transit segment.
-    Segments shrink to where the EE is `clear` above its grasp/place height, so
-    the approach descent, grasp, lift and place descent stay untouched — the
-    geometric analogue of the online recorder's phase gating."""
+def bend_delta(ee, close, opened, phi, theta, clear=0.1):
+    """Per-frame EE displacement: arc of radius L/(2 sin phi) on each transit
+    segment of chord L, bulging in a plane `theta` off the floor (0 = lateral,
+    pi/2 = up). Peak bulge is L/2 * tan(phi/2), path grows ~phi/sin(phi).
+    Segments stop `clear` above the grasp/place height, leaving the descents,
+    grasp and lift untouched (the online recorder's phase gating, geometrically)."""
     d = np.zeros_like(ee)
+    if phi < 1e-3:
+        return d
     up = np.array([0.0, 0.0, 1.0])
     z = ee[:, 2]
     hi1 = np.nonzero(z[:close] > z[max(close - 1, 0)] + clear)[0]
@@ -73,10 +74,9 @@ def bend_delta(ee, close, opened, lat, vert, clear=0.1):
         latd = np.cross(chord, up)
         n = np.linalg.norm(latd)
         latd = latd / n if n > 1e-4 else np.zeros(3)
-        t = np.arange(s1 - s0) / (s1 - s0 - 1)
-        prof = np.minimum(1.0, 2.0 * np.sin(np.pi * t))
-        arc = lat * latd + vert * up
-        d[s0:s1] = np.linalg.norm(chord) * prof[:, None] * arc
+        psi = phi * (2.0 * np.arange(s1 - s0) / (s1 - s0 - 1) - 1.0)  # [-phi, phi]
+        sag = np.linalg.norm(chord) / 2 * (np.cos(psi) - np.cos(phi)) / np.sin(phi)
+        d[s0:s1] = sag[:, None] * (np.cos(theta) * latd + np.sin(theta) * up)
     return d
 
 
@@ -94,13 +94,6 @@ def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
     return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
 
 
-def targets(grp, tm):
-    """Bent EE/rot target stacks (tm, n, .) for the action IK pass."""
-    e = np.stack([tpad(x["ee_t"], tm) for x in grp], axis=1)
-    q = np.stack([tpad(x["act_quat"], tm) for x in grp], axis=1)
-    return e, q
-
-
 def write(dst, obs, act, bend):
     for f in range(len(obs)):
         dst.add_frame(
@@ -115,8 +108,7 @@ def write(dst, obs, act, bend):
 
 
 def replay(env, rig, grp):
-    """Execute each copy's actions open-loop from its episode's initial
-    conditions; real dynamics produce the states (and a success filter)."""
+    """Open-loop rollout from each copy's initial conditions -> states + success."""
     n = env.cfg.world_count
     tm = max(len(x["na"]) for x in grp)
     acts = rig.pad(np.stack([tpad(x["na"], tm) for x in grp]))
@@ -142,10 +134,9 @@ def replay(env, rig, grp):
 
 
 class IKRig:
-    """Re-IK through the env's solver, batched over episodes and SEQUENTIAL over
-    frames: each frame warm-starts from the previous frame's solution, exactly
-    like the online recorder. Independent per-frame solves hop between IK
-    posture families and produce unusably jerky joint trajectories."""
+    """Env IK solver, batched over episodes and SEQUENTIAL over frames: each frame
+    warm-starts from the last. Independent solves hop posture families and are
+    unusably jerky."""
 
     def __init__(self, env, iters: int):
         self.env, self.iters = env, iters
@@ -177,12 +168,11 @@ class IKRig:
 
 @draccus.wrap()
 def main(cfg: Config):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     rng = np.random.default_rng(cfg.seed)
     env = make_env(cfg.env, ViewerNull())
     rig = IKRig(env, cfg.ik_iters)
     base = np.asarray(env.robot_base_pos, np.float32)
-    chain, _, _ = build_franka_chain(device)
+    chain, _, _ = build_franka_chain("cuda" if torch.cuda.is_available() else "cpu")
 
     src = LeRobotDataset(cfg.src_repo)
     hf = src.hf_dataset.with_format("numpy")
@@ -214,14 +204,7 @@ def main(cfg: Config):
             continue
         act_ee, act_quat = fk(chain, act[:, :7], base)
         todo.append(
-            dict(
-                obs=obs,
-                act=act,
-                close=close,
-                opened=opened,
-                act_ee=act_ee,
-                act_quat=act_quat,
-            )
+            dict(obs=obs, act=act, close=close, opened=opened, ee=act_ee, quat=act_quat)
         )
 
     # pass 2: bend + re-IK actions, then replay in sim for real states. Copies
@@ -236,16 +219,21 @@ def main(cfg: Config):
         for g in tqdm(range(0, len(pending), rig.W), desc=f"bend (try {attempt})"):
             grp = pending[g : g + rig.W]
             n = len(grp)
-            lats = cfg.bend_amp * rng.uniform(-1.0, 1.0, n)
-            verts = cfg.bend_amp * rng.uniform(0.0, 0.8, n)
-            for x, lat, vert in zip(grp, lats, verts):
-                d = bend_delta(x["obs"][:, EE], x["close"], x["opened"], lat, vert)
-                x["label"] = np.array([lat, vert])
-                x["ee_t"] = x["act_ee"] + d
+            phis = rng.uniform(0.0, cfg.bend_amp, n)
+            thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
+            for x, phi, theta in zip(grp, phis, thetas):
+                d = bend_delta(x["obs"][:, EE], x["close"], x["opened"], phi, theta)
+                # stored Cartesian: theta wraps and degenerates at phi=0, which
+                # would break the FPS/whitening candidate search in eval.py
+                x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
+                x["ee_t"] = x["ee"] + d
             tm = max(len(x["act"]) for x in grp)
-            aseed = np.stack([x["act"][0, [0, 1, 2, 3, 4, 5, 6, 7, 7]] for x in grp])
-            ae, aq = targets(grp, tm)
-            na_j = rig.solve_seq(ae, aq, aseed)
+            seed = np.stack([x["act"][0, [*range(7), 7, 7]] for x in grp])  # 7 + 2 tips
+            na_j = rig.solve_seq(
+                np.stack([tpad(x["ee_t"], tm) for x in grp], axis=1),
+                np.stack([tpad(x["quat"], tm) for x in grp], axis=1),
+                seed,
+            )
 
             ready = []
             for i, x in enumerate(grp):
