@@ -25,7 +25,7 @@ from tqdm import tqdm
 from flow_planning.envs import FrankaConfig, make_env
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
 
-EE, CUBE = slice(9, 12), slice(18, 21)  # obs blocks (see FrankaEnv.get_obs)
+EE = slice(9, 12)  # obs block (see FrankaEnv.get_obs)
 
 
 @dataclass
@@ -34,8 +34,6 @@ class Config:
     dst_repo: str = "reece-omahoney/franka"
     copies: int = 2  # bent copies per episode; the original is always kept
     bend_amp: float = 1.0  # scales the sampled arc, as in the online recorder
-    retime: bool = False  # stretch bent segments so a detour costs TIME not speed
-    retime_carry_only: bool = True  # leave the approach clock alone (grasp precision)
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
     env: FrankaConfig = field(default_factory=FrankaConfig)  # IK rig only
@@ -68,7 +66,6 @@ def bend_delta(ee, close, opened, lat, vert, clear=0.1):
         segs.append((0, int(hi1[-1])))  # home -> just above the grasp
     if len(hi2) and len(lifted2):  # lift done -> just above the place
         segs.append((int(lifted2[0]), int(hi2[-1])))
-    used = []
     for s0, s1 in segs:
         if s1 - s0 < 4:
             continue
@@ -80,42 +77,7 @@ def bend_delta(ee, close, opened, lat, vert, clear=0.1):
         prof = np.minimum(1.0, 2.0 * np.sin(np.pi * t))
         arc = lat * latd + vert * up
         d[s0:s1] = np.linalg.norm(chord) * prof[:, None] * arc
-        used.append((s0, s1))
-    return d, used
-
-
-def retime_map(n, segs, stretch):
-    """New->old fractional frame indices; total length is EXACTLY round(n*stretch),
-    with the extra frames split across the bent segments in proportion to their
-    length. Only those stretch: a global resampler eats the grasp/place dwell.
-
-    Duration must be a function of the conditioning label ALONE. Deriving it from
-    each episode's own path growth (the obvious choice) gives two episodes with
-    the same bend different durations; that variance is unexplained by cond and
-    the flow averages it into slow-motion plans that never finish -- free space
-    0.910 -> 0.461, every point of it timeout. Even a fixed per-SEGMENT factor
-    leaks, because the segments are 20-30% of frames and that share varies."""
-    total = sum(s1 - s0 for s0, s1 in segs)
-    extra = max(0, int(round(n * stretch)) - n)
-    u, prev, left = [], 0, extra
-    for i, (s0, s1) in enumerate(segs):
-        u.extend(range(prev, s0))
-        seg = s1 - s0
-        add = left if i == len(segs) - 1 else int(round(extra * seg / total))
-        left -= add
-        m = seg + add
-        u.extend(s0 + seg * np.arange(m) / m)
-        prev = s1
-    u.extend(range(prev, n))
-    return np.asarray(u, np.float64)
-
-
-def interp_rows(a, u):
-    """Linear resample of (T, d) at fractional indices u."""
-    lo = np.floor(u).astype(int).clip(0, len(a) - 1)
-    hi = np.minimum(lo + 1, len(a) - 1)
-    w = (u - lo)[:, None]
-    return a[lo] * (1 - w) + a[hi] * w
+    return d
 
 
 class IKRig:
@@ -210,13 +172,6 @@ def main(cfg: Config):
         write(obs, act, np.zeros(2))
         if opened - close < 4:
             continue
-        # segments depend only on the EE height profile, not on lat/vert, so
-        # settle this once: retiming the carry needs a carry to retime, and
-        # an episode silently left unstretched is duration the label does not
-        # explain (4.3% of episodes; keep them as originals only)
-        if cfg.retime and cfg.retime_carry_only:
-            if len(bend_delta(obs[:, EE], close, opened, 1.0, 1.0)[1]) < 2:
-                continue
         act_ee, act_quat = fk(act[:, :7])
         todo.append(
             dict(
@@ -233,22 +188,10 @@ def main(cfg: Config):
         return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
 
     def targets(grp, tm):
-        """Bent EE/rot target stacks (tm, n, .) for the action IK pass.
-        With retiming each copy has its own length: everything is resampled onto
-        the copy's timebase here, and x["u"] carries it to the gripper so the
-        whole episode stays on one clock."""
-        out: dict[str, list] = {"e": [], "q": []}
-        for x in grp:
-            e = x["act_ee"] + x["d"]
-            q = x["act_quat"]
-            u = x["u"]
-            if u is not None:
-                e = interp_rows(e, u)
-                q = interp_rows(q, u)
-                q /= np.linalg.norm(q, axis=1, keepdims=True).clip(1e-8)
-            for k, v in zip(out, (e, q)):
-                out[k].append(tpad(v, tm))
-        return tuple(np.stack(out[k], axis=1) for k in out)
+        """Bent EE/rot target stacks (tm, n, .) for the action IK pass."""
+        e = np.stack([tpad(x["ee_t"], tm) for x in grp], axis=1)
+        q = np.stack([tpad(x["act_quat"], tm) for x in grp], axis=1)
+        return e, q
 
     def replay(grp):
         """Execute each copy's actions open-loop from its episode's initial
@@ -293,55 +236,24 @@ def main(cfg: Config):
             lats = cfg.bend_amp * rng.uniform(-1.0, 1.0, n)
             verts = cfg.bend_amp * rng.uniform(0.0, 0.8, n)
             for x, lat, vert in zip(grp, lats, verts):
-                d, segs = bend_delta(
-                    x["obs"][:, EE], x["close"], x["opened"], lat, vert
-                )
-                x["d"], x["label"] = d, np.array([lat, vert])
-                src_ee = x["act_ee"]  # NOT `base`: fk() closes over that
-                # Stretch only the CARRY segment (post-lift -> above the place).
-                # Both segments still BEND; only the timing of the second moves.
-                # Retiming the approach too cost 0.22 free space, all of it at
-                # the grasp (21% never picked the cube up vs 6%): the same grasp
-                # then appears at varying approach speeds, and multimodal grasp
-                # targets interpolate into misses (cf grasp_symmetry, 0.76->0.96
-                # when removed). The detour that has to dodge an obstacle happens
-                # during the carry anyway.
-                # The carry is ~18% of frames and absorbs the whole stretch,
-                # so 0.18 total gives it ~(1 + |bend|) growth; 0.5 would make
-                # it 3.8x. Episodes without a carry segment are excluded in
-                # pass 1, so total duration stays exact in the label.
-                rt = segs[1:] if cfg.retime_carry_only else segs
-                k = 0.18 if cfg.retime_carry_only else 0.25
-                stretch = 1.0 + k * float(np.hypot(lat, vert))
-                x["u"] = (
-                    retime_map(len(src_ee), rt, stretch) if cfg.retime and rt else None
-                )
-                x["nf"] = len(x["u"]) if x["u"] is not None else len(src_ee)
-                # target EE on the copy's own clock, for the IK tracking gate
-                x["ee_t"] = (
-                    interp_rows(src_ee + d, x["u"])
-                    if x["u"] is not None
-                    else src_ee + d
-                )
-            tm = max(x["nf"] for x in grp)
+                d = bend_delta(x["obs"][:, EE], x["close"], x["opened"], lat, vert)
+                x["label"] = np.array([lat, vert])
+                x["ee_t"] = x["act_ee"] + d
+            tm = max(len(x["act"]) for x in grp)
             aseed = np.stack([x["act"][0, [0, 1, 2, 3, 4, 5, 6, 7, 7]] for x in grp])
             ae, aq = targets(grp, tm)
             na_j = rig.solve_seq(ae, aq, aseed)
 
             ready = []
             for i, x in enumerate(grp):
-                nf = x["nf"]
+                nf = len(x["act"])
                 achieved, _ = fk(na_j[:nf, i])
                 err = np.linalg.norm(achieved - x["ee_t"], axis=1)
                 jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
                 if err.max() > 0.05 or jerk > 0.6:
                     rejected.append(x)
                     continue
-                na = (
-                    interp_rows(x["act"], x["u"])
-                    if x["u"] is not None
-                    else x["act"].copy()
-                )
+                na = x["act"].copy()
                 na[:, :7] = na_j[:nf, i]
                 x["na"], x["err"] = na.astype(np.float32), err
                 ready.append(x)
