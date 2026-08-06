@@ -22,16 +22,21 @@ from tqdm import tqdm
 
 from flow_planning.envs import FrankaConfig, make_env
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
+from flow_planning.utils import quat_to_rot6d
 
-EE = slice(9, 12)  # obs block (see FrankaEnv.get_obs)
+ARM, EE, ROT, CUBE = slice(0, 7), slice(9, 12), slice(12, 18), slice(18, 21)
 
 
 @dataclass
 class Config:
     src_repo: str = "reece-omahoney/franka-src"
     dst_repo: str = "reece-omahoney/franka"
+    lag_repo: str = ""
     copies: int = 2  # bent copies per episode; the original is always kept
-    bend_amp: float = 1.05  # max arc half-angle in rad (~60 deg, 1.21x path)
+    bend_amp: float = 1.28
+    bend_margin: float = 1.0
+    lag: int = -1
+    limit: int = 0
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
     env: FrankaConfig = field(default_factory=FrankaConfig)  # IK rig only
@@ -48,25 +53,12 @@ def transit_segments(gripper: np.ndarray) -> tuple[int, int]:
     return close, opened
 
 
-def bend_delta(ee, close, opened, phi, theta, clear=0.1):
-    """Per-frame EE displacement: arc of radius L/(2 sin phi) on each transit
-    segment of chord L, bulging in a plane `theta` off the floor (0 = lateral,
-    pi/2 = up). Peak bulge is L/2 * tan(phi/2), path grows ~phi/sin(phi).
-    Segments stop `clear` above the grasp/place height, leaving the descents,
-    grasp and lift untouched (the online recorder's phase gating, geometrically)."""
+def bend_delta(ee, close, opened, phi, theta, margin):
     d = np.zeros_like(ee)
     if phi < 1e-3:
         return d
     up = np.array([0.0, 0.0, 1.0])
-    z = ee[:, 2]
-    hi1 = np.nonzero(z[:close] > z[max(close - 1, 0)] + clear)[0]
-    hi2 = np.nonzero(z[close:opened] > z[opened - 1] + clear)[0] + close
-    lifted2 = np.nonzero(z[close:opened] > z[close] + clear)[0] + close
-    segs = []
-    if len(hi1):
-        segs.append((0, int(hi1[-1])))  # home -> just above the grasp
-    if len(hi2) and len(lifted2):  # lift done -> just above the place
-        segs.append((int(lifted2[0]), int(hi2[-1])))
+    segs = [(0, close - margin), (close + margin, opened - margin)]
     for s0, s1 in segs:
         if s1 - s0 < 4:
             continue
@@ -105,6 +97,28 @@ def write(dst, obs, act, bend):
             }
         )
     dst.save_episode()
+
+
+def lag_error(obs, act, kmax=6):
+    return np.array(
+        [
+            np.abs(obs[k:, ARM] - act[: len(act) - k or None, ARM]).mean()
+            for k in range(kmax)
+        ]
+    )
+
+
+def lag_states(x, chain, base, lag):
+    obs, dq = x["obs"], x["na"][:, ARM] - x["act"][:, ARM]
+    if lag:
+        dq = np.concatenate([np.zeros((lag, 7), np.float32), dq[:-lag]])
+    new = obs.copy()
+    new[:, ARM] += dq
+    ee, quat = fk(chain, new[:, ARM], base)
+    new[:, EE], new[:, ROT] = ee, quat_to_rot6d(quat)
+    held = slice(x["close"], x["opened"])
+    new[held, CUBE] += ee[held] - obs[held, EE]
+    return new.astype(np.float32)
 
 
 def replay(env, rig, grp):
@@ -189,18 +203,27 @@ def main(cfg: Config):
         "action": {"dtype": "float32", "shape": act_all.shape[1:], "names": None},
         "bend": {"dtype": "float32", "shape": (2,), "names": None},
     }
-    dst = LeRobotDataset.create(
-        repo_id=cfg.dst_repo, fps=src.fps, features=features, use_videos=False
-    )
+
+    def make(r):
+        return LeRobotDataset.create(
+            repo_id=r, fps=src.fps, features=features, use_videos=False
+        )
+
+    dsts = [make(cfg.dst_repo)] + ([make(cfg.lag_repo)] if cfg.lag_repo else [])
 
     # pass 1: write originals, FK-cache bendable episodes
     todo: list[dict[str, Any]] = []
-    for e in tqdm(range(src.num_episodes), desc="originals"):
+    lag_err = np.zeros(6)
+    margin = round(cfg.bend_margin * src.fps)
+    n_src = min(src.num_episodes, cfg.limit or src.num_episodes)
+    for e in tqdm(range(n_src), desc="originals"):
         sel = epi == e
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
-        write(dst, obs, act, np.zeros(2))
-        if opened - close < 4:
+        for d in dsts:
+            write(d, obs, act, np.zeros(2))
+        lag_err += lag_error(obs, act)
+        if opened - close < 2 * margin:
             continue
         act_ee, act_quat = fk(chain, act[:, :7], base)
         todo.append(
@@ -211,22 +234,30 @@ def main(cfg: Config):
     # that fail either gate — IK can't track the arc (unreachable / posture
     # flip) or the replayed rollout fails the task — get their latents
     # resampled, like the recorder's success filter.
+    lag = cfg.lag if cfg.lag >= 0 else int(lag_err.argmin())
+    print(f"tracking delay {lag} frames, |state-target| {lag_err / src.num_episodes}")
+
     ee_err: list[np.ndarray] = []
-    written = 0
+    written = rej_ik = rej_sim = 0
     pending = [dict(x) for x in todo for _ in range(cfg.copies)]
+    bar = tqdm(total=len(pending), desc="bends")
     for attempt in range(4):
         rejected = []
-        for g in tqdm(range(0, len(pending), rig.W), desc=f"bend (try {attempt})"):
+        bar.set_postfix(attempt=attempt, retrying=len(pending))
+        for g in range(0, len(pending), rig.W):
             grp = pending[g : g + rig.W]
             n = len(grp)
-            phis = rng.uniform(0.0, cfg.bend_amp, n)
+            phis = 2.0 * np.arctan(2.0 * rng.uniform(0.0, cfg.bend_amp, n))
             thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
             for x, phi, theta in zip(grp, phis, thetas):
-                d = bend_delta(x["obs"][:, EE], x["close"], x["opened"], phi, theta)
+                d = bend_delta(
+                    x["obs"][:, EE], x["close"], x["opened"], phi, theta, margin
+                )
                 # stored Cartesian: theta wraps and degenerates at phi=0, which
                 # would break the FPS/whitening candidate search in eval.py
                 x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
                 x["ee_t"] = x["ee"] + d
+                x["bent"] = np.linalg.norm(d, axis=1) > 1e-6
             tm = max(len(x["act"]) for x in grp)
             seed = np.stack([x["act"][0, [*range(7), 7, 7]] for x in grp])  # 7 + 2 tips
             na_j = rig.solve_seq(
@@ -236,17 +267,18 @@ def main(cfg: Config):
             )
 
             ready = []
+            achieved = fk(chain, na_j.reshape(-1, 7), base)[0].reshape(tm, n, 3)
             for i, x in enumerate(grp):
                 nf = len(x["act"])
-                achieved, _ = fk(chain, na_j[:nf, i], base)
-                err = np.linalg.norm(achieved - x["ee_t"], axis=1)
+                err = np.linalg.norm(achieved[:nf, i] - x["ee_t"], axis=1)
                 jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
                 if err.max() > 0.05 or jerk > 0.6:
                     rejected.append(x)
+                    rej_ik += 1
                     continue
                 na = x["act"].copy()
                 na[:, :7] = na_j[:nf, i]
-                x["na"], x["err"] = na.astype(np.float32), err
+                x["na"], x["err"] = na.astype(np.float32), err[x["bent"]]
                 ready.append(x)
 
             if not ready:
@@ -255,20 +287,29 @@ def main(cfg: Config):
             for i, x in enumerate(ready):
                 if not succ[i]:
                     rejected.append(x)
+                    rej_sim += 1
                     continue
                 nf = len(x["na"])
-                write(dst, obs_seq[:nf, i], x["na"], x["label"])
+                write(dsts[0], obs_seq[:nf, i], x["na"], x["label"])
+                if cfg.lag_repo:
+                    write(dsts[1], lag_states(x, chain, base, lag), x["na"], x["label"])
                 written += 1
+                bar.update(1)
                 ee_err.append(x["err"])
         pending = rejected
         if not pending:
             break
+    bar.close()
 
     err = np.concatenate(ee_err)
     total = written + len(pending)
     print(f"wrote {written}/{total} copies ({len(pending)} dropped after retries)")
-    print(f"re-IK EE error: mean {err.mean():.4f}m  p95 {np.percentile(err, 95):.4f}m")
-    dst.finalize()
+    print(f"rejected: {rej_ik} on IK/jerk, {rej_sim} on replay (re-sampled, not lost)")
+    print(
+        f"bent-frame IK error: mean {err.mean():.4f} p95 {np.percentile(err, 95):.4f}"
+    )
+    for d in dsts:
+        d.finalize()
 
 
 if __name__ == "__main__":
