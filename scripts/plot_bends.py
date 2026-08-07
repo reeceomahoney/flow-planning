@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 ROOT = Path.home() / ".cache/huggingface/lerobot/reece-omahoney/franka"
 EPISODE = 0
 COPIES = 8
-BEND_MIN, BEND_MAX, BEND_MARGIN = 0.15, 0.75, 1.0
+BEND_MIN, BEND_MAX, BEND_MARGIN = 0.15, 0.75, 1.5
 
 
 def load(episode):

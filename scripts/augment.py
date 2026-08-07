@@ -36,7 +36,7 @@ class Config:
     copies: int = 2  # bent copies per episode; the original is always kept
     bend_min: float = 0.15  # half-angle, units of pi
     bend_max: float = 0.75
-    bend_margin: float = 1.0
+    bend_margin: float = 1.5
     limit: int = 0
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
