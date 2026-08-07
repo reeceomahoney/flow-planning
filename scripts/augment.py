@@ -1,8 +1,9 @@
 """Offline detour augmentation of a recorded dataset (teleop-compatible).
 
-Bends each episode's transit segments into EE-space arcs and re-IKs to joint
-actions; only the gripper signal segments the episode, so this applies to any
-pre-existing demos. States come from REPLAYING the bent actions in sim —
+Bends each episode's carry segment (first gripper close to the release after
+it) into an EE-space arc and re-IKs to joint actions; only the gripper signal
+segments the episode, so this applies to any pre-existing demos. States come
+from REPLAYING the bent actions in sim —
 IK-synthesized states are kinematically right but dynamically sterile (no
 tracking lag, no contact) and collapse training silently.
 """
@@ -21,11 +22,10 @@ from pytorch_kinematics.transforms import matrix_to_quaternion
 from scipy.signal import filtfilt
 from tqdm import tqdm
 
+from flow_planning.bend import ARM, CUBE, EE, ROT, bend_delta, transit_segments
 from flow_planning.envs import FrankaConfig, make_env
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
 from flow_planning.utils import quat_to_rot6d
-
-ARM, EE, ROT, CUBE = slice(0, 7), slice(9, 12), slice(12, 18), slice(18, 21)
 
 
 @dataclass
@@ -34,49 +34,13 @@ class Config:
     dst_repo: str = "reece-omahoney/franka"
     lag_repo: str = ""
     copies: int = 2  # bent copies per episode; the original is always kept
-    bend_min: float = 0.3
-    bend_amp: float = 1.28
-    bend_margin: float = 0.3
+    bend_min: float = 0.15  # half-angle, units of pi
+    bend_max: float = 0.75
+    bend_margin: float = 1.0
     limit: int = 0
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
     env: FrankaConfig = field(default_factory=FrankaConfig)  # IK rig only
-
-
-def transit_segments(gripper: np.ndarray) -> tuple[int, int]:
-    """(close, open) frame indices from the gripper command alone."""
-    closed = gripper < 0.03
-    if not closed.any():
-        return 0, 0
-    close = int(closed.argmax())
-    after = ~closed[close:]
-    opened = close + int(after.argmax()) if after.any() else len(gripper)
-    return close, opened
-
-
-def bend_delta(ee, close, opened, phi, theta, margin):
-    d = np.zeros_like(ee)
-    if phi < 1e-3:
-        return d
-    up = np.array([0.0, 0.0, 1.0])
-    segs = [(0, close - margin), (close + margin, opened - margin)]
-    for s0, s1 in segs:
-        if s1 - s0 < 4:
-            continue
-        p0, chord = ee[s0], ee[s1 - 1] - ee[s0]
-        latd = np.cross(chord, up)
-        n = np.linalg.norm(latd)
-        latd = latd / n if n > 1e-4 else np.zeros(3)
-        t = np.arange(s1 - s0) / (s1 - s0 - 1)
-        psi = phi * (2.0 * t - 1.0)
-        sag = np.linalg.norm(chord) / 2 * (np.cos(psi) - np.cos(phi)) / np.sin(phi)
-        nhat = np.cos(theta) * latd + np.sin(theta) * up
-        line = p0 + t[:, None] * chord
-        clear = ((ee[s0:s1] - line) @ up).max()
-        fill = max(0.0, clear - sag.max() * nhat[2])
-        d[s0:s1] = line + sag[:, None] * nhat + fill * (sag / sag.max())[:, None] * up
-        d[s0:s1] -= ee[s0:s1]
-    return d
 
 
 def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
@@ -267,11 +231,15 @@ def main(cfg: Config):
         for g in range(0, len(pending), rig.W):
             grp = pending[g : g + rig.W]
             n = len(grp)
-            phis = 2.0 * np.arctan(2.0 * rng.uniform(cfg.bend_min, cfg.bend_amp, n))
+            phis = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max, n)
             thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
             for x, phi, theta in zip(grp, phis, thetas):
                 d = bend_delta(
-                    x["obs"][:, EE], x["close"], x["opened"], phi, theta, margin
+                    x["obs"][:, EE],
+                    x["close"] + margin,
+                    x["opened"] - margin,
+                    phi,
+                    theta,
                 )
                 # stored Cartesian: theta wraps and degenerates at phi=0, which
                 # would break the FPS/whitening candidate search in eval.py
