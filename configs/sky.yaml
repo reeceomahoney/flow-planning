@@ -29,7 +29,7 @@ run: |
     --repo_id reece-omahoney/franka-src
 
   rm -rf $CACHE/franka
-  pixi run python scripts/augment.py --limit 8 \
+  pixi run python scripts/augment.py \
     --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka
 
   mkdir -p outputs

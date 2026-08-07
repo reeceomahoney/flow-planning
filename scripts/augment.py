@@ -11,7 +11,7 @@ from pytorch_kinematics.transforms import (
     matrix_to_quaternion,
     quaternion_to_matrix,
 )
-from scipy.signal import filtfilt
+from scipy.signal import lfilter, lfilter_zi
 from tqdm import tqdm
 
 from flow_planning.bend import ARM, CUBE, EE, ROT, bend_delta, transit_segments
@@ -36,7 +36,7 @@ class Config:
 
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-ALPHAS = np.linspace(0.0, 0.95, 20)
+ALPHAS = np.linspace(0.0, 0.98, 25)
 
 
 def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
@@ -95,26 +95,18 @@ def write(dst, obs, act, bend):
 
 
 def smooth(a, alpha):
-    return filtfilt([1 - alpha], [1, -alpha], a, axis=0)
+    b, p = [1 - alpha], [1, -alpha]
+    return lfilter(b, p, a, axis=0, zi=lfilter_zi(b, p)[:, None] * a[:1])[0]
 
 
-def lag_error(obs, act, kmax=6):
+def track_error(obs, act):
     o, a = obs[:, ARM], act[:, ARM]
-    pos = np.array(
-        [np.abs(o[k:] - a[: len(a) - k or None]).mean() for k in range(kmax)]
-    )
-    jerk = np.abs(np.diff(o, n=3, axis=0)).max()
-    jfit = np.array(
-        [abs(np.abs(np.diff(smooth(a, al), n=3, axis=0)).max() - jerk) for al in ALPHAS]
-    )
-    return pos, jfit
+    return np.array([np.abs(smooth(a, al) - o).mean() for al in ALPHAS])
 
 
-def lag_states(x, chain, base, lag, alpha):
-    obs, dq = x["obs"], x["na"][:, ARM] - x["act"][:, ARM]
-    if lag:
-        dq = np.concatenate([np.zeros((lag, 7), np.float32), dq[:-lag]])
-    dq = smooth(dq, alpha)
+def lag_states(x, chain, base, alpha):
+    obs = x["obs"]
+    dq = smooth(x["na"][:, ARM] - x["act"][:, ARM], alpha)
     new = obs.copy()
     new[:, ARM] += dq
     ee, quat = fk(chain, new[:, ARM], base)
@@ -153,7 +145,7 @@ def main(cfg: Config):
 
     # pass 1: write originals, FK-cache bendable episodes
     todo: list[dict[str, Any]] = []
-    lag_err, jerk_err = np.zeros(6), np.zeros(len(ALPHAS))
+    grid = np.zeros(len(ALPHAS))
     margin = round(cfg.bend_margin * src.fps)
     n_src = min(src.num_episodes, cfg.limit or src.num_episodes)
     for e in tqdm(range(n_src), desc="originals"):
@@ -161,9 +153,7 @@ def main(cfg: Config):
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
         write(dst, obs, act, np.zeros(2))
-        p, j = lag_error(obs, act)
-        lag_err += p
-        jerk_err += j
+        grid += track_error(obs, act) / n_src
         if opened - close < 2 * margin:
             continue
         act_ee, act_quat = fk(chain, act[:, :7], base)
@@ -172,10 +162,22 @@ def main(cfg: Config):
         )
 
     # pass 2: bend + re-IK actions; states are the recorded ones displaced by the
-    # lagged/smoothed joint delta, so real tracking lag and contact survive.
+    # smoothed joint delta, so real tracking lag and contact survive.
     # Copies the IK can't track (unreachable / posture flip) get resampled.
-    lag, alpha = int(lag_err.argmin()), float(ALPHAS[jerk_err.argmin()])
-    print(f"tracking fit: lag {lag} frames, alpha {alpha:.2f}")
+    j = int(grid.argmin())
+    alpha = float(ALPHAS[j])
+    print(f"tracking fit: alpha {alpha:.2f}")
+    print(f"  joint MAE {grid[j]:.5f} rad vs {grid[0]:.5f} unfiltered")
+    if j in (0, len(ALPHAS) - 1):
+        print("  WARNING: optimum on a grid edge")
+    for name, a_ in (("unfiltered", 0.0), ("fitted", alpha)):
+        d = np.concatenate(
+            [
+                fk(chain, smooth(x["act"][:, ARM], a_), base)[0] - x["obs"][:, EE]
+                for x in todo
+            ]
+        )
+        print(f"  {name:>10} EE MAE {1e3 * np.linalg.norm(d, axis=1).mean():.1f} mm")
 
     ee_err: list[np.ndarray] = []
     written = rej_ik = 0
@@ -183,7 +185,7 @@ def main(cfg: Config):
     bar = tqdm(total=len(pending), desc="bends")
     for attempt in range(4):
         rejected = []
-        bar.set_postfix(attempt=attempt, retrying=len(pending))
+        bar.write(f"attempt {attempt}: {len(pending)} pending")
         n = len(pending)
         phis = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max, n)
         thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
@@ -219,7 +221,7 @@ def main(cfg: Config):
             na = x["act"].copy()
             na[:, :7] = na_j[:nf, i]
             x["na"] = na.astype(np.float32)
-            write(dst, lag_states(x, chain, base, lag, alpha), na, x["label"])
+            write(dst, lag_states(x, chain, base, alpha), na, x["label"])
             written += 1
             bar.update(1)
             ee_err.append(err[x["bent"]])
