@@ -53,6 +53,7 @@ def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
     Damped least squares, batched over copies and SEQUENTIAL over frames: each
     frame warm-starts from the last. Independent solves hop posture families
     and are unusably jerky."""
+
     lo, hi = (torch.tensor(x, device=DEV) for x in chain.get_joint_limits())
     eye = damping * torch.eye(6, device=DEV)
     p = torch.as_tensor(ee_t - base, dtype=torch.float32, device=DEV)
@@ -61,6 +62,7 @@ def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
     th = torch.as_tensor(seed0, dtype=torch.float32, device=DEV)
     out = torch.empty(p.shape[:2] + (7,), device=DEV)
     for t in range(len(p)):
+        # IK loop
         for _ in range(iters):
             jac, m = chain.jacobian(th, ret_eef_pose=True)
             err = torch.cat(
@@ -105,12 +107,15 @@ def track_error(obs, act):
 
 
 def lag_states(x, chain, base, alpha):
+    # add the filtered action delta onto the recorded arm joints
     obs = x["obs"]
     dq = smooth(x["na"][:, ARM] - x["act"][:, ARM], alpha)
     new = obs.copy()
     new[:, ARM] += dq
     ee, quat = fk(chain, new[:, ARM], base)
     new[:, EE], new[:, ROT] = ee, quat_to_rot6d(quat)
+
+    # shift the cube by the EE displacement over the frames it is held
     held = slice(x["close"], x["opened"])
     new[held, CUBE] += ee[held] - obs[held, EE]
     return new.astype(np.float32)
@@ -119,10 +124,13 @@ def lag_states(x, chain, base, alpha):
 @draccus.wrap()
 def main(cfg: Config):
     rng = np.random.default_rng(cfg.seed)
+
+    # build kinematic chain
     base = np.array([-0.5, -0.5, cfg.env.table_height], np.float32)
     chain, _, _ = build_franka_chain("cpu")
     chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
 
+    # load datasets
     src = LeRobotDataset(cfg.src_repo)
     hf = src.hf_dataset.with_format("numpy")
     epi = np.asarray(hf["episode_index"])
@@ -143,17 +151,20 @@ def main(cfg: Config):
         repo_id=cfg.dst_repo, fps=src.fps, features=features, use_videos=False
     )
 
-    # pass 1: write originals, FK-cache bendable episodes
+    # write originals, FK-cache bendable episodes
     todo: list[dict[str, Any]] = []
     grid = np.zeros(len(ALPHAS))
     margin = round(cfg.bend_margin * src.fps)
     n_src = min(src.num_episodes, cfg.limit or src.num_episodes)
     for e in tqdm(range(n_src), desc="originals"):
+        # write original episode
         sel = epi == e
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
         write(dst, obs, act, np.zeros(2))
         grid += track_error(obs, act) / n_src
+
+        # fk bendable episodes
         if opened - close < 2 * margin:
             continue
         act_ee, act_quat = fk(chain, act[:, :7], base)
@@ -161,15 +172,15 @@ def main(cfg: Config):
             dict(obs=obs, act=act, close=close, opened=opened, ee=act_ee, quat=act_quat)
         )
 
-    # pass 2: bend + re-IK actions; states are the recorded ones displaced by the
-    # smoothed joint delta, so real tracking lag and contact survive.
-    # Copies the IK can't track (unreachable / posture flip) get resampled.
+    # take the alpha with the lowest prediction error
     j = int(grid.argmin())
     alpha = float(ALPHAS[j])
     print(f"tracking fit: alpha {alpha:.2f}")
     print(f"  joint MAE {grid[j]:.5f} rad vs {grid[0]:.5f} unfiltered")
     if j in (0, len(ALPHAS) - 1):
         print("  WARNING: optimum on a grid edge")
+
+    # report the same fit in EE space, against doing no filtering at all
     for name, a_ in (("unfiltered", 0.0), ("fitted", alpha)):
         d = np.concatenate(
             [
@@ -179,6 +190,7 @@ def main(cfg: Config):
         )
         print(f"  {name:>10} EE MAE {1e3 * np.linalg.norm(d, axis=1).mean():.1f} mm")
 
+    # queue up `copies` bends per episode and retry the rejects up to 4 times
     ee_err: list[np.ndarray] = []
     written = rej_ik = 0
     pending = [dict(x) for x in todo for _ in range(cfg.copies)]
@@ -186,18 +198,20 @@ def main(cfg: Config):
     for attempt in range(4):
         rejected = []
         bar.write(f"attempt {attempt}: {len(pending)} pending")
+
+        # sample arcs
         n = len(pending)
         phis = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max, n)
-        thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
+        thetas = rng.uniform(0.0, np.pi, n)
         for x, phi, theta in zip(pending, phis, thetas):
             d = bend_delta(
                 x["obs"][:, EE], x["close"] + margin, x["opened"] - margin, phi, theta
             )
-            # stored Cartesian: theta wraps and degenerates at phi=0, which
-            # would break the FPS/whitening candidate search in eval.py
             x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
             x["ee_t"] = x["ee"] + d
             x["bent"] = np.linalg.norm(d, axis=1) > 1e-6
+
+        # solve IK to get joints
         tm = max(len(x["act"]) for x in pending)
         na_j = solve_seq(
             chain,
@@ -209,6 +223,7 @@ def main(cfg: Config):
             base,
         )
 
+        # measure what the IK actually achieved and drop copies that miss or jerk
         achieved = fk(chain, na_j.reshape(-1, 7), base)[0].reshape(tm, n, 3)
         for i, x in enumerate(pending):
             nf = len(x["act"])
@@ -218,6 +233,8 @@ def main(cfg: Config):
                 rejected.append(x)
                 rej_ik += 1
                 continue
+
+            # splice the new arm joints in over the original gripper channel
             na = x["act"].copy()
             na[:, :7] = na_j[:nf, i]
             x["na"] = na.astype(np.float32)
