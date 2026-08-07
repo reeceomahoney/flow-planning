@@ -32,7 +32,5 @@ run: |
   pixi run python scripts/augment.py \
     --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka
 
-  mkdir -p outputs
-  pixi run python scripts/play.py --repo_id reece-omahoney/franka \
-    --env.world_count 1 --env.task_time 1.5 --episodes 0,-1,-2,-3,-4,-5 \
-    --video outputs/franka.mp4
+  pixi run python scripts/train.py --num_iters 75000 \
+    --env.type franka --env.task_time 1.5 --repo_id reece-omahoney/franka
