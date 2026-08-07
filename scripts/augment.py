@@ -18,6 +18,7 @@ import warp as wp
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from newton.viewer import ViewerNull
 from pytorch_kinematics.transforms import matrix_to_quaternion
+from scipy.signal import filtfilt
 from tqdm import tqdm
 
 from flow_planning.envs import FrankaConfig, make_env
@@ -33,9 +34,9 @@ class Config:
     dst_repo: str = "reece-omahoney/franka"
     lag_repo: str = ""
     copies: int = 2  # bent copies per episode; the original is always kept
+    bend_min: float = 0.3
     bend_amp: float = 1.28
-    bend_margin: float = 1.0
-    lag: int = -1
+    bend_margin: float = 0.3
     limit: int = 0
     ik_iters: int = 24  # per frame, warm-started; matches the online recorder
     seed: int = 0
@@ -62,13 +63,19 @@ def bend_delta(ee, close, opened, phi, theta, margin):
     for s0, s1 in segs:
         if s1 - s0 < 4:
             continue
-        chord = ee[s1 - 1] - ee[s0]
+        p0, chord = ee[s0], ee[s1 - 1] - ee[s0]
         latd = np.cross(chord, up)
         n = np.linalg.norm(latd)
         latd = latd / n if n > 1e-4 else np.zeros(3)
-        psi = phi * (2.0 * np.arange(s1 - s0) / (s1 - s0 - 1) - 1.0)  # [-phi, phi]
+        t = np.arange(s1 - s0) / (s1 - s0 - 1)
+        psi = phi * (2.0 * t - 1.0)
         sag = np.linalg.norm(chord) / 2 * (np.cos(psi) - np.cos(phi)) / np.sin(phi)
-        d[s0:s1] = sag[:, None] * (np.cos(theta) * latd + np.sin(theta) * up)
+        nhat = np.cos(theta) * latd + np.sin(theta) * up
+        line = p0 + t[:, None] * chord
+        clear = ((ee[s0:s1] - line) @ up).max()
+        fill = max(0.0, clear - sag.max() * nhat[2])
+        d[s0:s1] = line + sag[:, None] * nhat + fill * (sag / sag.max())[:, None] * up
+        d[s0:s1] -= ee[s0:s1]
     return d
 
 
@@ -99,19 +106,30 @@ def write(dst, obs, act, bend):
     dst.save_episode()
 
 
+ALPHAS = np.linspace(0.0, 0.95, 20)
+
+
+def smooth(a, alpha):
+    return filtfilt([1 - alpha], [1, -alpha], a, axis=0)
+
+
 def lag_error(obs, act, kmax=6):
-    return np.array(
-        [
-            np.abs(obs[k:, ARM] - act[: len(act) - k or None, ARM]).mean()
-            for k in range(kmax)
-        ]
+    o, a = obs[:, ARM], act[:, ARM]
+    pos = np.array(
+        [np.abs(o[k:] - a[: len(a) - k or None]).mean() for k in range(kmax)]
     )
+    jerk = np.abs(np.diff(o, n=3, axis=0)).max()
+    jfit = np.array(
+        [abs(np.abs(np.diff(smooth(a, al), n=3, axis=0)).max() - jerk) for al in ALPHAS]
+    )
+    return pos, jfit
 
 
-def lag_states(x, chain, base, lag):
+def lag_states(x, chain, base, lag, alpha):
     obs, dq = x["obs"], x["na"][:, ARM] - x["act"][:, ARM]
     if lag:
         dq = np.concatenate([np.zeros((lag, 7), np.float32), dq[:-lag]])
+    dq = smooth(dq, alpha)
     new = obs.copy()
     new[:, ARM] += dq
     ee, quat = fk(chain, new[:, ARM], base)
@@ -213,7 +231,7 @@ def main(cfg: Config):
 
     # pass 1: write originals, FK-cache bendable episodes
     todo: list[dict[str, Any]] = []
-    lag_err = np.zeros(6)
+    lag_err, jerk_err = np.zeros(6), np.zeros(len(ALPHAS))
     margin = round(cfg.bend_margin * src.fps)
     n_src = min(src.num_episodes, cfg.limit or src.num_episodes)
     for e in tqdm(range(n_src), desc="originals"):
@@ -222,7 +240,9 @@ def main(cfg: Config):
         close, opened = transit_segments(act[:, 7])
         for d in dsts:
             write(d, obs, act, np.zeros(2))
-        lag_err += lag_error(obs, act)
+        p, j = lag_error(obs, act)
+        lag_err += p
+        jerk_err += j
         if opened - close < 2 * margin:
             continue
         act_ee, act_quat = fk(chain, act[:, :7], base)
@@ -234,8 +254,8 @@ def main(cfg: Config):
     # that fail either gate — IK can't track the arc (unreachable / posture
     # flip) or the replayed rollout fails the task — get their latents
     # resampled, like the recorder's success filter.
-    lag = cfg.lag if cfg.lag >= 0 else int(lag_err.argmin())
-    print(f"tracking delay {lag} frames, |state-target| {lag_err / src.num_episodes}")
+    lag, alpha = int(lag_err.argmin()), float(ALPHAS[jerk_err.argmin()])
+    print(f"tracking fit: lag {lag} frames, alpha {alpha:.2f}")
 
     ee_err: list[np.ndarray] = []
     written = rej_ik = rej_sim = 0
@@ -247,7 +267,7 @@ def main(cfg: Config):
         for g in range(0, len(pending), rig.W):
             grp = pending[g : g + rig.W]
             n = len(grp)
-            phis = 2.0 * np.arctan(2.0 * rng.uniform(0.0, cfg.bend_amp, n))
+            phis = 2.0 * np.arctan(2.0 * rng.uniform(cfg.bend_min, cfg.bend_amp, n))
             thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
             for x, phi, theta in zip(grp, phis, thetas):
                 d = bend_delta(
@@ -292,7 +312,12 @@ def main(cfg: Config):
                 nf = len(x["na"])
                 write(dsts[0], obs_seq[:nf, i], x["na"], x["label"])
                 if cfg.lag_repo:
-                    write(dsts[1], lag_states(x, chain, base, lag), x["na"], x["label"])
+                    write(
+                        dsts[1],
+                        lag_states(x, chain, base, lag, alpha),
+                        x["na"],
+                        x["label"],
+                    )
                 written += 1
                 bar.update(1)
                 ee_err.append(x["err"])
