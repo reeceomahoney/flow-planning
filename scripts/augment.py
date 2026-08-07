@@ -1,29 +1,21 @@
-"""Offline detour augmentation of a recorded dataset (teleop-compatible).
-
-Bends each episode's carry segment (first gripper close to the release after
-it) into an EE-space arc and re-IKs to joint actions; only the gripper signal
-segments the episode, so this applies to any pre-existing demos. States come
-from REPLAYING the bent actions in sim —
-IK-synthesized states are kinematically right but dynamically sterile (no
-tracking lag, no contact) and collapse training silently.
-"""
-
 from dataclasses import dataclass, field
 from typing import Any
 
 import draccus
-import newton
 import numpy as np
+import pytorch_kinematics as pk
 import torch
-import warp as wp
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from newton.viewer import ViewerNull
-from pytorch_kinematics.transforms import matrix_to_quaternion
+from pytorch_kinematics.transforms import (
+    matrix_to_axis_angle,
+    matrix_to_quaternion,
+    quaternion_to_matrix,
+)
 from scipy.signal import filtfilt
 from tqdm import tqdm
 
 from flow_planning.bend import ARM, CUBE, EE, ROT, bend_delta, transit_segments
-from flow_planning.envs import FrankaConfig, make_env
+from flow_planning.envs import FrankaConfig
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
 from flow_planning.utils import quat_to_rot6d
 
@@ -32,25 +24,57 @@ from flow_planning.utils import quat_to_rot6d
 class Config:
     src_repo: str = "reece-omahoney/franka-src"
     dst_repo: str = "reece-omahoney/franka"
-    lag_repo: str = ""
     copies: int = 2  # bent copies per episode; the original is always kept
     bend_min: float = 0.15  # half-angle, units of pi
     bend_max: float = 0.75
     bend_margin: float = 1.5
     limit: int = 0
-    ik_iters: int = 24  # per frame, warm-started; matches the online recorder
+    ik_iters: int = 8  # per frame, warm-started
+    ik_damping: float = 0.05
     seed: int = 0
-    env: FrankaConfig = field(default_factory=FrankaConfig)  # IK rig only
+    env: FrankaConfig = field(default_factory=FrankaConfig)  # table geometry only
+
+
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+ALPHAS = np.linspace(0.0, 0.95, 20)
 
 
 def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
-    njoints = len(chain.get_joint_parameter_names())
-    th = torch.as_tensor(q, dtype=torch.float32, device=chain.device)
-    th = torch.cat([th, th.new_zeros(len(th), njoints - 7)], dim=1)
-    m = chain.forward_kinematics(th)[EE_FRAME].get_matrix()
+    th = torch.as_tensor(np.asarray(q), dtype=torch.float32, device=DEV)
+    m = chain.forward_kinematics(th).get_matrix()
     pos = m[:, :3, 3].cpu().numpy() + base
     quat = matrix_to_quaternion(m[:, :3, :3])[:, [1, 2, 3, 0]].cpu().numpy()
     return pos, quat
+
+
+def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
+    """(T, B, 3/4) world targets + (B, 7) initial joints -> (T, B, 7).
+
+    Damped least squares, batched over copies and SEQUENTIAL over frames: each
+    frame warm-starts from the last. Independent solves hop posture families
+    and are unusably jerky."""
+    lo, hi = (torch.tensor(x, device=DEV) for x in chain.get_joint_limits())
+    eye = damping * torch.eye(6, device=DEV)
+    p = torch.as_tensor(ee_t - base, dtype=torch.float32, device=DEV)
+    q = torch.as_tensor(quat_t[..., [3, 0, 1, 2]], dtype=torch.float32, device=DEV)
+    rot = quaternion_to_matrix(q)
+    th = torch.as_tensor(seed0, dtype=torch.float32, device=DEV)
+    out = torch.empty(p.shape[:2] + (7,), device=DEV)
+    for t in range(len(p)):
+        for _ in range(iters):
+            jac, m = chain.jacobian(th, ret_eef_pose=True)
+            err = torch.cat(
+                [
+                    p[t] - m[:, :3, 3],
+                    matrix_to_axis_angle(rot[t] @ m[:, :3, :3].transpose(1, 2)),
+                ],
+                dim=-1,
+            )
+            jt = jac.transpose(1, 2)
+            th = th + (jt @ torch.linalg.solve(jac @ jt + eye, err[..., None]))[..., 0]
+            th = th.clamp(lo, hi)
+        out[t] = th
+    return out.cpu().numpy()
 
 
 def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
@@ -68,9 +92,6 @@ def write(dst, obs, act, bend):
             }
         )
     dst.save_episode()
-
-
-ALPHAS = np.linspace(0.0, 0.95, 20)
 
 
 def smooth(a, alpha):
@@ -103,72 +124,12 @@ def lag_states(x, chain, base, lag, alpha):
     return new.astype(np.float32)
 
 
-def replay(env, rig, grp):
-    """Open-loop rollout from each copy's initial conditions -> states + success."""
-    n = env.cfg.world_count
-    tm = max(len(x["na"]) for x in grp)
-    acts = rig.pad(np.stack([tpad(x["na"], tm) for x in grp]))
-    jq = np.zeros((n, env.coords_per_world), np.float32)
-    o0 = rig.pad(np.stack([x["obs"][0] for x in grp]))
-    jq[:, :9] = o0[:, :9]
-    jq[:, 9:12] = o0[:, 18:21]
-    yaw = np.arctan2(o0[:, 21], o0[:, 22])
-    jq[:, 14] = np.sin(yaw / 2)
-    jq[:, 15] = np.cos(yaw / 2)
-    env.reset()
-    env.goal_pos = o0[:, 23:26]
-    env.cube_pos_prev = o0[:, 18:21].copy()
-    env.cube_start_z = o0[:, 20].copy()
-    wp.copy(env.state_0.joint_q, wp.array(jq.flatten(), dtype=wp.float32))
-    env.state_0.joint_qd.zero_()
-    newton.eval_fk(env.model, env.state_0.joint_q, env.state_0.joint_qd, env.state_0)
-    obs_seq = np.empty((tm, n, o0.shape[1]), np.float32)
-    for t in range(tm):
-        env.apply_action(acts[:, t])
-        obs_seq[t] = env.get_obs()
-    return obs_seq, env.success()
-
-
-class IKRig:
-    """Env IK solver, batched over episodes and SEQUENTIAL over frames: each frame
-    warm-starts from the last. Independent solves hop posture families and are
-    unusably jerky."""
-
-    def __init__(self, env, iters: int):
-        self.env, self.iters = env, iters
-        self.W = env.cfg.world_count
-        self.dofs = env.joint_q_ik.shape[1]
-
-    def pad(self, a):  # (B, ...) -> (W, ...) by repeating the last row
-        p = np.repeat(a[-1:], self.W, axis=0)
-        p[: len(a)] = a
-        return np.ascontiguousarray(p, np.float32)
-
-    def solve_seq(self, ee_t, quat_t, seed0):
-        """(T, B, 3/4) target sequences + (B, 9) initial joints -> (T, B, 7)."""
-        env = self.env
-        T, B = ee_t.shape[:2]
-        seed = np.zeros((self.W, self.dofs), np.float32)
-        seed[:, :9] = self.pad(seed0)
-        wp.copy(env.joint_q_ik, wp.array(seed, dtype=wp.float32))
-        out = np.empty((T, B, 7), np.float32)
-        for t in range(T):
-            env.pos_obj.set_target_positions(wp.array(self.pad(ee_t[t]), dtype=wp.vec3))
-            env.rot_obj.set_target_rotations(
-                wp.array(self.pad(quat_t[t]), dtype=wp.vec4)
-            )
-            env.ik_solver.step(env.joint_q_ik, env.joint_q_ik, iterations=self.iters)
-            out[t] = env.joint_q_ik.numpy()[:B, :7]
-        return out
-
-
 @draccus.wrap()
 def main(cfg: Config):
     rng = np.random.default_rng(cfg.seed)
-    env = make_env(cfg.env, ViewerNull())
-    rig = IKRig(env, cfg.ik_iters)
-    base = np.asarray(env.robot_base_pos, np.float32)
-    chain, _, _ = build_franka_chain("cuda" if torch.cuda.is_available() else "cpu")
+    base = np.array([-0.5, -0.5, cfg.env.table_height], np.float32)
+    chain, _, _ = build_franka_chain("cpu")
+    chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
 
     src = LeRobotDataset(cfg.src_repo)
     hf = src.hf_dataset.with_format("numpy")
@@ -186,12 +147,9 @@ def main(cfg: Config):
         "bend": {"dtype": "float32", "shape": (2,), "names": None},
     }
 
-    def make(r):
-        return LeRobotDataset.create(
-            repo_id=r, fps=src.fps, features=features, use_videos=False
-        )
-
-    dsts = [make(cfg.dst_repo)] + ([make(cfg.lag_repo)] if cfg.lag_repo else [])
+    dst = LeRobotDataset.create(
+        repo_id=cfg.dst_repo, fps=src.fps, features=features, use_videos=False
+    )
 
     # pass 1: write originals, FK-cache bendable episodes
     todo: list[dict[str, Any]] = []
@@ -202,8 +160,7 @@ def main(cfg: Config):
         sel = epi == e
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
-        for d in dsts:
-            write(d, obs, act, np.zeros(2))
+        write(dst, obs, act, np.zeros(2))
         p, j = lag_error(obs, act)
         lag_err += p
         jerk_err += j
@@ -214,81 +171,58 @@ def main(cfg: Config):
             dict(obs=obs, act=act, close=close, opened=opened, ee=act_ee, quat=act_quat)
         )
 
-    # pass 2: bend + re-IK actions, then replay in sim for real states. Copies
-    # that fail either gate — IK can't track the arc (unreachable / posture
-    # flip) or the replayed rollout fails the task — get their latents
-    # resampled, like the recorder's success filter.
+    # pass 2: bend + re-IK actions; states are the recorded ones displaced by the
+    # lagged/smoothed joint delta, so real tracking lag and contact survive.
+    # Copies the IK can't track (unreachable / posture flip) get resampled.
     lag, alpha = int(lag_err.argmin()), float(ALPHAS[jerk_err.argmin()])
     print(f"tracking fit: lag {lag} frames, alpha {alpha:.2f}")
 
     ee_err: list[np.ndarray] = []
-    written = rej_ik = rej_sim = 0
+    written = rej_ik = 0
     pending = [dict(x) for x in todo for _ in range(cfg.copies)]
     bar = tqdm(total=len(pending), desc="bends")
     for attempt in range(4):
         rejected = []
         bar.set_postfix(attempt=attempt, retrying=len(pending))
-        for g in range(0, len(pending), rig.W):
-            grp = pending[g : g + rig.W]
-            n = len(grp)
-            phis = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max, n)
-            thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
-            for x, phi, theta in zip(grp, phis, thetas):
-                d = bend_delta(
-                    x["obs"][:, EE],
-                    x["close"] + margin,
-                    x["opened"] - margin,
-                    phi,
-                    theta,
-                )
-                # stored Cartesian: theta wraps and degenerates at phi=0, which
-                # would break the FPS/whitening candidate search in eval.py
-                x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
-                x["ee_t"] = x["ee"] + d
-                x["bent"] = np.linalg.norm(d, axis=1) > 1e-6
-            tm = max(len(x["act"]) for x in grp)
-            seed = np.stack([x["act"][0, [*range(7), 7, 7]] for x in grp])  # 7 + 2 tips
-            na_j = rig.solve_seq(
-                np.stack([tpad(x["ee_t"], tm) for x in grp], axis=1),
-                np.stack([tpad(x["quat"], tm) for x in grp], axis=1),
-                seed,
+        n = len(pending)
+        phis = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max, n)
+        thetas = rng.uniform(0.0, np.pi, n)  # upper half only: never dip
+        for x, phi, theta in zip(pending, phis, thetas):
+            d = bend_delta(
+                x["obs"][:, EE], x["close"] + margin, x["opened"] - margin, phi, theta
             )
+            # stored Cartesian: theta wraps and degenerates at phi=0, which
+            # would break the FPS/whitening candidate search in eval.py
+            x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
+            x["ee_t"] = x["ee"] + d
+            x["bent"] = np.linalg.norm(d, axis=1) > 1e-6
+        tm = max(len(x["act"]) for x in pending)
+        na_j = solve_seq(
+            chain,
+            np.stack([tpad(x["ee_t"], tm) for x in pending], axis=1),
+            np.stack([tpad(x["quat"], tm) for x in pending], axis=1),
+            np.stack([x["act"][0, :7] for x in pending]),
+            cfg.ik_iters,
+            cfg.ik_damping,
+            base,
+        )
 
-            ready = []
-            achieved = fk(chain, na_j.reshape(-1, 7), base)[0].reshape(tm, n, 3)
-            for i, x in enumerate(grp):
-                nf = len(x["act"])
-                err = np.linalg.norm(achieved[:nf, i] - x["ee_t"], axis=1)
-                jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
-                if err.max() > 0.05 or jerk > 0.6:
-                    rejected.append(x)
-                    rej_ik += 1
-                    continue
-                na = x["act"].copy()
-                na[:, :7] = na_j[:nf, i]
-                x["na"], x["err"] = na.astype(np.float32), err[x["bent"]]
-                ready.append(x)
-
-            if not ready:
+        achieved = fk(chain, na_j.reshape(-1, 7), base)[0].reshape(tm, n, 3)
+        for i, x in enumerate(pending):
+            nf = len(x["act"])
+            err = np.linalg.norm(achieved[:nf, i] - x["ee_t"], axis=1)
+            jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
+            if err.max() > 0.05 or jerk > 0.6:
+                rejected.append(x)
+                rej_ik += 1
                 continue
-            obs_seq, succ = replay(env, rig, ready)
-            for i, x in enumerate(ready):
-                if not succ[i]:
-                    rejected.append(x)
-                    rej_sim += 1
-                    continue
-                nf = len(x["na"])
-                write(dsts[0], obs_seq[:nf, i], x["na"], x["label"])
-                if cfg.lag_repo:
-                    write(
-                        dsts[1],
-                        lag_states(x, chain, base, lag, alpha),
-                        x["na"],
-                        x["label"],
-                    )
-                written += 1
-                bar.update(1)
-                ee_err.append(x["err"])
+            na = x["act"].copy()
+            na[:, :7] = na_j[:nf, i]
+            x["na"] = na.astype(np.float32)
+            write(dst, lag_states(x, chain, base, lag, alpha), na, x["label"])
+            written += 1
+            bar.update(1)
+            ee_err.append(err[x["bent"]])
         pending = rejected
         if not pending:
             break
@@ -297,12 +231,11 @@ def main(cfg: Config):
     err = np.concatenate(ee_err)
     total = written + len(pending)
     print(f"wrote {written}/{total} copies ({len(pending)} dropped after retries)")
-    print(f"rejected: {rej_ik} on IK/jerk, {rej_sim} on replay (re-sampled, not lost)")
+    print(f"rejected: {rej_ik} on IK/jerk (re-sampled, not lost)")
     print(
         f"bent-frame IK error: mean {err.mean():.4f} p95 {np.percentile(err, 95):.4f}"
     )
-    for d in dsts:
-        d.finalize()
+    dst.finalize()
 
 
 if __name__ == "__main__":

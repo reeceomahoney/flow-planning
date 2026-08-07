@@ -9,6 +9,7 @@ envs:
   HF_TOKEN:
   WANDB_API_KEY:
   CUDA_VISIBLE_DEVICES: 1
+  HF_DATASETS_DISABLE_PROGRESS_BARS: 1
 workdir: .
 
 setup: |
@@ -21,6 +22,17 @@ run: |
   export PATH="$HOME/.pixi/bin:$PATH"
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 
-  rm -rf ~/.cache/huggingface/lerobot/reece-omahoney/franka
-  pixi run python scripts/record.py --env.type franka --env.world_count 256 --env.task_time 1.5 --episodes 768
-  pixi run python scripts/train.py --num_iters 75000 --env.type franka --env.task_time 1.5
+  CACHE=~/.cache/huggingface/lerobot/reece-omahoney
+
+  [ -d $CACHE/franka-src ] || pixi run python scripts/record.py --env.type franka \
+    --env.world_count 256 --env.task_time 1.5 --episodes 768 \
+    --repo_id reece-omahoney/franka-src
+
+  rm -rf $CACHE/franka
+  pixi run python scripts/augment.py --limit 8 \
+    --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka
+
+  mkdir -p outputs
+  pixi run python scripts/play.py --repo_id reece-omahoney/franka \
+    --env.world_count 1 --env.task_time 1.5 --episodes 0,-1,-2,-3,-4,-5 \
+    --video outputs/franka.mp4
