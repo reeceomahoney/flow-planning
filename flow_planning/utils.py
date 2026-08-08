@@ -67,3 +67,11 @@ def rot6d_to_quat(d):
     b3 = np.cross(b1, b2)
     R = np.stack([b1, b2, b3], axis=2)
     return Rotation.from_matrix(R).as_quat().astype(np.float32)
+
+
+def hf_column(hf, name: str) -> np.ndarray:
+    col = hf.data.column(name).combine_chunks()
+    width = getattr(col.type, "list_size", None)
+    if width:
+        return np.array(col.flatten()).reshape(-1, width)
+    return np.array(col)

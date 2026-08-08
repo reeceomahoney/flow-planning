@@ -23,7 +23,7 @@ from flow_planning.policy import (
     FlowTransformer,
     make_flow_matching_pre_post_processors,
 )
-from flow_planning.utils import make_run_dir
+from flow_planning.utils import hf_column, make_run_dir
 
 
 @dataclass
@@ -170,11 +170,11 @@ def main(cfg: Config):
 
     # frames live once in host RAM; full-horizon windows are gathered per batch
     # with a clamped index, which IS the absorbing goal-frame tail pad
-    hf = dataset.hf_dataset.with_format("numpy")
-    obs_all = torch.from_numpy(np.asarray(hf["observation.state"]))
-    act_all = torch.from_numpy(np.asarray(hf["action"]))
-    bend_all = torch.from_numpy(np.asarray(hf["bend"])) if policy_cfg.cond_dim else None
-    ep = torch.as_tensor(np.asarray(hf["episode_index"]), dtype=torch.long)
+    hf = dataset.hf_dataset
+    obs_all = torch.from_numpy(hf_column(hf, "observation.state"))
+    act_all = torch.from_numpy(hf_column(hf, "action"))
+    bend_all = torch.from_numpy(hf_column(hf, "bend")) if policy_cfg.cond_dim else None
+    ep = torch.as_tensor(hf_column(hf, "episode_index"), dtype=torch.long)
     last = torch.zeros(int(ep.max()) + 1, dtype=torch.long)
     last[ep] = torch.arange(len(ep))  # sequential writes leave each episode's end
     ep_end = last[ep]

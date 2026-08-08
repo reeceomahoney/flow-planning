@@ -20,7 +20,7 @@ from flow_planning.policy import (
     make_flow_matching_pre_post_processors,
 )
 from flow_planning.selector import AnalyticSelector
-from flow_planning.utils import latest_run_dir, make_viewer
+from flow_planning.utils import hf_column, latest_run_dir, make_viewer
 
 
 class Cond(enum.StrEnum):
@@ -119,7 +119,7 @@ def main(cfg: Config):
     rng = np.random.default_rng(cfg.seed)
     bend = None
     if getattr(policy.config, "cond_dim", 0):
-        bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
+        bend = hf_column(dataset.hf_dataset, "bend")
         if cfg.cond is Cond.ZERO:
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)
         elif cfg.cond is Cond.SEARCH:  # candidates scored + latched via selector

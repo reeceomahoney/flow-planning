@@ -17,7 +17,7 @@ from tqdm import tqdm
 from flow_planning.bend import ARM, CUBE, EE, ROT, bend_delta, transit_segments
 from flow_planning.envs import FrankaConfig
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
-from flow_planning.utils import quat_to_rot6d
+from flow_planning.utils import hf_column, quat_to_rot6d
 
 
 @dataclass
@@ -132,10 +132,10 @@ def main(cfg: Config):
 
     # load datasets
     src = LeRobotDataset(cfg.src_repo)
-    hf = src.hf_dataset.with_format("numpy")
-    epi = np.asarray(hf["episode_index"])
-    obs_all = np.asarray(hf["observation.state"])
-    act_all = np.asarray(hf["action"])
+    hf = src.hf_dataset
+    epi = hf_column(hf, "episode_index")
+    obs_all = hf_column(hf, "observation.state")
+    act_all = hf_column(hf, "action")
 
     features = {
         "observation.state": {

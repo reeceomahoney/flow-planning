@@ -10,7 +10,7 @@ import warp as wp
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from flow_planning.envs import FrankaConfig, make_env
-from flow_planning.utils import make_viewer
+from flow_planning.utils import hf_column, make_viewer
 
 
 @dataclass
@@ -25,10 +25,10 @@ class Config:
 def main(cfg: Config):
     viewer = make_viewer("opengl", headless=bool(cfg.video))
     env = make_env(cfg.env, viewer)
-    hf = LeRobotDataset(cfg.repo_id).hf_dataset.with_format("numpy")
-    epi = np.asarray(hf["episode_index"])
-    obs_all = np.asarray(hf["observation.state"])
-    bend_all = np.asarray(hf["bend"]) if "bend" in hf.column_names else None
+    hf = LeRobotDataset(cfg.repo_id).hf_dataset
+    epi = hf_column(hf, "episode_index")
+    obs_all = hf_column(hf, "observation.state")
+    bend_all = hf_column(hf, "bend") if "bend" in hf.column_names else None
     n_ep = int(epi.max()) + 1
     print(f"{n_ep} episodes in {cfg.repo_id}")
 
