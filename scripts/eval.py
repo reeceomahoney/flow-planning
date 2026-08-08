@@ -46,7 +46,6 @@ class Config:
     cond: Cond = Cond.NULL
     n_cond: int = 8  # search: uniform candidates drawn at startup
     selector_margin: float = 0.0  # keep-out inflation on the collision check
-    selector_radii: bool = False  # clearance to the link MESH, not the centreline
 
 
 def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
@@ -115,7 +114,6 @@ def main(cfg: Config):
             device=device,
             cube_size=env.cube_size,
             margin=cfg.selector_margin,
-            radii=cfg.selector_radii,
         )
         policy.selector_fn = sel.score
     rng = np.random.default_rng(cfg.seed)

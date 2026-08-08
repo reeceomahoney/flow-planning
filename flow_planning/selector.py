@@ -16,12 +16,14 @@ ARM_FRAMES = ["link2", "link3", "link4", "link5", "link6", "link7", "hand"]
 # but the thick forearm and the thin fingers need opposite standoffs: the arm
 # must clear the wall while the hand reaches a cube sitting right next to it.
 SEGMENT_RADII = [0.06, 0.06, 0.05, 0.05, 0.04, 0.04]  # link2-3 .. link7-hand
-HAND_RADIUS = 0.02
+HAND_RADIUS = 0.05
 HAND_OFFSETS = [
     [0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.10],
-    [0.0, 0.04, 0.10],
-    [0.0, -0.04, 0.10],
+    [0.0, 0.0, 0.06],
+    [0.0, 0.07, 0.03],
+    [0.0, -0.07, 0.03],
+    [0.0, 0.07, 0.09],
+    [0.0, -0.07, 0.09],
 ]
 
 
@@ -90,7 +92,6 @@ class AnalyticSelector:
         cube_index: int = 18,
         n_arm: int = 7,
         margin: float = 0.0,  # keep-out inflation; 0 = bare collision check
-        radii: bool = False,  # subtract per-segment link radii from clearance
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.fc = FrankaCollision(device, base_pos, cube_size)
@@ -106,7 +107,7 @@ class AnalyticSelector:
         self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
         self.margin = margin
-        self.rad = self.fc.radii if radii else 0.0  # broadcast scalar when off
+        self.rad = self.fc.radii
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
