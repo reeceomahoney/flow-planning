@@ -43,42 +43,21 @@ class Config:
     seed: int = 0
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
-    best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
     cond: Cond = Cond.NULL
     n_cond: int = 8  # search: uniform candidates drawn at startup
-    mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
-    selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
-    selector_margin: float = 0.0  # >0: shortest path among plans clearing this much
-    selector_obj: str = "path"  # objective under selector_margin: "path"|"speed"
+    selector_margin: float = 0.0  # keep-out inflation on the collision check
     selector_radii: bool = False  # clearance to the link MESH, not the centreline
-    selector_cap: float = 0.08  # clearance sufficiency cap
-    selector_prog: float = 0.03  # progress-term weight
-    guidance_scale: float = 0.0  # >0: collision-cost guidance instead of best-of-N
-    guidance_margin: float = 0.1  # keep-out margin for the guidance hinge
-    guidance_len: float = 0.0  # path-length weight in the guidance cost
-    guidance_target: str = "x1"  # guide the predicted clean traj, or raw "xt"
-    warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
 def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
     r = np.linalg.norm(bend, axis=1)
     nz = r > 0
+    assert nz.any(), "dataset has no bent episodes; every bend label is zero"
     ang = np.arctan2(bend[nz, 1], bend[nz, 0])
     phi = rng.uniform(r[nz].min(), r.max(), k)
     theta = rng.uniform(ang.min(), ang.max(), k)
     xy = np.stack([phi * np.cos(theta), phi * np.sin(theta)], axis=1)
     return torch.tensor(xy, dtype=torch.float32, device=device)
-
-
-def demo_speed_limit(dataset, n_arm: int = 7, q: float = 99.0) -> np.ndarray:
-    """Per-joint step speed the demos stay under — the plan's feasibility bar.
-    A statistic of the free-space training set, like the action stats; no extra
-    rollouts and nothing obstacle-specific."""
-    hf = dataset.hf_dataset.with_format("numpy")
-    act = np.asarray(hf[ACTION])[:, :n_arm]
-    ep = np.asarray(hf["episode_index"])
-    dq = np.abs(np.diff(act, axis=0))[ep[1:] == ep[:-1]]  # drop episode seams
-    return np.percentile(dq, q, axis=0)
 
 
 @draccus.wrap()
@@ -94,7 +73,6 @@ def main(cfg: Config):
         policy.config.n_action_steps = cfg.n_action_steps
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
-    policy.warm_start_t = cfg.warm_start_t
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -126,8 +104,7 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     searching = cfg.cond is Cond.SEARCH
-    want_sel = cfg.best_of > 1 or searching or cfg.guidance_scale > 0
-    if want_sel and hasattr(env, "ee_state_index"):
+    if searching and cfg.env.obstacle and hasattr(env, "ee_state_index"):
         geom = env.obstacle_geometry
         sel = AnalyticSelector(
             geom["center"] + geom["half_extents"],
@@ -137,24 +114,10 @@ def main(cfg: Config):
             joint_start=policy.state_dim,
             device=device,
             cube_size=env.cube_size,
-            cap=cfg.selector_cap,
-            prog=cfg.selector_prog,
-            speed=cfg.selector_speed,
-            vlim=demo_speed_limit(dataset),
             margin=cfg.selector_margin,
-            obj=cfg.selector_obj,
             radii=cfg.selector_radii,
         )
-        if cfg.guidance_scale > 0:  # ablation: guidance instead of best-of-N selection
-            policy.guidance_fn = lambda t: sel.guidance_cost(
-                t, cfg.guidance_margin, cfg.guidance_len
-            )
-            policy.guidance_scale = cfg.guidance_scale
-            policy.guidance_target = cfg.guidance_target
-        if cfg.best_of > 1 or searching:
-            policy.selector_fn = sel.score
-            policy.n_samples = cfg.best_of
-            policy.mode_reduce = cfg.mode_reduce
+        policy.selector_fn = sel.score
     rng = np.random.default_rng(cfg.seed)
     bend = None
     if getattr(policy.config, "cond_dim", 0):
@@ -162,7 +125,7 @@ def main(cfg: Config):
         if cfg.cond is Cond.ZERO:
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)
         elif cfg.cond is Cond.SEARCH:  # candidates scored + latched via selector
-            assert policy.selector_fn is not None, "search needs a selector"
+            assert policy.selector_fn is not None, "search needs --env.obstacle"
             cand = sample_cond(bend, cfg.n_cond, rng, device)
             policy.cond_candidates = cand
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")

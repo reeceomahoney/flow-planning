@@ -151,21 +151,6 @@ class EncoderLayer(nn.Module):
         return x + g2 * self.ff(self.norm2(x) * (1 + sc2) + sh2)
 
 
-def pick_plan(s: Tensor, ns: int, reduce: str = "min") -> Tensor:
-    """Index of the chosen plan per world, from scores (n_worlds, n_modes * ns).
-
-    "min" is a flat argmin, so a mode wins on its luckiest sample. Ranking modes
-    by median/max of their samples first removes that optimism, then the best
-    sample within the won mode is executed."""
-    if reduce == "min":
-        return s.argmin(dim=1)
-    sm = s.view(s.shape[0], -1, ns)
-    agg = sm.median(dim=2).values if reduce == "median" else sm.amax(dim=2)
-    rows = torch.arange(s.shape[0], device=s.device)
-    best = agg.argmin(dim=1)
-    return best * ns + sm[rows, best].argmin(dim=1)
-
-
 class FlowTransformer(nn.Module):
     """Unconditional velocity field v(x_t, t) over a chunk of [state, action] steps.
 
@@ -236,16 +221,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
         self.model = FlowTransformer(self.traj_dim, config)
         self.action_clip = None  # optional (low, high) normalized action bounds
-        self.selector_fn = None  # optional plan scorer for best-of-N selection
-        self.n_samples = 1  # plans sampled per world when selector_fn is set
-        self.mode_reduce = "min"  # rank candidate modes by "min"|"median"|"max" sample
-        self.guidance_fn = None  # optional differentiable collision cost (guidance)
-        self.guidance_scale = 0.0  # step size for the guidance gradient
-        self.guidance_target = "x1"  # cost on "x1" (predicted clean) or raw "xt"
+        self.selector_fn = None  # optional plan scorer for candidate selection
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
-        self.warm_start_t = 0.0  # >0: renoise the shifted previous plan to this t
-        # and integrate t..1, keeping timing/mode continuity across replans
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -257,7 +235,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def reset(self):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
-        self.last_traj = None
         self.lpf_state = None  # EMA state for the executed-action low-pass
         self.latched_cond = None  # per-world bend picked at the first replan
 
@@ -299,32 +276,18 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         state: Tensor,
         goal: Tensor,
         cond: Tensor | None,
-        t0: float = 0.0,
     ) -> Tensor:
-        """ODE-integrate x from t0 to 1, re-clamping the boundary frames each step."""
+        """ODE-integrate x from 0 to 1, re-clamping the boundary frames each step."""
         sd, gd = self.state_dim, self.config.goal_dim
         gs = self.config.goal_state_start
-        dt = (1.0 - t0) / self.config.num_inference_steps
+        dt = 1.0 / self.config.num_inference_steps
         for i in range(self.config.num_inference_steps):
-            t = torch.full((x.shape[0],), t0 + i * dt, device=x.device)
+            t = torch.full((x.shape[0],), i * dt, device=x.device)
             x = x.clone()
             x[:, 0, :sd] = state
             x[:, -1, gs : gs + gd] = goal
             v = self.model(x, t, cond)
             x = x + dt * v
-            if self.guidance_fn is not None:  # gradient descent on the collision cost
-                b = 1.0 - (t0 + i * dt)  # optimal-transport path: x1 = x + (1-t)v
-                # "x1": cost on the predicted CLEAN trajectory rather than the
-                # noisy x_t, which is what pushes samples off-manifold
-                x1 = self.guidance_target == "x1"
-                tgt = (x + b * v if x1 else x).detach()
-                g = torch.zeros_like(x)
-                with torch.enable_grad():  # chunk: FK autograd graph is memory-heavy
-                    for j in range(0, x.shape[0], 32):
-                        xg = tgt[j : j + 32].detach().requires_grad_(True)
-                        (gj,) = torch.autograd.grad(self.guidance_fn(xg).sum(), xg)
-                        g[j : j + 32] = gj
-                x = x - self.guidance_scale * (b if x1 else 1.0) * g
         return x
 
     @torch.no_grad()
@@ -337,44 +300,24 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         obs = batch[OBS_STATE]
         sel = self.selector_fn
         n_worlds = obs.shape[0]
-        ns = self.n_samples if sel is not None else 1
-        # bend conditioning: fixed command, latched pick, or a candidate search;
-        # ns samples per mode are drawn and the selector keeps the best plan
-        cond, k, searching = None, ns, False
+        # bend conditioning: fixed command, latched pick, or a candidate search
+        # where the selector keeps the plan with the lowest collision score
+        cond, k, searching = None, 1, False
         if self.config.cond_dim and self.cond_candidates is not None:
             if self.latched_cond is not None:
-                cond = self.latched_cond.repeat_interleave(k, dim=0)
+                cond = self.latched_cond
             else:
                 searching = True
-                k = self.cond_candidates.shape[0] * ns
-                cond = self.cond_candidates.repeat_interleave(ns, dim=0).repeat(
-                    n_worlds, 1
-                )
+                k = self.cond_candidates.shape[0]
+                cond = self.cond_candidates.repeat(n_worlds, 1)
         elif self.config.cond_dim and self.cond is not None:
-            cond = self.cond.expand(n_worlds, -1).repeat_interleave(ns, dim=0)
+            cond = self.cond.expand(n_worlds, -1)
         if k > 1:
             obs = obs.repeat_interleave(k, dim=0)
         sd, gd = self.state_dim, self.config.goal_dim
         state, goal = obs[:, :sd], obs[:, -gd:]
         m = obs.shape[0]
         x = torch.randn(m, self.config.horizon, self.traj_dim, device=obs.device)
-        last = self.last_traj
-        t0 = self.warm_start_t if last is not None else 0.0
-        if t0 > 0 and last is not None:
-            # re-anchor: shift by the plan frame closest to the current state —
-            # rolling by executed steps drifts into the absorbing tail (and
-            # stalls there) whenever execution lags the plan's schedule
-            na, h = self.config.n_action_steps, last.shape[1]
-            cur = state[::k, :sd]  # one row per world
-            w = min(2 * na, h - 1)
-            d = (last[:, :w, :sd] - cur[:, None]).norm(dim=-1)
-            shift = d.argmin(dim=1)  # (n_worlds,)
-            idx = (torch.arange(h, device=x.device)[None] + shift[:, None]).clamp(
-                max=h - 1
-            )
-            prev = last.gather(1, idx[..., None].expand(-1, -1, last.shape[-1]))
-            x = (1 - t0) * x + t0 * prev.repeat_interleave(k, dim=0)
-
         # micro-batch cap for a 24GB card: memory scales with horizon, so hold
         # plans x horizon constant instead of hard-coding a count (retiming took
         # the horizon 599 -> 832 and OOM'd a fixed 4096)
@@ -386,20 +329,17 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                     state[i : i + mb],
                     goal[i : i + mb],
                     None if cond is None else cond[i : i + mb],
-                    t0=t0,
                 )
                 for i in range(0, m, mb)
             ]
         )
-        if sel is not None and k > 1:  # best-of-N: lowest-scoring plan per world
-            red = self.mode_reduce if searching else "min"
-            pick = pick_plan(sel(x).view(n_worlds, k), ns, red)
+        if sel is not None and k > 1:  # lowest-scoring candidate per world
+            pick = sel(x).view(n_worlds, k).argmin(dim=1)
             rows = torch.arange(len(pick), device=x.device)
             x = x.view(-1, k, *x.shape[1:])[rows, pick]
             if searching:  # commit to the picked bend mode for later replans
                 assert cond is not None
                 self.latched_cond = cond.view(-1, k, cond.shape[-1])[rows, pick]
-        self.last_traj = x  # full [state, action] plan, for viz/diagnostics
         acts = x[..., sd:]  # normalized action dims
         if self.action_clip is not None:
             acts = acts.clamp(self.action_clip[0], self.action_clip[1])

@@ -78,9 +78,6 @@ class FrankaCollision:
 
 
 class AnalyticSelector:
-    """Best-of-N scorer: worst-case obstacle clearance of the arm and the plan's
-    predicted cube position, capped at 'enough', minus a small progress term."""
-
     def __init__(
         self,
         box,  # physical world [center(3), half_extents(3)]
@@ -92,12 +89,7 @@ class AnalyticSelector:
         cube_size: float,
         cube_index: int = 18,
         n_arm: int = 7,
-        cap: float = 0.08,  # clearance beyond this buys nothing
-        prog: float = 0.03,  # weight of the mean cube-to-goal progress term
-        speed: float = 0.0,  # weight of the overspeed hinge (0 disables)
-        vlim=None,  # (n_arm,) per-step joint speed the demos never exceed
-        margin: float = 0.0,  # >0: shortest path among plans clearing this much
-        obj: str = "path",  # objective inside the margin constraint: path|speed
+        margin: float = 0.0,  # keep-out inflation; 0 = bare collision check
         radii: bool = False,  # subtract per-segment link radii from clearance
     ):
         f32 = {"dtype": torch.float32, "device": device}
@@ -113,59 +105,24 @@ class AnalyticSelector:
         self.cm = torch.as_tensor(obs_stats["mean"], **f32)[ci : ci + 3]
         self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
-        self.cap, self.prog, self.speed, self.margin = cap, prog, speed, margin
-        self.vlim = None if vlim is None else torch.as_tensor(vlim, **f32)
-        self.obj = obj
+        self.margin = margin
         self.rad = self.fc.radii if radii else 0.0  # broadcast scalar when off
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
-        """Uncapped margin-max games the goal clamp: the safest plan is one
-        that never approaches the cube/goal at all — hence cap + progress."""
-        out = [self.clearance(traj[i : i + 1024]) for i in range(0, len(traj), 1024)]
-        clear = torch.cat(out)
-        if self.margin > 0:
-            # Constrained form: clearance is a requirement, not a thing to
-            # maximize. Unconstrained, capped clearance ties every clearing plan
-            # and `prog` breaks the tie -- and prog rewards covering ground early,
-            # so it picks the FASTEST arc (data-menu plans demand 5.6-9.3x
-            # overspeed vs the grid's 1.8-2.3x, tracking the timeout gap).
-            ok = clear >= self.margin
-            obj = (
-                self.overspeed(traj) if self.obj == "speed" else self.path_length(traj)
-            )
-            return torch.where(ok, obj, 1e3 - clear)
-        cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
-        prog = (cube - cube[:, -1:]).norm(dim=-1).mean(dim=1)  # mean dist to goal
-        s = -clear.clamp(max=self.cap) + self.prog * prog
-        if self.speed and self.vlim is not None:
-            s = s + self.speed * self.overspeed(traj)
-        return s
-
-    def path_length(self, traj: Tensor) -> Tensor:
-        """Joint-space path length. Unlike mean distance-to-goal, which an arc
-        wins by closing distance early, this charges the detour for its detour."""
-        j = self.joint_start
-        q = traj[..., j : j + self.n_arm] * self.js + self.jm
-        return (q[:, 1:] - q[:, :-1]).norm(dim=-1).sum(dim=1)
-
-    def overspeed(self, traj: Tensor) -> Tensor:
-        """Peak fraction by which a plan's demanded joint speed exceeds anything
-        the demos asked for. Horizon is fixed, so a longer detour is a faster one
-        — past what the arm can track, execution lags and the plan is fiction."""
-        assert self.vlim is not None
-        j = self.joint_start
-        q = traj[..., j : j + self.n_arm] * self.js + self.jm
-        dq = (q[:, 1:] - q[:, :-1]).abs()
-        return (dq / self.vlim - 1.0).clamp(min=0.0).amax(dim=2).amax(dim=1)
-
-    def clearance(self, traj: Tensor) -> Tensor:
-        """Worst clearance per plan (min over time and points)."""
-        return self.clearance_t(traj).amin(dim=1)
+        """Total penetration below the keep-out margin. Ranking on clearance
+        instead games the goal clamp -- the safest plan never approaches the
+        cube at all -- so clearance past the margin buys nothing and every
+        collision-free plan ties."""
+        out = [
+            (self.margin - self.clearance_t(traj[i : i + 1024])).clamp(min=0.0)
+            for i in range(0, len(traj), 1024)
+        ]
+        return torch.cat(out).sum(dim=1)
 
     def clearance_t(self, traj: Tensor) -> Tensor:
         """Per-timestep worst clearance (b, t): min over arm points, the cube, and
-        both joint sources. Differentiable — the guidance penalty rides on this."""
+        both joint sources."""
         s, n = self.joint_start, self.n_arm
         center, half = self.box[:, :3], self.box[:, None, None, 3:]
         cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
@@ -184,15 +141,3 @@ class AnalyticSelector:
         dc = box_sdf(cube[:, :, None].float(), center[:, None, None], half)
         worst.append(dc.amin(dim=2) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)
-
-    def guidance_cost(self, traj: Tensor, margin: float, w_len: float = 0.0) -> Tensor:
-        """Clearance hinge plus a path-length term. Without the length term the
-        gradient buys clearance with unbounded detour, which is why guidance
-        over-avoided and stalled; clearance saturates at ~0.04 anyway."""
-        c = self.penalty(traj, margin)
-        return c + w_len * self.path_length(traj) if w_len else c
-
-    def penalty(self, traj: Tensor, margin: float) -> Tensor:
-        """Differentiable per-plan collision cost for guidance: hinge below the
-        keep-out margin, summed over time. Its gradient pushes near-wall frames out."""
-        return (margin - self.clearance_t(traj)).clamp(min=0.0).sum(dim=1)
