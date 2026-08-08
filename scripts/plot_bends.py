@@ -1,24 +1,28 @@
 import json
 from pathlib import Path
 
+import draccus
 import matplotlib
 import numpy as np
 import pyarrow.parquet as pq
+from augment import Config
 
 from flow_planning.bend import EE, bend_delta, transit_segments
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-ROOT = Path.home() / ".cache/huggingface/lerobot/reece-omahoney/franka"
 EPISODE = 0
 COPIES = 8
-BEND_MIN, BEND_MAX, BEND_MARGIN = 0.15, 0.75, 1.5
 
 
-def load(episode):
+def root(repo):
+    return Path.home() / ".cache/huggingface/lerobot" / repo
+
+
+def load(root, episode):
     t = pq.read_table(
-        ROOT / "data",
+        root / "data",
         columns=["observation.state", "action"],
         filters=[("episode_index", "==", episode)],
     )
@@ -44,19 +48,21 @@ def plot(trajs, path):
     return path
 
 
-def main():
-    fps = json.loads((ROOT / "meta/info.json").read_text())["fps"]
-    obs, act = load(EPISODE)
+@draccus.wrap()
+def main(cfg: Config):
+    r = root(cfg.dst_repo)
+    fps = json.loads((r / "meta/info.json").read_text())["fps"]
+    obs, act = load(r, EPISODE)
 
     ee = obs[:, EE]
     close, opened = transit_segments(act[:, 7])
-    margin = round(BEND_MARGIN * fps)
+    margin = round(cfg.bend_margin * fps)
     print(f"{len(ee)} frames, close {close}, open {opened}, margin {margin}")
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(cfg.seed)
     grid = {"original": ee}
     for _ in range(COPIES):
-        phi = np.pi * rng.uniform(BEND_MIN, BEND_MAX)
+        phi = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max)
         theta = rng.uniform(0.0, np.pi)
         d = bend_delta(ee, close + margin, opened - margin, phi, theta)
         grid[f"{phi / np.pi:.2f}pi, {theta / np.pi:.2f}pi"] = ee + d
