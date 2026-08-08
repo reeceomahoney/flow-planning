@@ -47,12 +47,13 @@ def obstacle_contact_kernel(
     if gap >= 0.0:
         return
 
+    s = s0
     if shape_is_obstacle[s0] == 1:
-        contacted[shape_world[s1]] = 1
-        contact_shape[shape_world[s1]] = s1
-    else:
-        contacted[shape_world[s0]] = 1
-        contact_shape[shape_world[s0]] = s0
+        s = s1
+    w = shape_world[s]
+    if contacted[w] == 0:
+        contact_shape[w] = s
+    contacted[w] = 1
 
 
 class ObstacleContactSensor:
@@ -64,14 +65,18 @@ class ObstacleContactSensor:
             np.int32,
         )
         self.model = model
-        # prefer the owning body's key (link name); fall back to the shape label
         sbody = model.shape_body.numpy()
-        bkey = list(getattr(model, "body_key", []) or [])
+        bkey = list(getattr(model, "body_label", []) or [])
         self.labels = []
         for s, lab in enumerate(model.shape_label):
             b = int(sbody[s])
-            name = bkey[b] if 0 <= b < len(bkey) else lab
-            self.labels.append(str(name).split("/")[-1])
+            name = str(bkey[b]).split("/")[-1] if 0 <= b < len(bkey) else ""
+            if not name or name.startswith("body_"):
+                name = str(lab).split("/")[-1]
+            self.labels.append(name)
+        assert not all(n.startswith("shape_") for n in self.labels), (
+            "contact labels fell back to shape indices; model.body_label missing"
+        )
         self.shape_is_obstacle = wp.array(is_obstacle, dtype=wp.int32)
         self.contacted = wp.zeros(model.world_count, dtype=wp.int32)
         self.contact_shape = wp.full(model.world_count, -1, dtype=wp.int32)
