@@ -1,5 +1,6 @@
 """Roll out the trained policy: headless batched eval or interactive viewer."""
 
+import enum
 import itertools
 from collections import Counter
 from dataclasses import dataclass, field
@@ -22,6 +23,13 @@ from flow_planning.selector import AnalyticSelector
 from flow_planning.utils import latest_run_dir, make_viewer
 
 
+class Cond(enum.StrEnum):
+    NULL = "null"  # the learned CFG null token
+    ZERO = "zero"  # the label the unbent originals carry
+    RANDOM = "random"  # one uniform latent per world, redrawn each episode
+    SEARCH = "search"  # n_cond uniform candidates, selector-scored and latched
+
+
 @dataclass
 class Config:
     env: EnvConfig = field(default_factory=FrankaConfig)
@@ -36,11 +44,8 @@ class Config:
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
-    cond: str = "null"  # "null" | "zero" (unbent original) | "search" | "a,b" fixed
-    cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
-    n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
-    cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
-    cond_pick: str = "fps"  # "fps" (spread, hits degenerate extremes) | "dense"
+    cond: Cond = Cond.NULL
+    n_cond: int = 8  # search: uniform candidates drawn at startup
     mode_reduce: str = "min"  # rank modes by "min"|"median"|"max" of their samples
     selector_speed: float = 0.0  # weight of the demanded-joint-speed hinge
     selector_margin: float = 0.0  # >0: shortest path among plans clearing this much
@@ -55,27 +60,14 @@ class Config:
     warm_start_t: float = 0.0  # >0: renoise-and-refine the previous plan (SDEdit)
 
 
-def fps_idx(pts: np.ndarray, k: int, seed: int) -> list[int]:
-    """Farthest-point sampling: indices of k points with maximal mutual spread."""
-    idx = [seed]
-    d = np.linalg.norm(pts - pts[seed], axis=1)
-    for _ in range(k - 1):
-        i = int(d.argmax())
-        idx.append(i)
-        d = np.minimum(d, np.linalg.norm(pts - pts[i], axis=1))
-    return idx
-
-
-def dense_idx(pts: np.ndarray, k: int, keep: float = 0.7, m: int = 5) -> list[int]:
-    """FPS restricted to the well-supported region. Plain FPS seeks the extremes
-    of this space, and those are degenerate modes (cube barely lifts), so drop
-    isolated labels by m-NN distance first. k-means is no good here: a lone
-    outlier forms a singleton cluster whose centroid is the outlier itself."""
-    d = np.sort(np.linalg.norm(pts[:, None] - pts[None], axis=-1), axis=1)[:, m]
-    keep_i = np.argsort(d)[: max(k, int(keep * len(pts)))]
-    sub = pts[keep_i]
-    seed = int(np.linalg.norm(sub - sub.mean(0), axis=1).argmin())
-    return [int(keep_i[i]) for i in fps_idx(sub, k, seed)]
+def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
+    r = np.linalg.norm(bend, axis=1)
+    nz = r > 0
+    ang = np.arctan2(bend[nz, 1], bend[nz, 0])
+    phi = rng.uniform(r[nz].min(), r.max(), k)
+    theta = rng.uniform(ang.min(), ang.max(), k)
+    xy = np.stack([phi * np.cos(theta), phi * np.sin(theta)], axis=1)
+    return torch.tensor(xy, dtype=torch.float32, device=device)
 
 
 def demo_speed_limit(dataset, n_arm: int = 7, q: float = 99.0) -> np.ndarray:
@@ -87,30 +79,6 @@ def demo_speed_limit(dataset, n_arm: int = 7, q: float = 99.0) -> np.ndarray:
     ep = np.asarray(hf["episode_index"])
     dq = np.abs(np.diff(act, axis=0))[ep[1:] == ep[:-1]]  # drop episode seams
     return np.percentile(dq, q, axis=0)
-
-
-def data_cond_candidates(
-    dataset,
-    k: int,
-    device,
-    whiten: bool = True,
-    pick: str = "fps",
-) -> torch.Tensor:
-    """K conditioning modes drawn from the dataset's own bend labels via FPS. The
-    augmentation only kept labels whose sim-replay succeeded, so the set is
-    on-manifold and execution-validated — no hand-tuned grid needed."""
-    bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
-    modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
-    if len(modes) <= k:
-        return torch.tensor(modes, dtype=torch.float32, device=device)
-    # bend is polar (phi*cos(theta), phi*sin(theta)); whitening equalizes the axes
-    w = modes / (modes.std(0) + 1e-6) if whiten else modes
-    if pick == "dense":
-        idx = dense_idx(w, k)
-    else:
-        seed = int(np.linalg.norm(w - w.mean(0), axis=1).argmin())
-        idx = fps_idx(w, k, seed)
-    return torch.tensor(modes[idx], dtype=torch.float32, device=device)
 
 
 @draccus.wrap()
@@ -157,7 +125,7 @@ def main(cfg: Config):
         )
         policy.action_clip = (low, high)
 
-    searching = cfg.cond == "search"
+    searching = cfg.cond is Cond.SEARCH
     want_sel = cfg.best_of > 1 or searching or cfg.guidance_scale > 0
     if want_sel and hasattr(env, "ee_state_index"):
         geom = env.obstacle_geometry
@@ -187,23 +155,15 @@ def main(cfg: Config):
             policy.selector_fn = sel.score
             policy.n_samples = cfg.best_of
             policy.mode_reduce = cfg.mode_reduce
+    rng = np.random.default_rng(cfg.seed)
+    bend = None
     if getattr(policy.config, "cond_dim", 0):
-        if cfg.cond == "zero":
+        bend = np.asarray(dataset.hf_dataset.with_format("numpy")["bend"])
+        if cfg.cond is Cond.ZERO:
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)
-        elif "," in cfg.cond:  # fixed bend command, e.g. "0.5,0.5"
-            vals = [float(v) for v in cfg.cond.split(",")]
-            policy.cond = torch.tensor([vals], device=device)
-        elif cfg.cond == "search":  # candidates scored + latched via selector
+        elif cfg.cond is Cond.SEARCH:  # candidates scored + latched via selector
             assert policy.selector_fn is not None, "search needs a selector"
-            if cfg.cond_grid:  # explicit hand grid
-                grid = [
-                    [float(v) for v in g.split(",")] for g in cfg.cond_grid.split(";")
-                ]
-                cand = torch.tensor(grid, device=device)
-            else:  # scalable: sample execution-validated modes from the data itself
-                cand = data_cond_candidates(
-                    dataset, cfg.n_cond, device, cfg.cond_whiten, cfg.cond_pick
-                )
+            cand = sample_cond(bend, cfg.n_cond, rng, device)
             policy.cond_candidates = cand
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
 
@@ -231,6 +191,8 @@ def main(cfg: Config):
             break
         policy.reset()
         env.reset()
+        if cfg.cond is Cond.RANDOM and bend is not None:
+            policy.cond = sample_cond(bend, n, rng, device)
         succ = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
         frame = 0
