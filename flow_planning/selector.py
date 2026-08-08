@@ -117,8 +117,6 @@ class AnalyticSelector:
         self.vlim = None if vlim is None else torch.as_tensor(vlim, **f32)
         self.obj = obj
         self.rad = self.fc.radii if radii else 0.0  # broadcast scalar when off
-        self.feas_n = self.feas_ok = self.feas_none = self.feas_calls = 0.0
-        self.n_worlds = 1  # set by eval; score() sees worlds and candidates flat
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
@@ -133,19 +131,6 @@ class AnalyticSelector:
             # so it picks the FASTEST arc (data-menu plans demand 5.6-9.3x
             # overspeed vs the grid's 1.8-2.3x, tracking the timeout gap).
             ok = clear >= self.margin
-            # supply vs execution: if NO candidate ever clears, the policy cannot
-            # generate a clearing plan and the fix is in augment.py; if candidates
-            # clear and the arm still hits, the fix is downstream of selection.
-            # Accumulate over replans -- a single call is one snapshot, and the
-            # last one lands after the episode is effectively decided.
-            self.feas_n += ok.numel()
-            self.feas_ok += float(ok.sum())
-            # per WORLD: flat .all() asks whether every candidate in every
-            # world failed, which is never true and reads as a clean 0.000
-            self.feas_none += float(
-                (~ok.view(self.n_worlds, -1)).all(dim=1).float().mean()
-            )
-            self.feas_calls += 1
             obj = (
                 self.overspeed(traj) if self.obj == "speed" else self.path_length(traj)
             )

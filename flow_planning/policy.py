@@ -259,7 +259,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.last_chunk = None
         self.last_traj = None
         self.lpf_state = None  # EMA state for the executed-action low-pass
-        self.last_shift = None
         self.latched_cond = None  # per-world bend picked at the first replan
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -370,7 +369,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             w = min(2 * na, h - 1)
             d = (last[:, :w, :sd] - cur[:, None]).norm(dim=-1)
             shift = d.argmin(dim=1)  # (n_worlds,)
-            self.last_shift = shift  # diagnostic: 0 every replan == plan rewinds
             idx = (torch.arange(h, device=x.device)[None] + shift[:, None]).clamp(
                 max=h - 1
             )

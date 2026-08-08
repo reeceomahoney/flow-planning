@@ -1,7 +1,7 @@
 """Roll out the trained policy: headless batched eval or interactive viewer."""
 
 import itertools
-import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 import cv2
@@ -28,7 +28,7 @@ class Config:
     repo_id: str = "reece-omahoney/franka"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
+    episodes: int = 1  # batches of env.world_count episodes, 0 = unlimited
     episode_seconds: float = 0.0  # 0 = train.py's 1.5 * env.episode_frames
     viewer: str = "none"  # "none", "rerun", or "opengl"
     video: str = ""  # non-empty: render headless to this mp4
@@ -177,7 +177,6 @@ def main(cfg: Config):
             obj=cfg.selector_obj,
             radii=cfg.selector_radii,
         )
-        sel.n_worlds = cfg.env.world_count
         if cfg.guidance_scale > 0:  # ablation: guidance instead of best-of-N selection
             policy.guidance_fn = lambda t: sel.guidance_cost(
                 t, cfg.guidance_margin, cfg.guidance_len
@@ -212,9 +211,6 @@ def main(cfg: Config):
     if arm:
         chain = build_franka_chain(device)[0]
         base_pos = np.asarray(env.robot_base_pos, np.float32)  # base frame -> world
-        gs = cfg.env.goal_state_start  # plan-cube dims, for hover diagnostics
-        cube_m = np.asarray(stats[OBS_STATE]["mean"])[gs : gs + 3]
-        cube_s = np.asarray(stats[OBS_STATE]["std"])[gs : gs + 3]
 
     n = cfg.env.world_count
     frames = (
@@ -224,12 +220,11 @@ def main(cfg: Config):
     )
     writer = None
     total_succ = total_fail = total = 0
-    plan_t, n_plan = 0.0, 0  # planning latency (only the frames that replan)
-    accels = []  # per-step action accel magnitudes (smoothness proxy)
     stages = getattr(env, "STAGES", None)  # franka pick-place stage ladder
-    stage_hist = np.zeros(len(stages) if stages else 0, int)
     nz = len(stages) if stages else 0
+    stage_hist = np.zeros(nz, int)
     stuck_hist = {k: np.zeros(nz, int) for k in ("timeout", "failure")}
+    contacts = Counter()  # what hit the wall, pooled over batches
     episodes = range(cfg.episodes) if cfg.episodes > 0 else itertools.count()
     for ep in episodes:
         if not viewer.is_running():
@@ -238,43 +233,13 @@ def main(cfg: Config):
         env.reset()
         succ = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
-        acts = []
-        plan_low = np.full(n, np.inf)  # closest interior plan-cube approach to goal
-        term_jumps, max_jumps = [], []
-        shifts = []  # warm-start re-anchor offset per replan
         frame = 0
         pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
         while frame < frames and viewer.is_running():
             if viewer.should_step():
                 obs = torch.from_numpy(env.get_obs())
-                replanning = len(policy._action_queue) == 0
-                if replanning:
-                    if device == "cuda":
-                        torch.cuda.synchronize()
-                    t0 = time.perf_counter()
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
-                if replanning:
-                    if device == "cuda":
-                        torch.cuda.synchronize()
-                    plan_t += time.perf_counter() - t0
-                    n_plan += 1
-                    if policy.last_shift is not None:
-                        shifts.append(policy.last_shift.cpu().numpy())
-                    if arm and policy.last_traj is not None:
-                        # hover diagnostics: does the plan descend to the goal
-                        # before the clamped final frame, or teleport into it?
-                        pc = policy.last_traj[..., gs : gs + 3].cpu().numpy()
-                        pc = pc * cube_s + cube_m
-                        gw = obs[:, -3:].numpy()
-                        d = np.linalg.norm(pc[:, :-1] - gw[:, None], axis=-1)
-                        plan_low = np.minimum(plan_low, d.min(axis=1))
-                        term_jumps.append(
-                            np.linalg.norm(pc[:, -1] - pc[:, -2], axis=-1)
-                        )
-                        steps = np.linalg.norm(np.diff(pc, axis=1), axis=-1)
-                        max_jumps.append(steps.max(axis=1))
                 phys = postprocessor(action).numpy().astype(np.float32)
-                acts.append(phys)
                 env.apply_action(phys)
                 if live and policy.last_chunk is not None:
                     chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
@@ -308,88 +273,27 @@ def main(cfg: Config):
             break
         fail = env.failure()
         stuck = ~succ & ~fail
-        a = np.stack(acts)  # (T, n, act_dim)
-        accel = np.linalg.norm(a[2:] - 2 * a[1:-1] + a[:-2], axis=-1)
-        accels.append(accel.ravel())
-        accel_p95 = np.percentile(accel, 95) if accel.size else float("nan")
         total_succ += int(succ.sum())
         total_fail += int(fail.sum())
         total += n
         print(
             f"batch {ep}: success {succ.mean():.3f} "
-            f"failure {fail.mean():.3f} timeout {stuck.mean():.3f} "
-            f"accel_p95 {accel_p95:.4f} "
+            f"failure {fail.mean():.3f} timeout {stuck.mean():.3f}"
         )
-        if shifts:  # re-anchor advance vs the n_action_steps it should be
-            s = np.stack(shifts)  # (replans, n_worlds)
-            print(
-                f"  re-anchor shift: median {np.median(s):.0f} "
-                f"frac_zero {(s == 0).mean():.2f} of {len(s)} replans"
-            )
-            if n <= 4:
-                print(f"    per-world seq: {s.T.tolist()}")
-        if n <= 16:  # which world is which, for picking one out in the viewer
-            tag = np.where(succ, "succ", np.where(fail, "FAIL", "stuck"))
-            print("  per-world: " + "  ".join(f"{i}:{t}" for i, t in enumerate(tag)))
-        if hasattr(env, "contact_labels") and fail.any():  # what hit the wall
-            labs = env.contact_labels()[fail]
-            uniq, cnt = np.unique(labs, return_counts=True)
-            order = np.argsort(-cnt)
-            hits = "  ".join(f"{uniq[i]}:{cnt[i]}" for i in order)
-            print(f"  wall contacts (n={fail.sum()}): {hits}")
-        if want_sel and policy.last_traj is not None:  # is the picked plan trackable?
-            ov = sel.overspeed(policy.last_traj).cpu().numpy()
-            print(f"  overspeed mean {ov.mean():.3f} p90 {np.percentile(ov, 90):.3f}")
-        if want_sel and sel.feas_calls:  # supply or execution?
-            print(
-                f"  plans clearing margin {sel.feas_ok / sel.feas_n:.3f}; "
-                f"mean fraction of WORLDS with no feasible candidate "
-                f"{sel.feas_none / sel.feas_calls:.3f} ({int(sel.feas_calls)} replans)"
-            )
-            sel.feas_n = sel.feas_ok = sel.feas_none = sel.feas_calls = 0.0
-        lc = policy.latched_cond
-        if searching and lc is not None:  # latent distribution, for diagnosis
-            lc = lc.cpu().numpy()
-            print(f"  latched cond mean {lc.mean(0).round(3)} std {lc.std(0).round(3)}")
-        if term_jumps:
-            tj, mj = np.concatenate(term_jumps), np.concatenate(max_jumps)
-            print(
-                f"  plan term_jump p50 {np.median(tj):.3f} "
-                f"p90 {np.percentile(tj, 90):.3f} "
-                f"max_jump p50 {np.median(mj):.3f} p90 {np.percentile(mj, 90):.3f}"
-            )
-            for name, m in (("succ", succ), ("fail", fail), ("stuck", stuck)):
-                if m.any():
-                    print(
-                        f"  plan_low[{name}] p50 {np.median(plan_low[m]):.3f} "
-                        f"p90 {np.percentile(plan_low[m], 90):.3f} "
-                        f"hover_frac {(plan_low[m] > 0.05).mean():.2f}"
-                    )
+        if hasattr(env, "contact_labels") and fail.any():
+            contacts.update(env.contact_labels()[fail].tolist())
         if stages is not None:
-            counts = np.bincount(max_stage, minlength=len(stages))
-            stage_hist += counts
-            print(
-                "  stage: "
-                + "  ".join(f"{name} {c / n:.2f}" for name, c in zip(stages, counts))
-            )
+            stage_hist += np.bincount(max_stage, minlength=nz)
             for name, m in (("timeout", stuck), ("failure", fail)):
                 if m.any():
-                    c = np.bincount(max_stage[m], minlength=len(stages))
-                    stuck_hist[name] += c
-                    print(
-                        f"  stage|{name} (n={m.sum()}): "
-                        + "  ".join(f"{s} {v / m.sum():.2f}" for s, v in zip(stages, c))
-                    )
+                    stuck_hist[name] += np.bincount(max_stage[m], minlength=nz)
 
     if total:
-        ac = np.concatenate(accels)
         print(
             f"overall: success {total_succ / total:.3f} "
             f"failure {total_fail / total:.3f} "
             f"timeout {(total - total_succ - total_fail) / total:.3f} "
-            f"accel_p95 {np.percentile(ac, 95):.4f} "
-            f"p99 {np.percentile(ac, 99):.4f} max {ac.max():.3f} "
-            f"({total} episodes)"
+            f"({total} episodes, cond {cfg.cond})"
         )
     if stages is not None and total:
         reward = sum(i * c for i, c in enumerate(stage_hist)) / total
@@ -407,8 +311,13 @@ def main(cfg: Config):
                     f"overall stage|{k} (n={h.sum()}): "
                     + "  ".join(f"{s} {v / h.sum():.3f}" for s, v in zip(stages, h))
                 )
-    if n_plan:
-        print(f"plan latency: {1e3 * plan_t / n_plan:.1f} ms/replan ({n_plan} replans)")
+    if contacts:
+        hits = "  ".join(f"{k}:{v}" for k, v in contacts.most_common())
+        print(f"wall contacts (n={sum(contacts.values())}): {hits}")
+    lc = policy.latched_cond
+    if searching and lc is not None:
+        lc = lc.cpu().numpy()
+        print(f"latched cond mean {lc.mean(0).round(3)} std {lc.std(0).round(3)}")
     if writer is not None:
         writer.release()
         print(f"Saved video to {cfg.video}")
