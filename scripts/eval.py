@@ -4,6 +4,7 @@ import itertools
 import time
 from dataclasses import dataclass, field
 
+import cv2
 import draccus
 import numpy as np
 import torch
@@ -24,18 +25,18 @@ from flow_planning.utils import latest_run_dir, make_viewer
 @dataclass
 class Config:
     env: EnvConfig = field(default_factory=FrankaConfig)
-    repo_id: str = "reece-omahoney/particle"
+    repo_id: str = "reece-omahoney/franka"
     checkpoint: str = ""  # empty: latest run under outputs/<env>
     device: str = "cuda"
-    episodes: int = 1  # batches of env.world_count episodes, 0 = unlimited
-    episode_seconds: float = 20.0
+    episodes: int = 2  # batches of env.world_count episodes, 0 = unlimited
+    episode_seconds: float = 0.0  # 0 = train.py's 1.5 * env.episode_frames
     viewer: str = "none"  # "none", "rerun", or "opengl"
-    rrd: str = ""  # record a rerun .rrd to this path (view locally: `rerun <rrd>`)
+    video: str = ""  # non-empty: render headless to this mp4
     seed: int = 0
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     best_of: int = 1  # >1: sample K plans/world, execute the lowest collision score
-    cond: str = "null"  # "null" | "zero" | "search" | "a,b,..." fixed
+    cond: str = "null"  # "null" | "zero" (unbent original) | "search" | "a,b" fixed
     cond_grid: str = ""  # override search candidates: "a,b,c;d,e,f;..."
     n_cond: int = 8  # search: # candidates drawn from the data when no cond_grid
     cond_whiten: bool = True  # scale-normalize bend dims before FPS candidate spread
@@ -102,7 +103,7 @@ def data_cond_candidates(
     modes = np.unique(bend, axis=0)  # distinct latents (bend is const per episode)
     if len(modes) <= k:
         return torch.tensor(modes, dtype=torch.float32, device=device)
-    # whiten: raw dims span 2.0 (lat) vs 0.8 (vert), so FPS ignores the short dim
+    # bend is polar (phi*cos(theta), phi*sin(theta)); whitening equalizes the axes
     w = modes / (modes.std(0) + 1e-6) if whiten else modes
     if pick == "dense":
         idx = dense_idx(w, k)
@@ -139,10 +140,13 @@ def main(cfg: Config):
     act_mean = np.asarray(stats[ACTION]["mean"])
     act_std = np.asarray(stats[ACTION]["std"])
 
-    live = cfg.viewer != "none" or bool(cfg.rrd)
-    viewer = make_viewer(cfg.viewer, cfg.rrd)
+    live = cfg.viewer != "none" or bool(cfg.video)
+    viewer = make_viewer(
+        "opengl" if cfg.video else cfg.viewer, headless=bool(cfg.video)
+    )
 
     env = make_env(cfg.env, viewer)
+    env.rng = np.random.default_rng(cfg.seed)  # same instances as train.py's evaluate
     arena = getattr(cfg.env, "arena_size", None)
     if arena is not None:  # particle: clamp actions to the arena
         low = torch.as_tensor(
@@ -213,7 +217,12 @@ def main(cfg: Config):
         cube_s = np.asarray(stats[OBS_STATE]["std"])[gs : gs + 3]
 
     n = cfg.env.world_count
-    frames = round(cfg.episode_seconds * cfg.env.fps)
+    frames = (
+        round(cfg.episode_seconds * cfg.env.fps)
+        if cfg.episode_seconds > 0
+        else int(1.5 * env.episode_frames)
+    )
+    writer = None
     total_succ = total_fail = total = 0
     plan_t, n_plan = 0.0, 0  # planning latency (only the frames that replan)
     accels = []  # per-step action accel magnitudes (smoothness proxy)
@@ -280,10 +289,20 @@ def main(cfg: Config):
                 succ |= env.success()
                 if stages is not None:
                     max_stage = np.maximum(max_stage, env.stage())
-                if (succ | env.failure()).all():
+                if not cfg.video and (succ | env.failure()).all():
                     break
             if live:
                 env.render()
+            if cfg.video:
+                f = viewer.get_frame().numpy()
+                if writer is None:
+                    writer = cv2.VideoWriter(
+                        cfg.video,
+                        cv2.VideoWriter.fourcc(*"mp4v"),
+                        cfg.env.fps,
+                        (f.shape[1], f.shape[0]),
+                    )
+                writer.write(f[..., ::-1])
         pbar.close()
         if not viewer.is_running():
             break
@@ -390,6 +409,9 @@ def main(cfg: Config):
                 )
     if n_plan:
         print(f"plan latency: {1e3 * plan_t / n_plan:.1f} ms/replan ({n_plan} replans)")
+    if writer is not None:
+        writer.release()
+        print(f"Saved video to {cfg.video}")
     viewer.close()
 
 

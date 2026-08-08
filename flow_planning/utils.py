@@ -9,12 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-def make_viewer(name: str, rrd: str = "", headless: bool = False):
-    if rrd:
-        import newton._src.viewer.viewer_rerun as vr
-
-        vr.is_jupyter_notebook = lambda: True  # ty: ignore[invalid-assignment]
-        return newton.viewer.ViewerRerun(record_to_rrd=rrd, keep_historical_data=True)
+def make_viewer(name: str, headless: bool = False):
     if name == "none":
         return newton.viewer.ViewerNull()
     if name == "opengl":
