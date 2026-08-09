@@ -26,7 +26,7 @@ class Config:
     dst_repo: str = "reece-omahoney/franka"
     copies: int = 2  # bent copies per episode; the original is always kept
     bend_min: float = 0.15  # half-angle, units of pi
-    bend_max: float = 0.75
+    bend_max: float = 1.0
     bend_margin: float = 1.5
     limit: int = 0
     ik_iters: int = 8  # per frame, warm-started

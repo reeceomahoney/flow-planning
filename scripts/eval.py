@@ -28,6 +28,7 @@ class Cond(enum.StrEnum):
     ZERO = "zero"  # the label the unbent originals carry
     RANDOM = "random"  # one uniform latent per world, redrawn each episode
     SEARCH = "search"  # n_cond uniform candidates, selector-scored and latched
+    SAMPLE = "sample"  # null token, n_cond noise draws, selector picks each replan
 
 
 @dataclass
@@ -103,7 +104,11 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     searching = cfg.cond is Cond.SEARCH
-    if searching and cfg.env.obstacle and hasattr(env, "ee_state_index"):
+    if (
+        cfg.cond in (Cond.SEARCH, Cond.SAMPLE)
+        and cfg.env.obstacle
+        and hasattr(env, "ee_state_index")
+    ):
         geom = env.obstacle_geometry
         sel = AnalyticSelector(
             geom["center"] + geom["half_extents"],
@@ -116,6 +121,10 @@ def main(cfg: Config):
             margin=cfg.selector_margin,
         )
         policy.selector_fn = sel.score
+    if cfg.cond is Cond.SAMPLE:
+        assert policy.selector_fn is not None, "sample needs --env.obstacle"
+        policy.n_samples = cfg.n_cond
+        print(f"null-token best-of-{cfg.n_cond} over noise")
     rng = np.random.default_rng(cfg.seed)
     bend = None
     if getattr(policy.config, "cond_dim", 0):

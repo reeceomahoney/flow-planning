@@ -224,6 +224,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.selector_fn = None  # optional plan scorer for candidate selection
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
+        self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -310,8 +311,10 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 searching = True
                 k = self.cond_candidates.shape[0]
                 cond = self.cond_candidates.repeat(n_worlds, 1)
-        elif self.config.cond_dim and self.cond is not None:
-            cond = self.cond.expand(n_worlds, -1)
+        else:
+            k = max(self.n_samples, 1)
+            if self.config.cond_dim and self.cond is not None:
+                cond = self.cond.expand(n_worlds * k, -1)
         if k > 1:
             obs = obs.repeat_interleave(k, dim=0)
         sd, gd = self.state_dim, self.config.goal_dim
