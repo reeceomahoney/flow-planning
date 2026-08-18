@@ -32,6 +32,9 @@ class Config:
     repo_id: str = "reece-omahoney/franka"
     batch_size: int = 256
     num_iters: int = 50_000
+    dim_model: int = 128
+    n_layers: int = 4
+    cond_dim: int = -1  # -1: take it from the dataset's bend feature
     warmup_iters: int = 500
     ema_decay: float = 0.999
     device: str = "cuda"
@@ -142,9 +145,13 @@ def main(cfg: Config):
         goal_dim=cfg.env.goal_dim,
         goal_state_start=cfg.env.goal_state_start,
         n_action_steps=cfg.env.n_action_steps,
-        cond_dim=dataset.features["bend"]["shape"][0]
+        cond_dim=cfg.cond_dim
+        if cfg.cond_dim >= 0
+        else dataset.features["bend"]["shape"][0]
         if "bend" in dataset.features
         else 0,
+        dim_model=cfg.dim_model,
+        n_layers=cfg.n_layers,
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
