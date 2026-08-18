@@ -62,12 +62,10 @@ class FlowMatchingConfig(PreTrainedConfig):
 
     # flow matching
     num_inference_steps: int = 10
-    action_lpf: float = 0.3  # EMA alpha on executed actions; <1 smooths seam jumps
 
     # bend-parameter conditioning (0 disables); dropout trains the null token
     cond_dim: int = 0
     cond_dropout: float = 0.15
-    adaln: bool = True  # ignored (AdaLN-Zero is the only path); kept for ckpt compat
 
     # training
     optimizer_lr: float = 1e-4
@@ -225,6 +223,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
+        self.guidance_scale = 1.0  # CFG on the bend/posture latent; 1 = off
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -236,7 +235,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def reset(self):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
-        self.lpf_state = None  # EMA state for the executed-action low-pass
         self.latched_cond = None  # per-world bend picked at the first replan
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -287,7 +285,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             x = x.clone()
             x[:, 0, :sd] = state
             x[:, -1, gs : gs + gd] = goal
-            v = self.model(x, t, cond)
+            if cond is not None and self.guidance_scale != 1.0:
+                vc = self.model(x, t, cond)
+                vu = self.model(x, t, None)
+                v = vu + self.guidance_scale * (vc - vu)
+            else:
+                v = self.model(x, t, cond)
             x = x + dt * v
         return x
 
@@ -356,18 +359,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             self.last_chunk = self.predict_action_chunk(batch)  # full horizon
             actions = self.last_chunk[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
-        action = self._action_queue.popleft()
-        # low-pass the executed action stream to smooth replan-seam jumps; EMA in
-        # normalized space == filtering physical actions (unnormalize is affine)
-        a = self.config.action_lpf
-        if a < 1.0:
-            self.lpf_state = (
-                action
-                if self.lpf_state is None
-                else a * action + (1 - a) * self.lpf_state
-            )
-            action = self.lpf_state
-        return action
+        return self._action_queue.popleft()
 
 
 def alias_goal_stats(

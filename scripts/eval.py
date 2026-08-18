@@ -46,18 +46,20 @@ class Config:
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     cond: Cond = Cond.NULL
     n_cond: int = 8  # search: uniform candidates drawn at startup
-    selector_margin: float = 0.0  # keep-out inflation on the collision check
+    guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
 
 
 def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
-    r = np.linalg.norm(bend, axis=1)
+    arc = bend[:, :2]
+    r = np.linalg.norm(arc, axis=1)
     nz = r > 0
     assert nz.any(), "dataset has no bent episodes; every bend label is zero"
-    ang = np.arctan2(bend[nz, 1], bend[nz, 0])
+    ang = np.arctan2(arc[nz, 1], arc[nz, 0])
     phi = rng.uniform(r[nz].min(), r.max(), k)
     theta = rng.uniform(ang.min(), ang.max(), k)
-    xy = np.stack([phi * np.cos(theta), phi * np.sin(theta)], axis=1)
-    return torch.tensor(xy, dtype=torch.float32, device=device)
+    cols = [phi * np.cos(theta), phi * np.sin(theta)]
+    cols += [rng.choice(np.unique(bend[:, j]), k) for j in range(2, bend.shape[1])]
+    return torch.tensor(np.stack(cols, axis=1), dtype=torch.float32, device=device)
 
 
 @draccus.wrap()
@@ -73,6 +75,7 @@ def main(cfg: Config):
         policy.config.n_action_steps = cfg.n_action_steps
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
+    policy.guidance_scale = cfg.guidance_scale
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -104,11 +107,7 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     searching = cfg.cond is Cond.SEARCH
-    if (
-        cfg.cond in (Cond.SEARCH, Cond.SAMPLE)
-        and cfg.env.obstacle
-        and hasattr(env, "ee_state_index")
-    ):
+    if cfg.env.obstacle and hasattr(env, "ee_state_index"):
         geom = env.obstacle_geometry
         sel = AnalyticSelector(
             geom["center"] + geom["half_extents"],
@@ -118,9 +117,9 @@ def main(cfg: Config):
             joint_start=policy.state_dim,
             device=device,
             cube_size=env.cube_size,
-            margin=cfg.selector_margin,
         )
-        policy.selector_fn = sel.score
+        if cfg.cond in (Cond.SEARCH, Cond.SAMPLE):
+            policy.selector_fn = sel.score
     if cfg.cond is Cond.SAMPLE:
         assert policy.selector_fn is not None, "sample needs --env.obstacle"
         policy.n_samples = cfg.n_cond
@@ -204,6 +203,7 @@ def main(cfg: Config):
         if not viewer.is_running():
             break
         fail = env.failure()
+        succ &= ~fail
         stuck = ~succ & ~fail
         total_succ += int(succ.sum())
         total_fail += int(fail.sum())

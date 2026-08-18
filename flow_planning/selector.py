@@ -17,6 +17,7 @@ ARM_FRAMES = ["link2", "link3", "link4", "link5", "link6", "link7", "hand"]
 # must clear the wall while the hand reaches a cube sitting right next to it.
 SEGMENT_RADII = [0.06, 0.06, 0.05, 0.05, 0.04, 0.04]  # link2-3 .. link7-hand
 HAND_RADIUS = 0.05
+FINGER_OFFSETS = [[0.0, 0.045, 0.135], [0.0, -0.045, 0.135]]
 HAND_OFFSETS = [
     [0.0, 0.0, 0.0],
     [0.0, 0.0, 0.06],
@@ -53,13 +54,17 @@ class FrankaCollision:
             self.frames.append(m)
         self.frame_indices = chain.get_frame_indices(*self.frames)
         self.hand_off = torch.as_tensor(
-            HAND_OFFSETS, dtype=torch.float32, device=device
+            HAND_OFFSETS + FINGER_OFFSETS, dtype=torch.float32, device=device
         )
         seg = torch.as_tensor(SEGMENT_RADII, dtype=torch.float32, device=device)
         self.radii = torch.cat(
             [
                 seg.repeat_interleave(interp + 1),
-                torch.full((len(HAND_OFFSETS),), HAND_RADIUS, device=device),
+                torch.full(
+                    (len(HAND_OFFSETS) + len(FINGER_OFFSETS),),
+                    HAND_RADIUS,
+                    device=device,
+                ),
             ]
         )  # (K,), aligned with arm_points
 
@@ -91,7 +96,6 @@ class AnalyticSelector:
         cube_size: float,
         cube_index: int = 18,
         n_arm: int = 7,
-        margin: float = 0.0,  # keep-out inflation; 0 = bare collision check
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.fc = FrankaCollision(device, base_pos, cube_size)
@@ -106,17 +110,15 @@ class AnalyticSelector:
         self.cm = torch.as_tensor(obs_stats["mean"], **f32)[ci : ci + 3]
         self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
-        self.margin = margin
         self.rad = self.fc.radii
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
-        """Total penetration below the keep-out margin. Ranking on clearance
-        instead games the goal clamp -- the safest plan never approaches the
-        cube at all -- so clearance past the margin buys nothing and every
-        collision-free plan ties."""
+        """Total penetration. Ranking on clearance instead games the goal clamp
+        -- the safest plan never approaches the cube at all -- so clearance buys
+        nothing and every collision-free plan ties."""
         out = [
-            (self.margin - self.clearance_t(traj[i : i + 1024])).clamp(min=0.0)
+            (-self.clearance_t(traj[i : i + 1024])).clamp(min=0.0)
             for i in range(0, len(traj), 1024)
         ]
         return torch.cat(out).sum(dim=1)
