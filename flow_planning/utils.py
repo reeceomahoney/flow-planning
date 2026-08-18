@@ -54,6 +54,9 @@ def latest_run_dir(base: str, env_name: str) -> Path:
 
 def quat_to_rot6d(q):
     """(n, 4) xyzw quaternions -> (n, 6) rotation representation."""
+    q = np.asarray(q, dtype=np.float64)
+    n = np.linalg.norm(q, axis=1, keepdims=True)
+    q = np.where(n > 1e-8, q / np.maximum(n, 1e-12), np.array([0.0, 0.0, 0.0, 1.0]))
     R = Rotation.from_quat(q).as_matrix()
     return np.concatenate([R[:, :, 0], R[:, :, 1]], axis=1).astype(np.float32)
 

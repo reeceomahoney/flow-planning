@@ -63,6 +63,7 @@ class FrankaConfig(EnvConfig):
     obstacle_height: float = 0.2
     obstacle_width: float = 0.15
     obstacle_thickness: float = 0.01
+    contact_depth: float = 0.005  # penetration below this is a graze, not a failure
 
     # keep cube/goal at least this far from the wall plane (feasible instances);
     # 0 = unconstrained. Wall-adjacent grasps (<8cm) are physically infeasible.
@@ -199,7 +200,9 @@ class FrankaEnv:
         self.control = self.model.control()
         self.contacts = self.model.contacts()
         self.obstacle_sensor = (
-            ObstacleContactSensor(self.model) if cfg.obstacle else None
+            ObstacleContactSensor(self.model, cfg.contact_depth)
+            if cfg.obstacle
+            else None
         )
 
         # state used only for FK queries (EE home pose, reset body poses)

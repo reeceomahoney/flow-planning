@@ -18,6 +18,7 @@ def obstacle_contact_kernel(
     shape_world: wp.array(dtype=wp.int32),
     shape_body: wp.array(dtype=wp.int32),
     body_q: wp.array(dtype=wp.transform),
+    depth_tol: float,
     # outputs
     contacted: wp.array(dtype=wp.int32),
     contact_shape: wp.array(dtype=wp.int32),
@@ -44,7 +45,7 @@ def obstacle_contact_kernel(
     p1 = wp.transform_point(x1, contact_point1[tid])
     gap = wp.dot(contact_normal[tid], p1 - p0)
     gap -= contact_margin0[tid] + contact_margin1[tid]
-    if gap >= 0.0:
+    if gap >= -depth_tol:
         return
 
     s = s0
@@ -59,7 +60,8 @@ def obstacle_contact_kernel(
 class ObstacleContactSensor:
     """Per-world latch set while anything is touching the obstacle."""
 
-    def __init__(self, model):
+    def __init__(self, model, depth_tol: float = 0.0):
+        self.depth_tol = depth_tol
         is_obstacle = np.array(
             [label.split("/")[-1] == "obstacle" for label in model.shape_label],
             np.int32,
@@ -98,6 +100,7 @@ class ObstacleContactSensor:
                 self.model.shape_world,
                 self.model.shape_body,
                 body_q,
+                self.depth_tol,
             ],
             outputs=[self.contacted, self.contact_shape],
         )
