@@ -51,7 +51,7 @@ HOME_Q = [
 class FrankaConfig(EnvConfig):
     ee_index: int = 11  # fr3_hand_tcp
     sim_substeps: int = 10
-    task_time: float = 1.0  # seconds per task phase
+    task_time: float = 1.5  # seconds per task phase
     ik_iters: int = 24
     cube_size: float = 0.05
     table_height: float = 0.1
@@ -60,14 +60,14 @@ class FrankaConfig(EnvConfig):
     lift_height: float = 0.25
 
     # barrier bisecting cube start and goal
-    obstacle_height: float = 0.2
+    obstacle_height: float = 0.25
     obstacle_width: float = 0.15
     obstacle_thickness: float = 0.01
     contact_depth: float = 0.005  # penetration below this is a graze, not a failure
 
     # keep cube/goal at least this far from the wall plane (feasible instances);
     # 0 = unconstrained. Wall-adjacent grasps (<8cm) are physically infeasible.
-    sample_wall_margin: float = 0.0
+    sample_wall_margin: float = 0.12
 
     goal_dim: int = 3  # goal xyz
     goal_state_start: int = 18  # cube pos block in the obs (9 joints + 3 EE + 6 rot6d)

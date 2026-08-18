@@ -21,5 +21,13 @@ run: |
   export PATH="$HOME/.pixi/bin:$PATH"
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 
-  pixi run python scripts/eval.py --env.type franka --env.task_time 1.5 \
-    --env.obstacle true --repo_id reece-omahoney/franka --cond search
+  bash scripts/pipeline.sh
+
+  EVAL="pixi run python scripts/eval.py --env.type franka \
+    --repo_id reece-omahoney/franka"
+
+  echo "=== obstacle (0.25m wall, feasible instances) ==="
+  $EVAL --env.obstacle true 2>&1 | grep -v "it/s"
+
+  echo "=== free space ==="
+  $EVAL --cond null 2>&1 | grep -v "it/s"

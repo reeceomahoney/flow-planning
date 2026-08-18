@@ -44,7 +44,7 @@ class Config:
     seed: int = 0
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
-    cond: Cond = Cond.NULL
+    cond: Cond = Cond.SEARCH
     n_cond: int = 8  # search: uniform candidates drawn at startup
     guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
 
