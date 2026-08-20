@@ -18,7 +18,7 @@ class Config:
     repo_id: str = "reece-omahoney/franka"
     episodes: str = "0,1,2"
     video: str = ""  # non-empty: render headless to this mp4 instead of a window
-    env: FrankaConfig = field(default_factory=FrankaConfig)
+    env: FrankaConfig = field(default_factory=lambda: FrankaConfig(world_count=1))
 
 
 @draccus.wrap()
