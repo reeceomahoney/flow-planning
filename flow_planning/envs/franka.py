@@ -594,6 +594,38 @@ class FrankaEnv:
             ],
         }
 
+    def scene_pointcloud(self, res: int = 160, fov: float = 60.0, voxel: float = 0.01):
+        g = self.obstacle_geometry
+        centers = np.array([g["center"], list(self.table_pos)], np.float32)
+        halves = np.array(
+            [g["half_extents"], [0.4, 0.4, 0.5 * self.cfg.table_height]], np.float32
+        )
+        eye = np.array([0.7, 0.2, 0.9], np.float32)
+        fwd = centers[0] - eye
+        fwd /= np.linalg.norm(fwd)
+        right = np.cross(fwd, [0.0, 0.0, 1.0])
+        right /= np.linalg.norm(right)
+        up = np.cross(right, fwd)
+        tanf = np.tan(np.radians(fov) / 2)
+        u, v = np.meshgrid(*[np.linspace(-tanf, tanf, res)] * 2)
+        dirs = fwd + u.reshape(-1, 1) * right + v.reshape(-1, 1) * up
+        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+        d = dirs[:, None, :]
+        with np.errstate(divide="ignore"):
+            t0 = (centers - halves - eye) / d
+            t1 = (centers + halves - eye) / d
+        tn = np.minimum(t0, t1).max(-1)
+        tf = np.maximum(t0, t1).min(-1)
+        tn[(tf < tn) | (tn <= 0)] = np.inf
+        t = tn.min(1)
+        pts = eye + dirs * t[:, None]
+        pts = pts[np.isfinite(t)]
+        pts = pts[pts[:, 2] > self.cfg.table_height + 0.005]
+        _, idx = np.unique(
+            np.round(pts / voxel).astype(np.int64), axis=0, return_index=True
+        )
+        return pts[idx].astype(np.float32)
+
     # --------------------------------------------------------------- render
     def render(self):
         self.viewer.begin_frame(self.sim_time)

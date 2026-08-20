@@ -46,6 +46,7 @@ class Config:
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     cond: Cond = Cond.SEARCH
     n_cond: int = 8  # search: uniform candidates drawn at startup
+    collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
     guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
 
 
@@ -109,6 +110,9 @@ def main(cfg: Config):
     searching = cfg.cond is Cond.SEARCH
     if cfg.env.obstacle and hasattr(env, "ee_state_index"):
         geom = env.obstacle_geometry
+        cloud = env.scene_pointcloud() if cfg.collision == "pointcloud" else None
+        if cloud is not None:
+            print(f"scene pointcloud: {len(cloud)} points")
         sel = AnalyticSelector(
             geom["center"] + geom["half_extents"],
             list(env.robot_base_pos),
@@ -117,6 +121,7 @@ def main(cfg: Config):
             joint_start=policy.state_dim,
             device=device,
             cube_size=env.cube_size,
+            pointcloud=cloud,
         )
         if cfg.cond in (Cond.SEARCH, Cond.SAMPLE):
             policy.selector_fn = sel.score

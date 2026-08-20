@@ -96,10 +96,12 @@ class AnalyticSelector:
         cube_size: float,
         cube_index: int = 18,
         n_arm: int = 7,
+        pointcloud=None,
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.fc = FrankaCollision(device, base_pos, cube_size)
         self.box = torch.as_tensor(box, **f32).view(1, 6)
+        self.cloud = None if pointcloud is None else torch.as_tensor(pointcloud, **f32)
         self.jm = torch.as_tensor(joint_stats["mean"], **f32)[:n_arm]
         self.js = torch.as_tensor(joint_stats["std"], **f32)[:n_arm]
         # the plan's predicted joint STATES share the action normalization only
@@ -123,11 +125,21 @@ class AnalyticSelector:
         ]
         return torch.cat(out).sum(dim=1)
 
+    def dist(self, points: Tensor) -> Tensor:
+        if self.cloud is None:
+            return box_sdf(points, self.box[:, :3], self.box[:, 3:])
+        p = points.reshape(-1, 3)
+        step = 1 << 19
+        out = [
+            torch.cdist(p[i : i + step], self.cloud).amin(dim=1)
+            for i in range(0, len(p), step)
+        ]
+        return torch.cat(out).reshape(points.shape[:-1])
+
     def clearance_t(self, traj: Tensor) -> Tensor:
         """Per-timestep worst clearance (b, t): min over arm points, the cube, and
         both joint sources."""
         s, n = self.joint_start, self.n_arm
-        center, half = self.box[:, :3], self.box[:, None, None, 3:]
         cube = traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
         # require both the joint targets and the plan's own predicted states to
         # clear: the two disagree by the controller's tracking lag
@@ -139,8 +151,7 @@ class AnalyticSelector:
         for q in sources:
             b, t = q.shape[:2]
             pts = self.fc.arm_points(q.reshape(-1, n).float()).reshape(b, t, -1, 3)
-            d = box_sdf(pts + self.fc.base_pos, center[:, None, None], half)
+            d = self.dist(pts + self.fc.base_pos)
             worst.append((d - self.rad).amin(dim=2))  # (b, t), mesh not centreline
-        dc = box_sdf(cube[:, :, None].float(), center[:, None, None], half)
-        worst.append(dc.amin(dim=2) - self.fc.cube_half)
+        worst.append(self.dist(cube.float()) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)
