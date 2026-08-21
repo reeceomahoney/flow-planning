@@ -215,6 +215,8 @@ class LiberoEnv:
 
     def __init__(self, cfg: LiberoConfig, viewer=None):
         import mujoco
+
+        safe_root = libero_setup()
         from libero.libero.envs.env_wrapper import ControlEnv
 
         self.cfg = cfg
@@ -224,7 +226,7 @@ class LiberoEnv:
         self.language = " ".join(
             re.sub(r"^[A-Z_0-9]+SCENE\d+_", "", self.name).split("_")
         )
-        bddl, init = task_files(cfg, libero_setup())
+        bddl, init = task_files(cfg, safe_root)
         self.init_states = np.asarray(torch.load(init, weights_only=False))
         self.envs = [
             ControlEnv(
