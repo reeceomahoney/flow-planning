@@ -9,7 +9,8 @@ CACHE=~/.cache/huggingface/lerobot/$REPO
 
 [ -d $CACHE ] || pixi run python scripts/convert_libero.py $ENV --repo_id $REPO
 
-pixi run python scripts/train.py $ENV --repo_id $REPO --eval_episodes 50
+[ "${TRAIN:-1}" = 0 ] || pixi run python scripts/train.py $ENV --repo_id $REPO \
+  --num_iters 20000 --eval_episodes 50
 
 EVAL="pixi run python scripts/eval.py $ENV --repo_id $REPO --episodes 10"
 
