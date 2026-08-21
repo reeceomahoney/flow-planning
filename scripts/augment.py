@@ -6,15 +6,20 @@ import numpy as np
 import pytorch_kinematics as pk
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from pytorch_kinematics.transforms import (
-    matrix_to_axis_angle,
-    matrix_to_quaternion,
-    quaternion_to_matrix,
-)
 from scipy.signal import lfilter, lfilter_zi
 from tqdm import tqdm
 
-from flow_planning.bend import ARM, CUBE, EE, ROT, bend_delta, transit_segments
+from flow_planning.bend import (
+    ARM,
+    CUBE,
+    EE,
+    ROT,
+    bend_delta,
+    fk,
+    solve_seq,
+    tpad,
+    transit_segments,
+)
 from flow_planning.envs import EnvConfig, FrankaConfig
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
 from flow_planning.selector import FrankaCollision, box_sdf
@@ -49,46 +54,6 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 ALPHAS = np.linspace(0.0, 0.98, 25)
 
 
-def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
-    th = torch.as_tensor(np.asarray(q), dtype=torch.float32, device=DEV)
-    m = chain.forward_kinematics(th).get_matrix()
-    pos = m[:, :3, 3].cpu().numpy() + base
-    quat = matrix_to_quaternion(m[:, :3, :3])[:, [1, 2, 3, 0]].cpu().numpy()
-    return pos, quat
-
-
-def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
-    """(T, B, 3/4) world targets + (B, 7) initial joints -> (T, B, 7).
-
-    Damped least squares, batched over copies and SEQUENTIAL over frames: each
-    frame warm-starts from the last. Independent solves hop posture families
-    and are unusably jerky."""
-
-    lo, hi = (torch.tensor(x, device=DEV) for x in chain.get_joint_limits())
-    eye = damping * torch.eye(6, device=DEV)
-    p = torch.as_tensor(ee_t - base, dtype=torch.float32, device=DEV)
-    q = torch.as_tensor(quat_t[..., [3, 0, 1, 2]], dtype=torch.float32, device=DEV)
-    rot = quaternion_to_matrix(q)
-    th = torch.as_tensor(seed0, dtype=torch.float32, device=DEV)
-    out = torch.empty(p.shape[:2] + (7,), device=DEV)
-    for t in range(len(p)):
-        # IK loop
-        for _ in range(iters):
-            jac, m = chain.jacobian(th, ret_eef_pose=True)
-            err = torch.cat(
-                [
-                    p[t] - m[:, :3, 3],
-                    matrix_to_axis_angle(rot[t] @ m[:, :3, :3].transpose(1, 2)),
-                ],
-                dim=-1,
-            )
-            jt = jac.transpose(1, 2)
-            th = th + (jt @ torch.linalg.solve(jac @ jt + eye, err[..., None]))[..., 0]
-            th = th.clamp(lo, hi)
-        out[t] = th
-    return out.cpu().numpy()
-
-
 def held_block(obs, close, opened, n_obj) -> slice:
     ee = obs[close:opened, EE] - obs[close, EE]
     errs = []
@@ -97,10 +62,6 @@ def held_block(obs, close, opened, n_obj) -> slice:
         errs.append(np.abs(obs[close:opened, blk] - obs[close, blk] - ee).mean())
     k = int(np.argmin(errs))
     return slice(CUBE.start + 9 * k, CUBE.start + 9 * k + 3)
-
-
-def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
-    return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
 
 
 def write(dst, obs, act, bend):

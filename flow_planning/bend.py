@@ -1,4 +1,10 @@
 import numpy as np
+import torch
+from pytorch_kinematics.transforms import (
+    matrix_to_axis_angle,
+    matrix_to_quaternion,
+    quaternion_to_matrix,
+)
 
 ARM, EE, ROT, CUBE = slice(0, 7), slice(9, 12), slice(12, 18), slice(18, 21)
 
@@ -37,3 +43,49 @@ def bend_delta(ee, s0, s1, phi, theta):
 
     d[s0:s1] = arc - ee[s0:s1]
     return d
+
+
+def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
+    th = torch.as_tensor(np.asarray(q), dtype=torch.float32, device=chain.device)
+    m = chain.forward_kinematics(th).get_matrix()
+    pos = m[:, :3, 3].cpu().numpy() + base
+    quat = matrix_to_quaternion(m[:, :3, :3])[:, [1, 2, 3, 0]].cpu().numpy()
+    return pos, quat
+
+
+def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
+    """(T, B, 3/4) world targets + (B, 7) initial joints -> (T, B, 7).
+
+    Damped least squares, batched over copies and SEQUENTIAL over frames: each
+    frame warm-starts from the last. Independent solves hop posture families
+    and are unusably jerky."""
+
+    lo, hi = (torch.tensor(x, device=chain.device) for x in chain.get_joint_limits())
+    eye = damping * torch.eye(6, device=chain.device)
+    p = torch.as_tensor(ee_t - base, dtype=torch.float32, device=chain.device)
+    q = torch.as_tensor(
+        quat_t[..., [3, 0, 1, 2]], dtype=torch.float32, device=chain.device
+    )
+    rot = quaternion_to_matrix(q)
+    th = torch.as_tensor(seed0, dtype=torch.float32, device=chain.device)
+    out = torch.empty(p.shape[:2] + (7,), device=chain.device)
+    for t in range(len(p)):
+        # IK loop
+        for _ in range(iters):
+            jac, m = chain.jacobian(th, ret_eef_pose=True)
+            err = torch.cat(
+                [
+                    p[t] - m[:, :3, 3],
+                    matrix_to_axis_angle(rot[t] @ m[:, :3, :3].transpose(1, 2)),
+                ],
+                dim=-1,
+            )
+            jt = jac.transpose(1, 2)
+            th = th + (jt @ torch.linalg.solve(jac @ jt + eye, err[..., None]))[..., 0]
+            th = th.clamp(lo, hi)
+        out[t] = th
+    return out.cpu().numpy()
+
+
+def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
+    return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])

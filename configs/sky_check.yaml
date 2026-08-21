@@ -1,0 +1,19 @@
+name: flow-check
+
+resources:
+  infra: ssh/ori
+  accelerators: RTX4090:1
+  cpus: 8
+
+envs:
+  HF_TOKEN:
+  CUDA_VISIBLE_DEVICES: 1
+  HF_DATASETS_DISABLE_PROGRESS_BARS: 1
+  CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  ARGS: ""
+workdir: .
+
+run: |
+  export PATH="$HOME/.pixi/bin:$PATH"
+  export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
+  pixi run python scripts/check_aug.py $ARGS 2>&1 | grep -vE "it/s\]|Warning|WARNING|macro"
