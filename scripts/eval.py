@@ -92,8 +92,10 @@ def main(cfg: Config):
     act_std = np.asarray(stats[ACTION]["std"])
 
     live = cfg.viewer != "none" or bool(cfg.video)
+    own_frames = getattr(cfg.env, "render", False)
     viewer = make_viewer(
-        "opengl" if cfg.video else cfg.viewer, headless=bool(cfg.video)
+        "opengl" if cfg.video and not own_frames else cfg.viewer,
+        headless=bool(cfg.video),
     )
 
     env = make_env(cfg.env, viewer)
@@ -213,7 +215,7 @@ def main(cfg: Config):
             if live:
                 env.render()
             if cfg.video:
-                f = viewer.get_frame().numpy()
+                f = env.get_frame() if own_frames else viewer.get_frame().numpy()
                 if writer is None:
                     writer = cv2.VideoWriter(
                         cfg.video,

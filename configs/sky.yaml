@@ -13,6 +13,7 @@ envs:
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
   TRAIN: 1
   AUG: 1
+  VIDEO: 0
 workdir: .
 
 setup: |

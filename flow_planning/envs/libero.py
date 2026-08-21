@@ -73,6 +73,8 @@ class LiberoConfig(EnvConfig):
     delta_max: float = 0.2
     settle_steps: int = 10
     collision_displacement: float = 0.001
+    render: bool = False
+    render_size: int = 256
 
 
 def task_name(cfg: LiberoConfig) -> str:
@@ -216,6 +218,8 @@ class LiberoEnv:
     def __init__(self, cfg: LiberoConfig, viewer=None):
         import mujoco
 
+        if cfg.render:
+            os.environ.setdefault("MUJOCO_GL", "egl")
         safe_root = libero_setup()
         from libero.libero.envs.env_wrapper import ControlEnv
 
@@ -232,12 +236,14 @@ class LiberoEnv:
             ControlEnv(
                 bddl_file_name=str(bddl),
                 controller="JOINT_POSITION",
-                use_camera_obs=False,
-                has_offscreen_renderer=False,
+                use_camera_obs=cfg.render and i == 0,
+                has_offscreen_renderer=cfg.render and i == 0,
                 has_renderer=False,
-                camera_names=[],
+                camera_names=["agentview"] if cfg.render and i == 0 else [],
+                camera_heights=cfg.render_size,
+                camera_widths=cfg.render_size,
             )
-            for _ in range(cfg.world_count)
+            for i in range(cfg.world_count)
         ]
         for e in self.envs:
             e.seed(0)
@@ -384,6 +390,9 @@ class LiberoEnv:
     def obstacle_geometry(self):
         box = self.obstacle_boxes()[0]
         return {"center": box[:3].tolist(), "half_extents": box[3:].tolist()}
+
+    def get_frame(self):
+        return np.ascontiguousarray(self.obs[0]["agentview_image"][::-1, ::-1])
 
     def set_predicted_path(self, positions):
         pass

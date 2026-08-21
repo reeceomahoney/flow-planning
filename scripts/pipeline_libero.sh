@@ -22,6 +22,16 @@ fi
 
 EVAL="pixi run python scripts/eval.py $ENV --repo_id $REPO --episodes 10"
 
+if [ "${VIDEO:-0}" = 1 ]; then
+  V="$EVAL --env.world_count 1 --env.render true --episodes 5"
+  $V --cond zero --video vid_free.mp4 2>&1 | grep -v "it/s"
+  for L in I II; do
+    $V --env.obstacle true --env.level $L --cond $COND --n_cond 8 \
+      --video vid_level_$L.mp4 2>&1 | grep -v "it/s"
+  done
+  exit 0
+fi
+
 echo "=== free space ==="
 $EVAL --cond zero 2>&1 | grep -v "it/s"
 
