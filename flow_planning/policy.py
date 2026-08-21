@@ -308,8 +308,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # where the selector keeps the plan with the lowest collision score
         cond, k, searching = None, 1, False
         if self.config.cond_dim and self.cond_candidates is not None:
-            if self.latched_cond is not None:
-                cond = self.latched_cond
+            if self.latched_cond is not None:  # best-of-n_samples in the held mode
+                k = max(self.n_samples, 1)
+                cond = self.latched_cond.repeat_interleave(k, dim=0)
             else:
                 searching = True
                 k = self.cond_candidates.shape[0]

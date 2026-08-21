@@ -239,7 +239,7 @@ class FrankaEnv:
             ),
             xform=wp.transform(self.robot_base_pos, wp.quat_identity()),
             floating=False,
-            enable_self_collisions=False,
+            enable_self_collisions=True,
             parse_visuals_as_colliders=False,
         )
 

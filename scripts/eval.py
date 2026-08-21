@@ -29,6 +29,7 @@ class Cond(enum.StrEnum):
     RANDOM = "random"  # one uniform latent per world, redrawn each episode
     SEARCH = "search"  # n_cond uniform candidates, selector-scored and latched
     SAMPLE = "sample"  # null token, n_cond noise draws, selector picks each replan
+    ORACLE = "oracle"  # true wall [height, width] as the label (DemoGen arm)
 
 
 @dataclass
@@ -123,7 +124,11 @@ def main(cfg: Config):
             cube_size=env.cube_size,
             pointcloud=cloud,
         )
-        if cfg.cond in (Cond.SEARCH, Cond.SAMPLE):
+        joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
+        sel.fc.calibrate_self(torch.as_tensor(joints, device=device))
+        if cfg.cond in (Cond.SEARCH, Cond.SAMPLE) or (
+            cfg.cond is Cond.ORACLE and cfg.n_cond > 1
+        ):
             policy.selector_fn = sel.score
     if cfg.cond is Cond.SAMPLE:
         assert policy.selector_fn is not None, "sample needs --env.obstacle"
@@ -135,10 +140,19 @@ def main(cfg: Config):
         bend = hf_column(dataset.hf_dataset, "bend")
         if cfg.cond is Cond.ZERO:
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)
+        elif cfg.cond is Cond.ORACLE:
+            assert isinstance(cfg.env, FrankaConfig) and cfg.env.obstacle
+            policy.cond = torch.tensor(
+                [[cfg.env.obstacle_height, cfg.env.obstacle_width]], device=device
+            )
+            if policy.selector_fn is not None:
+                policy.n_samples = cfg.n_cond
+                print(f"oracle cond best-of-{cfg.n_cond} over noise")
         elif cfg.cond is Cond.SEARCH:  # candidates scored + latched via selector
             assert policy.selector_fn is not None, "search needs --env.obstacle"
             cand = sample_cond(bend, cfg.n_cond, rng, device)
             policy.cond_candidates = cand
+            policy.n_samples = cfg.n_cond
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
 
     arm = hasattr(env, "ee_state_index")  # franka: planned path needs EE FK
