@@ -9,6 +9,14 @@ CACHE=~/.cache/huggingface/lerobot/$REPO
 
 [ -d $CACHE ] || pixi run python scripts/convert_libero.py $ENV --repo_id $REPO
 
+COND="sample"
+if [ "${AUG:-1}" = 1 ]; then
+  [ -d ${CACHE}_bend ] || pixi run python scripts/augment.py $ENV \
+    --src_repo $REPO --dst_repo ${REPO}_bend --bend_margin 0.3
+  REPO=${REPO}_bend
+  COND="search"
+fi
+
 [ "${TRAIN:-1}" = 0 ] || pixi run python scripts/train.py $ENV --repo_id $REPO \
   --num_iters 20000 --eval_episodes 50
 
@@ -19,5 +27,5 @@ $EVAL --cond zero 2>&1 | grep -v "it/s"
 
 for L in I II; do
   echo "=== SafeLIBERO level $L ==="
-  $EVAL --env.obstacle true --env.level $L --cond sample --n_cond 8 2>&1 | grep -v "it/s"
+  $EVAL --env.obstacle true --env.level $L --cond $COND --n_cond 8 2>&1 | grep -v "it/s"
 done

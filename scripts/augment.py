@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import draccus
@@ -15,7 +15,7 @@ from scipy.signal import lfilter, lfilter_zi
 from tqdm import tqdm
 
 from flow_planning.bend import ARM, CUBE, EE, ROT, bend_delta, transit_segments
-from flow_planning.envs import FrankaConfig
+from flow_planning.envs import EnvConfig, FrankaConfig
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
 from flow_planning.selector import FrankaCollision, box_sdf
 from flow_planning.utils import hf_column, quat_to_rot6d
@@ -33,7 +33,7 @@ class Config:
     ik_iters: int = 8  # per frame, warm-started
     ik_damping: float = 0.05
     seed: int = 0
-    env: FrankaConfig = field(default_factory=FrankaConfig)  # table geometry only
+    env: EnvConfig = field(default_factory=FrankaConfig)  # table geometry only
 
     demogen: bool = False
     wall_h_min: float = 0.10
@@ -87,6 +87,16 @@ def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
             th = th.clamp(lo, hi)
         out[t] = th
     return out.cpu().numpy()
+
+
+def held_block(obs, close, opened, n_obj) -> slice:
+    ee = obs[close:opened, EE] - obs[close, EE]
+    errs = []
+    for k in range(n_obj):
+        blk = slice(CUBE.start + 9 * k, CUBE.start + 9 * k + 3)
+        errs.append(np.abs(obs[close:opened, blk] - obs[close, blk] - ee).mean())
+    k = int(np.argmin(errs))
+    return slice(CUBE.start + 9 * k, CUBE.start + 9 * k + 3)
 
 
 def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
@@ -158,7 +168,7 @@ def lag_states(x, chain, base, alpha):
 
     # shift the cube by the EE displacement over the frames it is held
     held = slice(x["close"], x["opened"])
-    new[held, CUBE] += ee[held] - obs[held, EE]
+    new[held, x["blk"]] += ee[held] - obs[held, EE]
     return new.astype(np.float32)
 
 
@@ -167,7 +177,20 @@ def main(cfg: Config):
     rng = np.random.default_rng(cfg.seed)
 
     # build kinematic chain
-    base = np.array([-0.5, -0.5, cfg.env.table_height], np.float32)
+    n_obj = None
+    if isinstance(cfg.env, FrankaConfig):
+        base = np.array([-0.5, -0.5, cfg.env.table_height], np.float32)
+        cube_size = cfg.env.cube_size
+    else:
+        assert not cfg.demogen, "demogen bends need the franka wall geometry"
+        from flow_planning.envs.libero import LiberoConfig, LiberoEnv
+
+        assert isinstance(cfg.env, LiberoConfig)
+        lenv = LiberoEnv(replace(cfg.env, world_count=1, obstacle=False))
+        base = np.asarray(lenv.robot_base_pos, np.float32)
+        cube_size = 0.0
+        n_obj = len(lenv.objects)
+        del lenv
     chain, _, _ = build_franka_chain("cpu")
     chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
 
@@ -209,8 +232,17 @@ def main(cfg: Config):
         if opened - close < 2 * margin:
             continue
         act_ee, act_quat = fk(chain, act[:, :7], base)
+        blk = CUBE if n_obj is None else held_block(obs, close, opened, n_obj)
         todo.append(
-            dict(obs=obs, act=act, close=close, opened=opened, ee=act_ee, quat=act_quat)
+            dict(
+                obs=obs,
+                act=act,
+                close=close,
+                opened=opened,
+                ee=act_ee,
+                quat=act_quat,
+                blk=blk,
+            )
         )
 
     # take the alpha with the lowest prediction error
@@ -235,7 +267,8 @@ def main(cfg: Config):
     ee_err: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     written = rej_ik = rej_plan = rej_wall = rej_body = 0
-    fcol = FrankaCollision(DEV, base, cfg.env.cube_size)
+    fcol = FrankaCollision(DEV, base, cube_size)
+    jerk_limit = 0.6 * (50 / src.fps) ** 2
     base_t = torch.as_tensor(base, dtype=torch.float32, device=DEV)
     fcol.calibrate_self(
         torch.as_tensor(obs_all[::50, :7], dtype=torch.float32, device=DEV)
@@ -304,7 +337,7 @@ def main(cfg: Config):
             nf = len(x["act"])
             err = np.linalg.norm(achieved[:nf, i] - x["ee_t"], axis=1)
             jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
-            if err.max() > 0.05 or jerk > 0.6:
+            if err.max() > 0.05 or jerk > jerk_limit:
                 rejected.append(x)
                 rej_ik += 1
                 continue
@@ -316,7 +349,9 @@ def main(cfg: Config):
 
             # reject copies whose arm folds into itself or the held cube
             q = torch.as_tensor(na_j[:nf, i], dtype=torch.float32, device=DEV)
-            cube = torch.as_tensor(new_obs[:, CUBE], device=DEV) - base_t
+            cube = None
+            if cube_size > 0:
+                cube = torch.as_tensor(new_obs[:, CUBE], device=DEV) - base_t
             body, pts = fcol.body_penetration(q, cube)
             if float(body.max()) > 0.0:
                 rejected.append(x)
