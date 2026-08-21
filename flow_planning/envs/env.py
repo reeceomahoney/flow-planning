@@ -19,6 +19,14 @@ class EnvConfig(draccus.ChoiceRegistry):
         return self.get_choice_name(self.__class__)
 
 
+@EnvConfig.register_subclass("piper")
+@dataclass
+class PiperConfig(EnvConfig):
+    fps: int = 20
+    goal_dim: int = 0
+    n_action_steps: int = 30
+
+
 def world_offset(viewer, first=False):
     o = getattr(viewer, "world_offsets", None)
     if o is None:

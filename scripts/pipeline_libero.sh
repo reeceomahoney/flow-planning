@@ -3,7 +3,7 @@ set -e
 
 SUITE=${1:-safelibero_goal}
 TASK=${2:-0}
-REPO=reece-omahoney/${SUITE}_${TASK}
+REPO=reece-omahoney/${SUITE}_${TASK}_v2
 ENV="--env.type libero --env.suite $SUITE --env.task_id $TASK"
 CACHE=~/.cache/huggingface/lerobot/$REPO
 

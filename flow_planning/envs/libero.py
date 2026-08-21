@@ -53,7 +53,6 @@ MAX_STEPS = {
     "safelibero_goal": 300,
     "safelibero_long": 520,
 }
-SAFE_ONLY = re.compile(r"obstacle|^box_(small_)?base")
 DUMMY_ACTION = np.array([0.0] * 7 + [-1.0], np.float32)
 WORKSPACE = 0.5
 GRIPPER_OPEN = 0.04
@@ -253,9 +252,7 @@ class LiberoEnv:
             c["output_min"] = -cfg.delta_max
         sim = self.envs[0].sim
         self.robot_base_pos = sim.data.get_body_xpos("robot0_base").copy()
-        self.objects = sorted(
-            n for n in self.envs[0].env.objects_dict if not SAFE_ONLY.search(n)
-        )
+        self.objects = sorted(self.envs[0].obj_of_interest)
         m = sim.model._model
         joints = [
             (mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j), m.jnt_qposadr[j])
