@@ -109,6 +109,7 @@ def main(cfg: Config):
         policy.action_clip = (low, high)
 
     searching = cfg.cond is Cond.SEARCH
+    sel = None
     if cfg.env.obstacle and hasattr(env, "ee_state_index"):
         geom = env.obstacle_geometry
         cloud = env.scene_pointcloud() if cfg.collision == "pointcloud" else None
@@ -122,6 +123,7 @@ def main(cfg: Config):
             joint_start=policy.state_dim,
             device=device,
             cube_size=env.cube_size,
+            cube_index=getattr(env, "cube_index", 18),
             pointcloud=cloud,
         )
         joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
@@ -164,10 +166,10 @@ def main(cfg: Config):
     frames = (
         round(cfg.episode_seconds * cfg.env.fps)
         if cfg.episode_seconds > 0
-        else int(1.5 * env.episode_frames)
+        else getattr(env, "max_frames", int(1.5 * env.episode_frames))
     )
     writer = None
-    total_succ = total_fail = total = 0
+    total_succ = total_fail = total_task = total = 0
     stages = getattr(env, "STAGES", None)  # franka pick-place stage ladder
     nz = len(stages) if stages else 0
     stage_hist = np.zeros(nz, int)
@@ -179,6 +181,8 @@ def main(cfg: Config):
             break
         policy.reset()
         env.reset()
+        if sel is not None and hasattr(env, "obstacle_boxes"):
+            sel.set_boxes(env.obstacle_boxes())
         if cfg.cond is Cond.RANDOM and bend is not None:
             policy.cond = sample_cond(bend, n, rng, device)
         succ = np.zeros(n, dtype=bool)
@@ -222,6 +226,7 @@ def main(cfg: Config):
         if not viewer.is_running():
             break
         fail = env.failure()
+        total_task += int(succ.sum())
         succ &= ~fail
         stuck = ~succ & ~fail
         total_succ += int(succ.sum())
@@ -246,6 +251,11 @@ def main(cfg: Config):
             f"timeout {(total - total_succ - total_fail) / total:.3f} "
             f"({total} episodes, cond {cfg.cond})"
         )
+        if total_task != total_succ:
+            print(
+                f"overall task success incl. collisions {total_task / total:.3f} "
+                f"collision avoidance {1 - total_fail / total:.3f}"
+            )
     if stages is not None and total:
         reward = sum(i * c for i, c in enumerate(stage_hist)) / total
         print(f"overall reward (avg furthest stage reached): {reward:.2f}")

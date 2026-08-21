@@ -142,11 +142,13 @@ class FrankaCollision:
         d = box_sdf(pts[:, self.arm_mask], cube[:, None], self.cube_half)
         return (self.radius - d).clamp(min=0.0).amax(dim=1)
 
-    def body_penetration(self, q: Tensor, cube: Tensor) -> tuple[Tensor, Tensor]:
+    def body_penetration(self, q: Tensor, cube: Tensor | None) -> tuple[Tensor, Tensor]:
         """(m,) worst self + held-cube penetration per frame, and the points."""
         mats, pts = self.forward(q)
         pen = (self.self_gap - self.self_dists(mats, pts)).clamp(min=0.0).amax(dim=1)
-        return pen + self.cube_penetration(pts, cube), pts
+        if cube is not None:
+            pen = pen + self.cube_penetration(pts, cube)
+        return pen, pts
 
 
 class AnalyticSelector:
@@ -159,13 +161,14 @@ class AnalyticSelector:
         joint_start: int,
         device,
         cube_size: float,
-        cube_index: int = 18,
+        cube_index: int | None = 18,
         n_arm: int = 7,
         pointcloud=None,
     ):
         f32 = {"dtype": torch.float32, "device": device}
+        self.device = device
         self.fc = FrankaCollision(device, base_pos, cube_size)
-        self.box = torch.as_tensor(box, **f32).view(1, 6)
+        self.box = torch.as_tensor(box, **f32).view(-1, 6)
         self.cloud = None if pointcloud is None else torch.as_tensor(pointcloud, **f32)
         self.jm = torch.as_tensor(joint_stats["mean"], **f32)[:n_arm]
         self.js = torch.as_tensor(joint_stats["std"], **f32)[:n_arm]
@@ -174,26 +177,36 @@ class AnalyticSelector:
         self.sm = torch.as_tensor(obs_stats["mean"], **f32)[:n_arm]
         self.ss = torch.as_tensor(obs_stats["std"], **f32)[:n_arm]
         ci = cube_index
-        self.cm = torch.as_tensor(obs_stats["mean"], **f32)[ci : ci + 3]
-        self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
+        self.cm = self.cs = None
+        if ci is not None:
+            self.cm = torch.as_tensor(obs_stats["mean"], **f32)[ci : ci + 3]
+            self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
         self.rad = self.fc.radius
+
+    def set_boxes(self, boxes):
+        boxes = np.asarray(boxes, dtype=np.float32)
+        self.box = torch.as_tensor(boxes, device=self.device).view(-1, 6)
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
         """Total penetration. Ranking on clearance instead games the goal clamp
         -- the safest plan never approaches the cube at all -- so clearance buys
         nothing and every collision-free plan ties."""
+        boxes = self.box
+        if len(boxes) > 1:
+            boxes = boxes.repeat_interleave(len(traj) // len(boxes), dim=0)
         out = []
         for i in range(0, len(traj), 32):
             c = traj[i : i + 32]
-            pen = (-self.clearance_t(c)).clamp(min=0.0).sum(dim=1)
+            pen = (-self.clearance_t(c, boxes[i : i + 32])).clamp(min=0.0).sum(dim=1)
             out.append(pen + self.body_penetration(c))
         return torch.cat(out)
 
-    def dist(self, points: Tensor) -> Tensor:
+    def dist(self, points: Tensor, box: Tensor) -> Tensor:
         if self.cloud is None:
-            return box_sdf(points, self.box[:, :3], self.box[:, 3:])
+            shape = (len(box),) + (1,) * (points.dim() - 2) + (3,)
+            return box_sdf(points, box[:, :3].view(shape), box[:, 3:].view(shape))
         p = points.reshape(-1, 3)
         step = 1 << 19
         out = [
@@ -208,12 +221,16 @@ class AnalyticSelector:
             ..., :n
         ] * self.ss + self.sm
 
-    def cube(self, traj: Tensor) -> Tensor:
+    def cube(self, traj: Tensor) -> Tensor | None:
+        if self.cube_index is None or self.cs is None or self.cm is None:
+            return None
         return traj[..., self.cube_index : self.cube_index + 3] * self.cs + self.cm
 
-    def clearance_t(self, traj: Tensor) -> Tensor:
+    def clearance_t(self, traj: Tensor, box: Tensor | None = None) -> Tensor:
         """Per-timestep worst clearance (b, t): min over arm points, the cube, and
         both joint sources."""
+        if box is None:
+            box = self.box
         n = self.n_arm
         worst = []
         # require both the joint targets and the plan's own predicted states to
@@ -221,17 +238,19 @@ class AnalyticSelector:
         for q in self.joints(traj):
             b, t = q.shape[:2]
             pts = self.fc.arm_points(q.reshape(-1, n).float()).reshape(b, t, -1, 3)
-            d = self.dist(pts + self.fc.base_pos)
+            d = self.dist(pts + self.fc.base_pos, box)
             worst.append((d - self.rad).amin(dim=2))  # (b, t), mesh not centreline
-        worst.append(self.dist(self.cube(traj).float()) - self.fc.cube_half)
+        cube = self.cube(traj)
+        if cube is not None:
+            worst.append(self.dist(cube.float(), box) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)
 
     def body_penetration(self, traj: Tensor) -> Tensor:
         """(b,) self- and arm-vs-held-cube penetration summed over strided frames."""
         q = self.joints(traj)[0][:, ::SELF_STRIDE]
-        cube = self.cube(traj)[:, ::SELF_STRIDE].float() - self.fc.base_pos
         b, t = q.shape[:2]
-        pen, _ = self.fc.body_penetration(
-            q.reshape(-1, self.n_arm).float(), cube.reshape(-1, 3)
-        )
+        cube = self.cube(traj)
+        if cube is not None:
+            cube = (cube[:, ::SELF_STRIDE].float() - self.fc.base_pos).reshape(-1, 3)
+        pen, _ = self.fc.body_penetration(q.reshape(-1, self.n_arm).float(), cube)
         return SELF_STRIDE * pen.reshape(b, t).sum(dim=1)

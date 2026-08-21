@@ -10,6 +10,7 @@ envs:
   WANDB_API_KEY:
   CUDA_VISIBLE_DEVICES: 1
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
+  CMAKE_POLICY_VERSION_MINIMUM: 3.5
 workdir: .
 
 setup: |
@@ -21,13 +22,4 @@ run: |
   export PATH="$HOME/.pixi/bin:$PATH"
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 
-  bash scripts/pipeline.sh
-
-  EVAL="pixi run python scripts/eval.py --env.type franka \
-    --repo_id reece-omahoney/franka"
-
-  echo "=== obstacle (0.25m wall, feasible instances) ==="
-  $EVAL --env.obstacle true 2>&1 | grep -v "it/s"
-
-  echo "=== free space ==="
-  $EVAL --cond null 2>&1 | grep -v "it/s"
+  bash scripts/pipeline_libero.sh safelibero_goal 0
