@@ -44,7 +44,7 @@ class Config:
     ik_damping: float = 0.05
     hold: int = 20
     verbose: bool = True
-    families: list[str] = field(default_factory=lambda: ["arcs", "grasprot"])
+    families: str = "arcs,grasprot"
     alphas: list[float] = field(default_factory=lambda: [90.0, 180.0, 270.0])
 
 
@@ -95,7 +95,8 @@ def candidates(cfg, x, db, dp):
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
     a0, a1 = 1, close - m
     t0, t1 = close + m, opened - m
-    if "arcs" in cfg.families:
+    fams = cfg.families.split(",")
+    if "arcs" in fams:
         for phi in cfg.phis:
             for th in thetas:
                 da = bend_delta(ee, a0, a1, phi * np.pi, th)
@@ -104,7 +105,7 @@ def candidates(cfg, x, db, dp):
                 out.append(("approach", la, np.zeros(2), ee + base_shift + da, quat))
                 out.append(("transit", np.zeros(2), lt, ee + base_shift + dt, quat))
                 out.append(("both", la, lt, ee + base_shift + da + dt, quat))
-    if "grasprot" in cfg.families:
+    if "grasprot" in fams:
         for deg in cfg.alphas:
             ee_r, quat_r = grasp_rotation(x, a1, np.radians(deg))
             la = np.array([deg, 0.0])
