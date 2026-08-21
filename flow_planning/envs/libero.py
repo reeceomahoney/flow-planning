@@ -272,6 +272,8 @@ class LiberoEnv:
         self.obstacle_pos0 = np.zeros((n, 3), np.float32)
         self.collided = np.zeros(n, dtype=bool)
         self.succ = np.zeros(n, dtype=bool)
+        self.contact = [""] * n
+        self.step = 0
         for i, e in enumerate(self.envs):
             e.reset()
             s = self.init_states[self.episode_idx % len(self.init_states)]
@@ -317,6 +319,7 @@ class LiberoEnv:
     def apply_action(self, action):
         n = len(self.envs)
         a = np.asarray(action, np.float32).reshape(n, 8)
+        self.step += 1
         for i, e in enumerate(self.envs):
             q = e.robots[0]._joint_positions
             delta = np.clip((a[i, :7] - q) / self.cfg.delta_max, -1.0, 1.0)
@@ -327,6 +330,24 @@ class LiberoEnv:
             if name is not None and not self.collided[i]:
                 moved = np.abs(self.obs[i][f"{name}_pos"] - self.obstacle_pos0[i]).sum()
                 self.collided[i] = moved > self.cfg.collision_displacement
+                if self.collided[i]:
+                    self.contact[i] = self.contact_body(i, name, grip > 0)
+
+    def contact_body(self, i: int, name: str, grasped: bool) -> str:
+        e = self.envs[i]
+        m, d = e.sim.model._model, e.sim.data._data
+        b = m.body(f"{name}_main").id
+        hits = []
+        for c in d.contact[: d.ncon]:
+            b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
+            if m.body_rootid[b1] == b and m.body_rootid[b2] != b:
+                hits.append(m.body(b2).name)
+            elif m.body_rootid[b2] == b and m.body_rootid[b1] != b:
+                hits.append(m.body(b1).name)
+        hits = [h for h in hits if not h.startswith(("table", "floor", "main_table"))]
+        other = hits[0] if hits else "none"
+        phase = "post" if grasped else "pre"
+        return f"{name}/{other}/{phase}-grasp/t{self.step // 20 * 20}"
 
     def success(self):
         return self.succ.copy()
@@ -335,7 +356,7 @@ class LiberoEnv:
         return self.collided.copy()
 
     def contact_labels(self):
-        return np.array([o or "" for o in self.obstacle], dtype=object)
+        return np.array(self.contact, dtype=object)
 
     def obstacle_boxes(self):
 
