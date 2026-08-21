@@ -80,7 +80,7 @@ def grasp_rotation(x, a1, alpha):
             new_ee[t] = bowl + rotz(ramp[t]) @ (ee[t] - bowl)
         else:
             new_ee[t] = ee[t] + rotz(alpha) @ o - o
-    rot = R.from_euler("z", ramp) * R.from_quat(quat)
+    rot = R.from_euler("z", ramp[:, None]) * R.from_quat(quat)
     assert isinstance(rot, R)
     new_quat = rot.as_quat()
     return new_ee, new_quat.astype(np.float32)
