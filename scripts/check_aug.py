@@ -73,14 +73,17 @@ def grasp_rotation(x, a1, alpha):
     bowl[2] = 0.0
     o = ee[x["close"]] - bowl
     o[2] = 0.0
-    ramp = np.clip(np.arange(T) / max(a1, 1), 0.0, 1.0) * alpha
+    ramp = np.clip(np.arange(T) / max(a1, 1), 0.0, 1.0)
     new_ee = ee.copy()
     for t in range(T):
         if t < a1:
-            new_ee[t] = bowl + rotz(ramp[t]) @ (ee[t] - bowl)
+            new_ee[t] = bowl + rotz(ramp[t] * alpha) @ (ee[t] - bowl)
         else:
             new_ee[t] = ee[t] + rotz(alpha) @ o - o
-    rot = R.from_euler("z", ramp[:, None]) * R.from_quat(quat)
+    yaw = (alpha + np.pi) % (2 * np.pi) - np.pi
+    if np.isclose(abs(yaw), np.pi):
+        yaw = -np.pi
+    rot = R.from_euler("z", (ramp * yaw)[:, None]) * R.from_quat(quat)
     assert isinstance(rot, R)
     new_quat = rot.as_quat()
     return new_ee, new_quat.astype(np.float32)
@@ -216,7 +219,7 @@ def main(cfg: Config):
         cands: list[dict[str, Any]] = []
         for d, x in enumerate(demos):
             db = np.append(bowl[:2] - x["obs"][0, BOWL][:2], 0.0)
-            dp = np.append(plate[:2] - x["obs"][0, PLATE][:2], 0.0)
+            dp = np.append(plate[:2] - x["obs"][-1, BOWL][:2], 0.0)
             for fam, la, lt, ee_t, quat_t in candidates(cfg, x, db, dp):
                 cands.append(dict(d=d, fam=fam, la=la, lt=lt, ee_t=ee_t, quat=quat_t))
         tm = max(len(demos[c["d"]]["act"]) for c in cands)
@@ -229,14 +232,19 @@ def main(cfg: Config):
             cfg.ik_damping,
             base,
         )
-        achieved = fk(chain, q_all.reshape(-1, 7), base)[0].reshape(tm, len(cands), 3)
+        ach_pos, ach_quat = fk(chain, q_all.reshape(-1, 7), base)
+        achieved = ach_pos.reshape(tm, len(cands), 3)
+        ach_quat = ach_quat.reshape(tm, len(cands), 4)
         for k, c in enumerate(cands):
             x = demos[c["d"]]
             nf = len(x["act"])
             q = q_all[:nf, k]
             err = np.linalg.norm(achieved[:nf, k] - c["ee_t"], axis=1).max()
+            rot_err = R.from_quat(ach_quat[:nf, k]) * R.from_quat(c["quat"]).inv()
+            assert isinstance(rot_err, R)
+            rot_err = rot_err.magnitude().max()
             jerk = np.abs(np.diff(q, n=2, axis=0)).max()
-            c["ik_ok"] = err < 0.05 and jerk < jerk_limit
+            c["ik_ok"] = err < 0.02 and rot_err < np.radians(15) and jerk < jerk_limit
             c["clear"] = geometry_clearance(
                 fcol, base_t, q, c["ee_t"], x["close"], x["opened"], box
             )
