@@ -162,21 +162,27 @@ def phase_report(fcol, base_t, q, ee_t, close, opened, box, m):
 def replay(env, init_idx, act, hold):
     env.episode_idx = init_idx
     env.reset()
+    z0 = env.obs[0]["akita_black_bowl_1_pos"][2]
+    lift = 0.0
     for a in act:
         env.apply_action(a[None])
+        lift = max(lift, env.obs[0]["akita_black_bowl_1_pos"][2] - z0)
         if env.collided[0]:
             break
     for _ in range(hold):
         if env.collided[0]:
             break
         env.apply_action(act[-1][None])
-    return bool(env.collided[0]), bool(env.succ[0]), env.contact[0]
+    o = env.obs[0]
+    dist = np.linalg.norm(o["akita_black_bowl_1_pos"][:2] - o["plate_1_pos"][:2])
+    info = f"lift {lift:.3f} bowl-plate {dist:.3f}"
+    return bool(env.collided[0]), bool(env.succ[0]), env.contact[0], info
 
 
 @draccus.wrap()
 def main(cfg: Config):
     assert isinstance(cfg.env, LiberoConfig)
-    env = LiberoEnv(replace(cfg.env, world_count=1, obstacle=True))
+    env = LiberoEnv(replace(cfg.env, world_count=1))
     base = np.asarray(env.robot_base_pos, np.float32)
     base_t = torch.as_tensor(base, device=DEV)
     chain, _, _ = build_franka_chain("cpu")
@@ -249,7 +255,7 @@ def main(cfg: Config):
         best = None
         m = round(cfg.margin * cfg.env.fps)
         for c in to_replay:
-            col, suc, label = replay(env, i, c["act"], cfg.hold)
+            col, suc, label, info = replay(env, i, c["act"], cfg.hold)
             x = demos[c["d"]]
             if cfg.verbose and (c["fam"] == "none" or not col):
                 prof = phase_report(
@@ -265,7 +271,7 @@ def main(cfg: Config):
                 hit = label.split("/")[1] if col else ""
                 print(
                     f"   {c['fam']:8s} a={c['la'].round(2)} t={c['lt'].round(2)} "
-                    f"col={int(col)} succ={int(suc)} {hit} "
+                    f"col={int(col)} succ={int(suc)} {hit} {info} "
                     f"clear={c['clear']:+.3f} :: {prof}"
                 )
             s = stats[c["fam"]]
