@@ -386,7 +386,8 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
         if key not in seen and len(picked) < cfg.replay_max:
             seen.add(key)
             picked.append(c)
-    picked += [c for c in aug if c not in picked][: cfg.replay_max - len(picked)]
+    ids = {id(c) for c in picked}
+    picked += [c for c in aug if id(c) not in ids][: cfg.replay_max - len(picked)]
     to_replay += picked
     best = None
     for c in to_replay:
