@@ -45,6 +45,8 @@ class Config:
     ik_damping: float = 0.05
     hold: int = 20
     verbose: bool = True
+    arc: str = "additive"
+    vel_frac: float = 0.8
 
 
 def obj_slice(k):
@@ -133,9 +135,9 @@ def grasp_rotation(ee, quat, w0, close, opened, w1, m, centre, alpha):
     return new_ee, rot.as_quat().astype(np.float32)
 
 
-def bulge_delta(ee, s0, s1, phi, theta):
+def bulge_delta(ee, s0, s1, phi, theta, mode="additive"):
     d = bend_delta(ee, s0, s1, phi, theta)
-    if d.any():
+    if d.any() and mode == "additive":
         d[s0:s1] += ee[s0:s1] - np.linspace(ee[s0], ee[s1 - 1], s1 - s0)
     return d
 
@@ -163,10 +165,12 @@ def build(cfg, x, base_shift, combo):
             ee, quat = grasp_rotation(ee, quat, w0, c, o, w1, m, centre, np.radians(a))
             fam.add("rot")
         if pa:
-            ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
+            ee = ee + bulge_delta(
+                ee, w0 + m if k else 1, c - m, pa * np.pi, ta, cfg.arc
+            )
             fam.add("app")
         if pt:
-            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt)
+            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt, cfg.arc)
             ee = ee + d
             objs[k] = objs[k] + d
             fam.add("tra")
@@ -244,8 +248,10 @@ def phase_report(prof, segs, m):
 def run(env, act, hold, names, targets=()):
     p0 = [env.obs[0][f"{n}_pos"].copy() for n in names]
     lift = [0.0] * len(names)
+    trk = 0.0
     for a in act:
         env.apply_action(a[None])
+        trk = max(trk, np.abs(env.obs[0]["robot0_joint_pos"] - a[:7]).max())
         for j, n in enumerate(names):
             lift[j] = max(lift[j], env.obs[0][f"{n}_pos"][2] - p0[j][2])
         if env.collided[0]:
@@ -371,7 +377,13 @@ def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, st
         assert isinstance(rot_err, R)
         rot_err = rot_err.magnitude().max()
         jerk = np.abs(np.diff(q, n=2, axis=0)).max()
-        c["ik_ok"] = err < 0.02 and rot_err < np.radians(15) and jerk < jerk_limit
+        vel = np.abs(np.diff(q, axis=0)).max()
+        c["ik_ok"] = (
+            err < 0.02
+            and rot_err < np.radians(15)
+            and jerk < jerk_limit
+            and vel < cfg.vel_frac * cfg.env.delta_max
+        )
         c["prof"] = (arm[k, :nf], held[k, :nf], [fcol.frames[j] for j in link[k, :nf]])
         frame = np.minimum(c["prof"][0], c["prof"][1])
         c["clear"] = float(frame.min())
@@ -391,15 +403,14 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     ok = [c for c in cands if c["ik_ok"]]
     ok.sort(key=lambda c: -c["clear"])
     to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
-    groups = defaultdict(list)
-    for c in ok:
-        if c["fam"] != "none":
-            groups[tuple(a for a, *_ in c["combo"])].append(c)
+    cap = (cfg.replay_max + 1) // 2
+    used = defaultdict(int)
     picked = []
-    while len(picked) < cfg.replay_max and any(groups.values()):
-        for g in list(groups):
-            if groups[g] and len(picked) < cfg.replay_max:
-                picked.append(groups[g].pop(0))
+    for c in ok:
+        g = tuple(a for a, *_ in c["combo"])
+        if c["fam"] != "none" and used[g] < cap and len(picked) < cfg.replay_max:
+            used[g] += 1
+            picked.append(c)
     to_replay += picked
     best = None
     for c in to_replay:
