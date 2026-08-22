@@ -21,6 +21,6 @@ run: |
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
   for T in $TASKS; do for L in $LEVELS; do
     echo "##### $SUITE task $T level $L"
-    pixi run python scripts/check_aug.py --env.suite $SUITE --env.task_id $T \
+    pixi run python scripts/check_aug.py --env.type libero --env.suite $SUITE --env.task_id $T \
       --env.level $L $ARGS 2>&1 | grep -vE "it/s\]|Warning|WARNING|macro"
   done; done
