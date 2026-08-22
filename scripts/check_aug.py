@@ -259,7 +259,7 @@ def phase_report(prof, segs, m):
     return " | ".join(out)
 
 
-def run(env, act, hold, names, targets=()):
+def run(env, act, hold, names, targets=(), expected=()):
     p0 = [env.obs[0][f"{n}_pos"].copy() for n in names]
     lift = [0.0] * len(names)
     trk = 0.0
@@ -277,8 +277,10 @@ def run(env, act, hold, names, targets=()):
     o = env.obs[0]
     moved = [np.linalg.norm(o[f"{n}_pos"][:2] - p[:2]) for n, p in zip(names, p0)]
     dist = [
-        np.linalg.norm(o[f"{n}_pos"][:2] - o[f"{t}_pos"][:2]) if t else np.nan
-        for n, t in zip(names, targets)
+        np.linalg.norm(o[f"{n}_pos"][:2] - o[f"{t}_pos"][:2])
+        if t
+        else np.linalg.norm(o[f"{n}_pos"][:2] - e[:2])
+        for n, t, e in zip(names, targets, expected)
     ]
     info = (
         "lift "
@@ -291,17 +293,17 @@ def run(env, act, hold, names, targets=()):
     return bool(env.collided[0]), bool(env.succ[0]), env.contact[0], info
 
 
-def replay(env, init_idx, act, hold, names, targets):
+def replay(env, init_idx, act, hold, names, targets, expected):
     env.episode_idx = init_idx
     env.reset()
-    return run(env, act, hold, names, targets)
+    return run(env, act, hold, names, targets, expected)
 
 
 def source_replay(env, state0, act, hold, names, targets):
     env.reset()
     env.obs[0] = env.envs[0].set_init_state(state0)
     env.succ[:] = False
-    return run(env, act, hold, names, targets)
+    return run(env, act, hold, names, targets, [np.zeros(3)] * len(names))
 
 
 def held_names(names, x):
@@ -461,7 +463,7 @@ def fmt(combo):
 def scene_candidates(cfg, demos, names, pos, yaws, radii, halves):
     cands = []
     for d, x in enumerate(demos):
-        dbs, dps, dyaw, diag = [], [], [], []
+        dbs, dps, dyaw, diag, ends = [], [], [], [], []
         for (c, op), j, tg in zip(x["segs"], x["held"], x["targets"]):
             if j is None:
                 dbs.append(np.zeros(3))
@@ -473,6 +475,7 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii, halves):
             dbs.append(db)
             r6 = x["obs"][0, sl.stop : sl.stop + 6]
             dyaw.append(wrap(yaws[names[j]] - yaw_of_rot6d(r6)))
+            ends.append(x["obs"][-1, sl])
             diag.append(f"{names[j]} d={db.round(3)} dyaw={np.degrees(dyaw[-1]):.0f}")
             if tg is None:
                 dps.append(np.zeros(3))
@@ -487,6 +490,10 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii, halves):
             halves[names[j]] if j is not None else np.ones(2) for j in x["held"]
         ]
         x["dyaw"] = dyaw
+        x["expected"] = [
+            e + dp
+            for e, dp in zip(ends, [d for d, j in zip(dps, x["held"]) if j is not None])
+        ]
         if d == 0:
             print("   retarget " + " | ".join(diag))
         n = len(x["segs"])
@@ -498,7 +505,7 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii, halves):
         for combo in combos:
             c = build(cfg, x, x["base_shift"], combo)
             if c is not None:
-                c["d"], c["radii"] = d, x["radii"]
+                c["d"], c["radii"], c["expected"] = d, x["radii"], x["expected"]
                 cands.append(c)
     return cands
 
@@ -521,7 +528,7 @@ def compose_candidates(cfg, cands, demos):
                 continue
             c = build(cfg, x, x["base_shift"], combo)
             if c is not None:
-                c["d"], c["radii"] = d, x["radii"]
+                c["d"], c["radii"], c["expected"] = d, x["radii"], x["expected"]
                 out.append(c)
     return out
 
