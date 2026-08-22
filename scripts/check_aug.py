@@ -27,7 +27,7 @@ from flow_planning.selector import FrankaCollision, box_sdf
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 OBJ0 = 18
-ZERO = (0.0, 0.0, 0.0, 0.0, 0.0)
+ZERO = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -45,7 +45,7 @@ class Config:
     ik_damping: float = 0.05
     hold: int = 20
     verbose: bool = True
-    arc: str = "additive"
+    arcs: str = "additive,replace"
     vel_frac: float = 0.8
     ik_tol: float = 0.01
 
@@ -148,7 +148,14 @@ def seg_options(cfg, held):
         return [ZERO]
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
     arcs = [(0.0, 0.0)] + [(p, th) for p in cfg.phis for th in thetas]
-    return [(a, *ap, *tr) for a in cfg.alphas for ap in arcs for tr in arcs]
+    modes = cfg.arcs.split(",")
+    transit = [(0.0, 0.0, 0.0)] + [
+        (p, th, float(i))
+        for i, _ in enumerate(modes)
+        for p in cfg.phis
+        for th in thetas
+    ]
+    return [(a, *ap, *tr) for a in cfg.alphas for ap in arcs for tr in transit]
 
 
 def grasp_width(x, k, a_eff):
@@ -172,19 +179,18 @@ def build(cfg, x, base_shift, combo):
     ]
     w0 = 0
     fam = set()
-    for k, ((c, o), (a, pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
+    modes = cfg.arcs.split(",")
+    for k, ((c, o), (a, pa, ta, pt, tt, mode)) in enumerate(zip(segs, combo)):
         if a:
             centre = x["obs"][0, obj_slice(x["held"][k])]
             w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
             ee, quat = grasp_rotation(ee, quat, w0, c, o, w1, m, centre, np.radians(a))
             fam.add("rot")
         if pa:
-            ee = ee + bulge_delta(
-                ee, w0 + m if k else 1, c - m, pa * np.pi, ta, cfg.arc
-            )
+            ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
             fam.add("app")
         if pt:
-            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt, cfg.arc)
+            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt, modes[int(mode)])
             ee = ee + d
             objs[k] = objs[k] + d
             fam.add("tra")
@@ -456,7 +462,8 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
 
 def fmt(combo):
     return " ".join(
-        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f}]" for a, pa, ta, pt, tt in combo
+        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} {'ar'[int(md)]}]"
+        for a, pa, ta, pt, tt, md in combo
     )
 
 
