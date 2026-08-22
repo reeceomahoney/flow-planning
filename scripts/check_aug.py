@@ -65,13 +65,15 @@ def held_object(obs, close, opened, n_obj):
     return best
 
 
-def target_object(goals, objects, name):
+def target_name(goals, objects, sites, name):
     for _, a, b in goals:
         if a != name:
             continue
         hits = [o for o in objects if b.startswith(o) and o != name]
         if hits:
-            return objects.index(max(hits, key=len))
+            return max(hits, key=len)
+        if b in sites:
+            return b
     return None
 
 
@@ -265,7 +267,7 @@ def phase_report(prof, segs, m):
     return " | ".join(out)
 
 
-def run(env, act, hold, names, targets=(), expected=()):
+def run(env, act, hold, names, expected):
     p0 = [env.obs[0][f"{n}_pos"].copy() for n in names]
     lift = [0.0] * len(names)
     trk = 0.0
@@ -282,12 +284,7 @@ def run(env, act, hold, names, targets=(), expected=()):
         env.apply_action(act[-1][None])
     o = env.obs[0]
     moved = [np.linalg.norm(o[f"{n}_pos"][:2] - p[:2]) for n, p in zip(names, p0)]
-    dist = [
-        np.linalg.norm(o[f"{n}_pos"][:2] - o[f"{t}_pos"][:2])
-        if t
-        else np.linalg.norm(o[f"{n}_pos"][:2] - e[:2])
-        for n, t, e in zip(names, targets, expected)
-    ]
+    dist = [np.linalg.norm(o[f"{n}_pos"][:2] - e[:2]) for n, e in zip(names, expected)]
     info = (
         "lift "
         + "/".join(f"{v:.3f}" for v in lift)
@@ -299,31 +296,26 @@ def run(env, act, hold, names, targets=(), expected=()):
     return bool(env.collided[0]), bool(env.succ[0]), env.contact[0], info
 
 
-def replay(env, init_idx, act, hold, names, targets, expected):
+def replay(env, init_idx, act, hold, names, expected):
     env.episode_idx = init_idx
     env.reset()
-    return run(env, act, hold, names, targets, expected)
+    return run(env, act, hold, names, expected)
 
 
-def source_replay(env, state0, act, hold, names, targets):
+def source_replay(env, state0, act, hold, names, expected):
     env.reset()
     env.obs[0] = env.envs[0].set_init_state(state0)
     env.succ[:] = False
-    return run(env, act, hold, names, targets, [np.zeros(3)] * len(names))
+    return run(env, act, hold, names, expected)
 
 
 def held_names(names, x):
-    hn = [names[j] for j in x["held"] if j is not None]
-    tn = [
-        names[t] if t is not None else ""
-        for j, t in zip(x["held"], x["targets"])
-        if j is not None
-    ]
-    return hn, tn
+    return [names[j] for j in x["held"] if j is not None]
 
 
 def load_demos(cfg, free_env, goals):
     names = free_env.objects
+    sites = set(free_env.envs[0].env.object_sites_dict)
     path = hf_hub_download(
         HF_DEMOS,
         f"{SOURCE_SUITE[cfg.env.suite]}/{free_env.name}_demo.hdf5",
@@ -340,7 +332,7 @@ def load_demos(cfg, free_env, goals):
         segs = grasp_segments(act[:, 7])
         held = [held_object(obs, c, o, len(names)) for c, o in segs]
         targets = [
-            target_object(goals, names, names[j]) if j is not None else None
+            target_name(goals, names, sites, names[j]) if j is not None else None
             for j in held
         ]
         ee, quat = fk(chain, act[:, ARM], base)
@@ -362,7 +354,7 @@ def load_demos(cfg, free_env, goals):
             cfg.hold,
             *held_names(names, demos[-1]),
         )
-        nm = [names[j] if j is not None else None for j in held + targets]
+        nm = [names[j] if j is not None else None for j in held] + targets
         print(
             f"demo {k}: T={len(act)} segs={segs} held/targets={nm} "
             f"source replay succ={int(suc)} {info}"
@@ -427,8 +419,8 @@ def replay_round(cfg, env, free_env, i, cands, demos, names, stats, m, replay_no
     ok.sort(key=lambda c: -c["clear"])
     to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
     for c in to_replay:
-        hn, tn = held_names(names, demos[c["d"]])
-        _, suc, _, info = replay(free_env, i, c["act"], cfg.hold, hn, tn, c["expected"])
+        hn = held_names(names, demos[c["d"]])
+        _, suc, _, info = replay(free_env, i, c["act"], cfg.hold, hn, c["expected"])
         stats["free"][3] += 1
         stats["free"][5] += suc
         if cfg.verbose:
@@ -448,10 +440,8 @@ def replay_round(cfg, env, free_env, i, cands, demos, names, stats, m, replay_no
     best = None
     for c in to_replay:
         x = demos[c["d"]]
-        hn, tn = held_names(names, x)
-        col, suc, label, info = replay(
-            env, i, c["act"], cfg.hold, hn, tn, c["expected"]
-        )
+        hn = held_names(names, x)
+        col, suc, label, info = replay(env, i, c["act"], cfg.hold, hn, c["expected"])
         if cfg.verbose and (c["fam"] == "none" or not col):
             hit = label.split("/")[1] if col else ""
             print(
@@ -475,7 +465,7 @@ def fmt(combo):
     )
 
 
-def scene_candidates(cfg, demos, names, pos, yaws, radii, halves):
+def scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos):
     cands = []
     for d, x in enumerate(demos):
         dbs, dps, dyaw, diag, ends = [], [], [], [], []
@@ -496,7 +486,7 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii, halves):
                 dps.append(np.zeros(3))
             else:
                 end = x["obs"][min(op + 10, len(x["obs"]) - 1), sl][:2]
-                dps.append(np.append(pos[names[tg]][:2] - end, 0.0))
+                dps.append(np.append(tpos[tg][:2] - end, 0.0))
         x["base_shift"] = shift_path(
             len(x["act"]), x["segs"], round(cfg.margin * cfg.env.fps), dbs, dps
         )
@@ -570,11 +560,17 @@ def main(cfg: Config):
         env.reset()
         boxes = obstacle_geom_boxes(env.envs[0], env.obstacle[0])
         o = env.obs[0]
+        sim = env.envs[0].sim
         pos = {n: o[f"{n}_pos"] for n in names}
         yaws = {n: yaw_of_quat(o[f"{n}_quat"]) for n in names}
         halves = {n: body_aabb(env.envs[0], n)[3:5] for n in names}
         radii = {n: float(halves[n].max()) for n in names}
-        cands = scene_candidates(cfg, demos, names, pos, yaws, radii, halves)
+        tpos = {}
+        for x in demos:
+            for t in x["targets"]:
+                if t is not None and t not in tpos:
+                    tpos[t] = pos[t] if t in pos else sim.data.get_site_xpos(t)
+        cands = scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos)
         args = (demos, chain, base, base_t, fcol, boxes, jerk_limit, stats)
         evaluate(cfg, cands, *args)
         best, geo, n_ok = replay_round(
