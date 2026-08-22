@@ -94,7 +94,7 @@ def rotz(a):
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
-def grasp_rotation(ee, quat, w0, close, opened, m, centre, alpha):
+def grasp_rotation(ee, quat, w0, close, opened, w1, m, centre, alpha):
     T = len(ee)
     a1 = max(close - m, w0 + 1)
     centre = np.array([centre[0], centre[1], 0.0])
@@ -102,7 +102,9 @@ def grasp_rotation(ee, quat, w0, close, opened, m, centre, alpha):
     oh[2] = 0.0
     t = np.arange(T)
     ramp = np.clip((t - w0) / (a1 - w0), 0.0, 1.0)
-    ramp = np.where(t > opened, np.clip(1 - (t - opened) / (2 * m), 0.0, 1.0), ramp)
+    if w1 is not None:
+        decay = np.clip(1 - (t - opened) / max(w1 - opened, 1), 0.0, 1.0)
+        ramp = np.where(t > opened, decay, ramp)
     new_ee = ee.copy()
     off = rotz(alpha) @ oh - oh
     for i in range(w0, T):
@@ -144,7 +146,8 @@ def build(cfg, x, base_shift, combo):
     for k, ((c, o), (a, pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
         if a:
             centre = x["obs"][0, obj_slice(x["held"][k])]
-            ee, quat = grasp_rotation(ee, quat, w0, c, o, m, centre, np.radians(a))
+            w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
+            ee, quat = grasp_rotation(ee, quat, w0, c, o, w1, m, centre, np.radians(a))
             fam.add("rot")
         if pa:
             ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
@@ -375,7 +378,16 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     ok = [c for c in cands if c["ik_ok"]]
     ok.sort(key=lambda c: -c["clear"])
     to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
-    to_replay += [c for c in ok if c["fam"] != "none"][: cfg.replay_max]
+    aug = [c for c in ok if c["fam"] != "none"]
+    seen = set()
+    picked = []
+    for c in aug:
+        key = (c["d"],) + tuple((a, pt, tt) for a, _, _, pt, tt in c["combo"])
+        if key not in seen and len(picked) < cfg.replay_max:
+            seen.add(key)
+            picked.append(c)
+    picked += [c for c in aug if c not in picked][: cfg.replay_max - len(picked)]
+    to_replay += picked
     best = None
     for c in to_replay:
         x = demos[c["d"]]
