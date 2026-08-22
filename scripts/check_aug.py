@@ -41,12 +41,13 @@ class Config:
     alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
     top_k: int = 4
     replay_max: int = 12
-    ik_iters: int = 8
+    ik_iters: int = 12
     ik_damping: float = 0.05
     hold: int = 20
     verbose: bool = True
     arc: str = "additive"
     vel_frac: float = 0.8
+    ik_tol: float = 0.01
 
 
 def obj_slice(k):
@@ -378,8 +379,9 @@ def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, st
         rot_err = rot_err.magnitude().max()
         jerk = np.abs(np.diff(q, n=2, axis=0)).max()
         vel = np.abs(np.diff(q, axis=0)).max()
+        c["ik_err"] = float(err)
         c["ik_ok"] = (
-            err < 0.02
+            err < cfg.ik_tol
             and rot_err < np.radians(15)
             and jerk < jerk_limit
             and vel < cfg.vel_frac * cfg.env.delta_max
@@ -422,7 +424,7 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
             hit = label.split("/")[1] if col else ""
             print(
                 f"   {c['fam']:11s} {fmt(c['combo'])} col={int(col)} succ={int(suc)} "
-                f"{hit} {info} clear={c['clear']:+.3f} :: "
+                f"{hit} {info} ik {c['ik_err']:.3f} clear={c['clear']:+.3f} :: "
                 f"{phase_report(c['prof'], x['segs'], m)}"
             )
         s = stats[c["fam"]]
