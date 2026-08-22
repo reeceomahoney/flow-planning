@@ -422,10 +422,17 @@ def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, st
         s[2] += c["ik_ok"] and c["clear"] > 0
 
 
-def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
+def replay_round(cfg, env, free_env, i, cands, demos, names, stats, m, replay_none):
     ok = [c for c in cands if c["ik_ok"]]
     ok.sort(key=lambda c: -c["clear"])
     to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
+    for c in to_replay:
+        hn, tn = held_names(names, demos[c["d"]])
+        _, suc, _, info = replay(free_env, i, c["act"], cfg.hold, hn, tn, c["expected"])
+        stats["free"][3] += 1
+        stats["free"][5] += suc
+        if cfg.verbose:
+            print(f"   free-scene  demo {c['d']} succ={int(suc)} {info}")
     aug = [c for c in ok if c["fam"] != "none"]
     groups = defaultdict(list)
     for c in aug:
@@ -569,13 +576,15 @@ def main(cfg: Config):
         cands = scene_candidates(cfg, demos, names, pos, yaws, radii, halves)
         args = (demos, chain, base, base_t, fcol, boxes, jerk_limit, stats)
         evaluate(cfg, cands, *args)
-        best, geo, n_ok = replay_round(cfg, env, i, cands, demos, names, stats, m, True)
+        best, geo, n_ok = replay_round(
+            cfg, env, free_env, i, cands, demos, names, stats, m, True
+        )
         if best is None:
             more = compose_candidates(cfg, cands, demos)
             if more:
                 evaluate(cfg, more, *args)
                 best, g2, n2 = replay_round(
-                    cfg, env, i, more, demos, names, stats, m, False
+                    cfg, env, free_env, i, more, demos, names, stats, m, False
                 )
                 geo, n_ok = geo + g2, n_ok + n2
         scene_success.append(best is not None)
@@ -596,11 +605,12 @@ def main(cfg: Config):
     )
     for fam, s in sorted(stats.items()):
         print(f"{fam:11s} " + " ".join(f"{v:6d}" for v in s))
-    aug = sum(s[5] for f, s in stats.items() if f != "none")
+    aug = sum(s[5] for f, s in stats.items() if f not in ("none", "free"))
     print(
         f"RESULT {cfg.env.suite} task {cfg.env.task_id} level {cfg.env.level}: "
         f"scenes {sum(scene_success)}/{len(scene_success)} "
-        f"orig {stats['none'][5]}/{stats['none'][3]} aug {aug}"
+        f"orig {stats['none'][5]}/{stats['none'][3]} aug {aug} "
+        f"free-scene {stats['free'][5]}/{stats['free'][3]}"
     )
 
 
