@@ -20,6 +20,13 @@ def transit_segments(gripper: np.ndarray) -> tuple[int, int]:
     return close, opened
 
 
+def grasp_segments(gripper: np.ndarray, min_len: int = 5) -> list[tuple[int, int]]:
+    closed = np.concatenate([[False], gripper < 0.03, [False]])
+    edges = np.flatnonzero(np.diff(closed.astype(int)))
+    segs = [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2])]
+    return [(a, b) for a, b in segs if b - a >= min_len]
+
+
 def bend_delta(ee, s0, s1, phi, theta):
     d = np.zeros_like(ee)
     n = s1 - s0

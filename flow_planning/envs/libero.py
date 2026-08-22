@@ -79,7 +79,7 @@ class LiberoConfig(EnvConfig):
 def task_name(cfg: LiberoConfig) -> str:
     names = TASKS[cfg.suite]
     i = cfg.task_id
-    if cfg.obstacle and cfg.suite == "safelibero_goal" and cfg.level == "II" and i == 3:
+    if cfg.suite == "safelibero_goal" and cfg.level == "II" and i == 3:
         i = 4
     return names[i]
 
@@ -209,6 +209,34 @@ def task_files(cfg: LiberoConfig, safe_root: Path) -> tuple[Path, Path]:
     return bddl, init
 
 
+def body_aabb(e, name: str) -> np.ndarray:
+    m, d = e.sim.model._model, e.sim.data._data
+    b = m.body(f"{name}_main").id
+    signs = np.array(np.meshgrid(*[[-1, 1]] * 3)).reshape(3, -1).T
+    corners = []
+    for g in range(m.ngeom):
+        if m.body_rootid[m.geom_bodyid[g]] != b:
+            continue
+        local = m.geom_aabb[g, :3] + signs * m.geom_aabb[g, 3:]
+        corners.append(d.geom_xpos[g] + local @ d.geom_xmat[g].reshape(3, 3).T)
+    pts = np.concatenate(corners)
+    lo, hi = pts.min(0), pts.max(0)
+    return np.concatenate([(lo + hi) / 2, (hi - lo) / 2])
+
+
+def demo_to_episode(env, g) -> tuple[np.ndarray, np.ndarray]:
+    states, acts = g["states"][:], g["actions"][:]
+    env.envs[0].reset()
+    obs = []
+    for s in states:
+        env.set_state(0, s)
+        obs.append(env.get_obs()[0])
+    obs = np.stack(obs)
+    joints = np.concatenate([obs[1:, :7], obs[-1:, :7]])
+    grip = GRIPPER_OPEN * (acts[:, 6:7] < 0)
+    return obs, np.concatenate([joints, grip], axis=1).astype(np.float32)
+
+
 class LiberoEnv:
     ee_state_index = 9
     cube_size = 0.0
@@ -266,6 +294,7 @@ class LiberoEnv:
         self.episode_frames = self.max_frames
         self.episode_idx = 0
         self.reset()
+        self.objects = [n for n in self.objects if f"{n}_pos" in self.obs[0]]
         self.episode_idx = 0
 
     def reset(self):
@@ -361,26 +390,14 @@ class LiberoEnv:
     def contact_labels(self):
         return np.array(self.contact, dtype=object)
 
-    def obstacle_boxes(self):
+    def goals(self):
+        return [g for g in self.envs[0].env.parsed_problem["goal_state"] if len(g) == 3]
 
+    def obstacle_boxes(self):
         boxes = np.tile([1e3, 1e3, 1e3, 0.01, 0.01, 0.01], (len(self.envs), 1))
         for i, e in enumerate(self.envs):
-            name = self.obstacle[i]
-            if name is None:
-                continue
-            m, d = e.sim.model._model, e.sim.data._data
-            b = m.body(f"{name}_main").id
-            corners = []
-            for g in range(m.ngeom):
-                if m.body_rootid[m.geom_bodyid[g]] != b:
-                    continue
-                c, h = m.geom_aabb[g, :3], m.geom_aabb[g, 3:]
-                signs = np.array(np.meshgrid(*[[-1, 1]] * 3)).reshape(3, -1).T
-                local = c + signs * h
-                corners.append(d.geom_xpos[g] + local @ d.geom_xmat[g].reshape(3, 3).T)
-            pts = np.concatenate(corners)
-            lo, hi = pts.min(0), pts.max(0)
-            boxes[i] = np.concatenate([(lo + hi) / 2, (hi - lo) / 2])
+            if self.obstacle[i] is not None:
+                boxes[i] = body_aabb(e, self.obstacle[i])
         return boxes.astype(np.float32)
 
     @property

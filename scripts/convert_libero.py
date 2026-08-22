@@ -9,11 +9,11 @@ from tqdm import tqdm
 
 from flow_planning.envs import EnvConfig
 from flow_planning.envs.libero import (
-    GRIPPER_OPEN,
     HF_DEMOS,
     SOURCE_SUITE,
     LiberoConfig,
     LiberoEnv,
+    demo_to_episode,
 )
 
 
@@ -23,19 +23,6 @@ class Config:
     repo_id: str = ""
     push_to_hub: bool = False
     replay: int = 10
-
-
-def convert_demo(env: LiberoEnv, g) -> tuple[np.ndarray, np.ndarray]:
-    states, acts = g["states"][:], g["actions"][:]
-    env.envs[0].reset()
-    obs = []
-    for s in states:
-        env.set_state(0, s)
-        obs.append(env.get_obs()[0])
-    obs = np.stack(obs)
-    joints = np.concatenate([obs[1:, :7], obs[-1:, :7]])
-    grip = GRIPPER_OPEN * (acts[:, 6:7] < 0)
-    return obs, np.concatenate([joints, grip], axis=1).astype(np.float32)
 
 
 def replay(env: LiberoEnv, states, act) -> tuple[bool, float]:
@@ -78,7 +65,7 @@ def main(cfg: Config):
     )
     converted = []
     for k in tqdm(demos, desc="Converting demos"):
-        obs, act = convert_demo(env, f["data"][k])
+        obs, act = demo_to_episode(env, f["data"][k])
         converted.append((f["data"][k]["states"][:], act))
         for o, a in zip(obs, act):
             dataset.add_frame(
