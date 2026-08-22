@@ -20,12 +20,14 @@ from flow_planning.envs.libero import (
     LiberoEnv,
     body_aabb,
     demo_to_episode,
+    obstacle_geom_boxes,
 )
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
 from flow_planning.selector import FrankaCollision, box_sdf
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 OBJ0 = 18
+ZERO = (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -37,7 +39,7 @@ class Config:
     phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
     n_theta: int = 6
     alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
-    max_cands: int = 3000
+    top_k: int = 4
     replay_max: int = 16
     ik_iters: int = 8
     ik_damping: float = 0.05
@@ -116,63 +118,68 @@ def grasp_rotation(ee, quat, w0, close, opened, m, centre, alpha):
     return new_ee, rot.as_quat().astype(np.float32)
 
 
-def candidates(cfg, x, dbs, dps):
-    T, segs, m = len(x["act"]), x["segs"], round(cfg.margin * cfg.env.fps)
-    base_shift = shift_path(T, segs, m, dbs, dps)
+def seg_options(cfg, held):
+    if held is None:
+        return [ZERO]
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
     arcs = [(0.0, 0.0)] + [(p, th) for p in cfg.phis for th in thetas]
-    options = []
-    for k in range(len(segs)):
-        if x["held"][k] is None:
-            options.append([(0.0, 0.0, 0.0)])
-        else:
-            options.append([(a, p, th) for a in cfg.alphas for p, th in arcs])
-    out = []
-    for combo in product(*options):
-        ee, quat = x["ee"].copy(), x["quat"].copy()
-        objs = [
-            x["obs"][:, obj_slice(j)].copy() if j is not None else None
-            for j in x["held"]
-        ]
-        w0 = 0
-        for k, ((c, o), (a, p, th)) in enumerate(zip(segs, combo)):
-            if a:
-                centre = x["obs"][0, obj_slice(x["held"][k])]
-                ee, quat = grasp_rotation(ee, quat, w0, c, o, m, centre, np.radians(a))
-            if p:
-                d = bend_delta(ee, c + m, o - m, p * np.pi, th)
-                ee = ee + d
-                objs[k] = objs[k] + d
-            w0 = o
-        fam = ("rot" if any(a for a, _, _ in combo) else "") + (
-            "+arc" if any(p for _, p, _ in combo) else ""
-        )
-        out.append(
-            dict(
-                fam=fam.strip("+") or "none",
-                label=np.array(combo).ravel(),
-                ee_t=ee + base_shift,
-                quat=quat,
-                objs=[o + base_shift if o is not None else None for o in objs],
-            )
-        )
-    return out
+    return [(a, *ap, *tr) for a in cfg.alphas for ap in arcs for tr in arcs]
 
 
-def clearance_profile(fcol, base_t, q, c, x, box, radii):
-    box_t = torch.as_tensor(np.asarray(box, np.float32), device=DEV)
-    bc, bh = box_t[:3], box_t[3:]
+def build(cfg, x, base_shift, combo):
+    segs, m = x["segs"], round(cfg.margin * cfg.env.fps)
+    ee, quat = x["ee"].copy(), x["quat"].copy()
+    objs = [
+        x["obs"][:, obj_slice(j)].copy() if j is not None else None for j in x["held"]
+    ]
+    w0 = 0
+    fam = set()
+    for k, ((c, o), (a, pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
+        if a:
+            centre = x["obs"][0, obj_slice(x["held"][k])]
+            ee, quat = grasp_rotation(ee, quat, w0, c, o, m, centre, np.radians(a))
+            fam.add("rot")
+        if pa:
+            ee = ee + bend_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
+            fam.add("app")
+        if pt:
+            d = bend_delta(ee, c + m, o - m, pt * np.pi, tt)
+            ee = ee + d
+            objs[k] = objs[k] + d
+            fam.add("tra")
+        w0 = o
+    return dict(
+        fam="+".join(sorted(fam)) or "none",
+        combo=combo,
+        ee_t=ee + base_shift,
+        quat=quat,
+        objs=[o + base_shift if o is not None else None for o in objs],
+    )
+
+
+def clearance_profile(fcol, base_t, q, c, x, boxes, radii):
+    bx = torch.as_tensor(np.asarray(boxes, np.float32), device=DEV)
     pts = fcol.arm_points(torch.as_tensor(q, dtype=torch.float32, device=DEV)) + base_t
-    d = box_sdf(pts, bc, bh) - fcol.radius
+    d = torch.stack([box_sdf(pts, b[:3], b[3:]) for b in bx]).amin(0) - fcol.radius
     per_frame, worst_pt = d.min(dim=1)
     held = torch.ones(len(q), device=DEV)
     for (c0, o0), path, r in zip(x["segs"], c["objs"], radii):
         if path is None:
             continue
         p = torch.as_tensor(path[c0:o0], dtype=torch.float32, device=DEV)
-        held[c0:o0] = torch.minimum(held[c0:o0], box_sdf(p, bc, bh) - r)
+        dh = torch.stack([box_sdf(p, b[:3], b[3:]) for b in bx]).amin(0) - r
+        held[c0:o0] = torch.minimum(held[c0:o0], dh)
     link = [fcol.frames[int(fcol.owner[i])] for i in worst_pt.cpu().numpy()]
     return per_frame.cpu().numpy(), held.cpu().numpy(), link
+
+
+def seg_windows(segs, m, T):
+    prev = 0
+    out = []
+    for c, o in segs:
+        out.append((prev, min(o + m, T)))
+        prev = o
+    return out
 
 
 def phase_report(prof, segs, m):
@@ -197,9 +204,7 @@ def phase_report(prof, segs, m):
     return " | ".join(out)
 
 
-def replay(env, init_idx, act, hold, names):
-    env.episode_idx = init_idx
-    env.reset()
+def run(env, act, hold, names):
     z0 = [env.obs[0][f"{n}_pos"][2] for n in names]
     lift = [0.0] * len(names)
     for a in act:
@@ -216,7 +221,21 @@ def replay(env, init_idx, act, hold, names):
     return bool(env.collided[0]), bool(env.succ[0]), env.contact[0], info
 
 
-def load_demos(cfg, free_env, n_obj, goals):
+def replay(env, init_idx, act, hold, names):
+    env.episode_idx = init_idx
+    env.reset()
+    return run(env, act, hold, names)
+
+
+def source_replay(env, state0, act, hold, names):
+    env.reset()
+    env.obs[0] = env.envs[0].set_init_state(state0)
+    env.succ[:] = False
+    return run(env, act, hold, names)
+
+
+def load_demos(cfg, free_env, goals):
+    names = free_env.objects
     path = hf_hub_download(
         HF_DEMOS,
         f"{SOURCE_SUITE[cfg.env.suite]}/{free_env.name}_demo.hdf5",
@@ -231,11 +250,9 @@ def load_demos(cfg, free_env, n_obj, goals):
     for k in keys[: cfg.n_demos]:
         obs, act = demo_to_episode(free_env, f["data"][k])
         segs = grasp_segments(act[:, 7])
-        held = [held_object(obs, c, o, n_obj) for c, o in segs]
+        held = [held_object(obs, c, o, len(names)) for c, o in segs]
         targets = [
-            target_object(goals, free_env.objects, free_env.objects[j])
-            if j is not None
-            else None
+            target_object(goals, names, names[j]) if j is not None else None
             for j in held
         ]
         ee, quat = fk(chain, act[:, ARM], base)
@@ -250,9 +267,144 @@ def load_demos(cfg, free_env, n_obj, goals):
                 quat=quat,
             )
         )
-        nm = [free_env.objects[j] if j is not None else None for j in held + targets]
-        print(f"demo {k}: T={len(act)} segs={segs} held/targets={nm}")
+        hn = [names[j] for j in held if j is not None]
+        _, suc, _, info = source_replay(
+            free_env, f["data"][k]["states"][0], act, cfg.hold, hn
+        )
+        nm = [names[j] if j is not None else None for j in held + targets]
+        print(
+            f"demo {k}: T={len(act)} segs={segs} held/targets={nm} "
+            f"source replay succ={int(suc)} {info}"
+        )
     return demos, chain, base
+
+
+def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, stats):
+    m = round(cfg.margin * cfg.env.fps)
+    tm = max(len(demos[c["d"]]["act"]) for c in cands)
+    q_all = solve_seq(
+        chain,
+        np.stack([tpad(c["ee_t"], tm) for c in cands], axis=1),
+        np.stack([tpad(c["quat"], tm) for c in cands], axis=1),
+        np.stack([demos[c["d"]]["act"][0, ARM] for c in cands]),
+        cfg.ik_iters,
+        cfg.ik_damping,
+        base,
+    )
+    ach_pos, ach_quat = fk(chain, q_all.reshape(-1, 7), base)
+    achieved = ach_pos.reshape(tm, len(cands), 3)
+    ach_quat = ach_quat.reshape(tm, len(cands), 4)
+    for k, c in enumerate(cands):
+        x = demos[c["d"]]
+        nf = len(x["act"])
+        q = q_all[:nf, k]
+        err = np.linalg.norm(achieved[:nf, k] - c["ee_t"], axis=1).max()
+        rot_err = R.from_quat(ach_quat[:nf, k]) * R.from_quat(c["quat"]).inv()
+        assert isinstance(rot_err, R)
+        rot_err = rot_err.magnitude().max()
+        jerk = np.abs(np.diff(q, n=2, axis=0)).max()
+        c["ik_ok"] = err < 0.02 and rot_err < np.radians(15) and jerk < jerk_limit
+        c["prof"] = clearance_profile(fcol, base_t, q, c, x, boxes, c["radii"])
+        frame = np.minimum(c["prof"][0], c["prof"][1])
+        c["clear"] = float(frame.min())
+        c["seg_clear"] = [
+            float(frame[a:b].min()) for a, b in seg_windows(x["segs"], m, nf)
+        ]
+        act = x["act"].copy()
+        act[:, ARM] = q
+        c["act"] = act.astype(np.float32)
+        s = stats[c["fam"]]
+        s[0] += 1
+        s[1] += c["ik_ok"]
+        s[2] += c["ik_ok"] and c["clear"] > 0
+
+
+def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
+    ok = [c for c in cands if c["ik_ok"]]
+    ok.sort(key=lambda c: -c["clear"])
+    to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
+    to_replay += [c for c in ok if c["fam"] != "none"][: cfg.replay_max]
+    best = None
+    for c in to_replay:
+        x = demos[c["d"]]
+        held = [names[j] for j in x["held"] if j is not None]
+        col, suc, label, info = replay(env, i, c["act"], cfg.hold, held)
+        if cfg.verbose and (c["fam"] == "none" or not col):
+            hit = label.split("/")[1] if col else ""
+            print(
+                f"   {c['fam']:11s} {fmt(c['combo'])} col={int(col)} succ={int(suc)} "
+                f"{hit} {info} clear={c['clear']:+.3f} :: "
+                f"{phase_report(c['prof'], x['segs'], m)}"
+            )
+        s = stats[c["fam"]]
+        s[3] += 1
+        s[4] += not col
+        s[5] += suc and not col
+        if suc and not col and best is None:
+            best = c
+    return best, sum(c["clear"] > 0 for c in ok), len(ok)
+
+
+def fmt(combo):
+    return " ".join(
+        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f}]" for a, pa, ta, pt, tt in combo
+    )
+
+
+def scene_candidates(cfg, demos, names, pos, radii):
+    cands = []
+    for d, x in enumerate(demos):
+        dbs, dps = [], []
+        for (c, op), j, tg in zip(x["segs"], x["held"], x["targets"]):
+            if j is None:
+                dbs.append(np.zeros(3))
+                dps.append(np.zeros(3))
+                continue
+            dbs.append(
+                np.append(pos[names[j]][:2] - x["obs"][0, obj_slice(j)][:2], 0.0)
+            )
+            if tg is None:
+                dps.append(np.zeros(3))
+            else:
+                end = x["obs"][min(op + 10, len(x["obs"]) - 1), obj_slice(j)][:2]
+                dps.append(np.append(pos[names[tg]][:2] - end, 0.0))
+        x["base_shift"] = shift_path(
+            len(x["act"]), x["segs"], round(cfg.margin * cfg.env.fps), dbs, dps
+        )
+        x["radii"] = [radii[names[j]] if j is not None else 0.0 for j in x["held"]]
+        n = len(x["segs"])
+        combos = [tuple([ZERO] * n)]
+        for k in range(n):
+            for opt in seg_options(cfg, x["held"][k]):
+                if opt != ZERO:
+                    combos.append(tuple(opt if j == k else ZERO for j in range(n)))
+        for combo in combos:
+            c = build(cfg, x, x["base_shift"], combo)
+            c["d"], c["radii"] = d, x["radii"]
+            cands.append(c)
+    return cands
+
+
+def compose_candidates(cfg, cands, demos):
+    out = []
+    for d, x in enumerate(demos):
+        n = len(x["segs"])
+        if n < 2:
+            continue
+        tops = []
+        for k in range(n):
+            mine = [
+                c for c in cands if c["d"] == d and c["ik_ok"] and c["combo"][k] != ZERO
+            ]
+            mine.sort(key=lambda c: -c["seg_clear"][k])
+            tops.append([c["combo"][k] for c in mine[: cfg.top_k]] or [ZERO])
+        for combo in product(*tops):
+            if sum(o != ZERO for o in combo) < 2:
+                continue
+            c = build(cfg, x, x["base_shift"], combo)
+            c["d"], c["radii"] = d, x["radii"]
+            out.append(c)
+    return out
 
 
 @draccus.wrap()
@@ -264,11 +416,10 @@ def main(cfg: Config):
     names = env.objects
     goals = env.goals()
     print(f"task {env.name} level {cfg.env.level}: objects {names} goals {goals}")
-    demos, chain, base = load_demos(cfg, free_env, len(names), goals)
+    demos, chain, base = load_demos(cfg, free_env, goals)
     base_t = torch.as_tensor(base, device=DEV)
     fcol = FrankaCollision(DEV, base, 0.0)
     jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
-    rng = np.random.default_rng(0)
     m = round(cfg.margin * cfg.env.fps)
 
     stats = defaultdict(lambda: np.zeros(6, int))
@@ -276,112 +427,40 @@ def main(cfg: Config):
     for i in range(cfg.n_inits):
         env.episode_idx = i
         env.reset()
-        box = env.obstacle_boxes()[0]
+        boxes = obstacle_geom_boxes(env.envs[0], env.obstacle[0])
         o = env.obs[0]
         pos = {n: o[f"{n}_pos"] for n in names}
         radii = {n: float(body_aabb(env.envs[0], n)[3:5].max()) for n in names}
-        cands: list[dict[str, Any]] = []
-        for d, x in enumerate(demos):
-            dbs, dps = [], []
-            for (c, op), j, tg in zip(x["segs"], x["held"], x["targets"]):
-                if j is None:
-                    dbs.append(np.zeros(3))
-                    dps.append(np.zeros(3))
-                    continue
-                dbs.append(
-                    np.append(pos[names[j]][:2] - x["obs"][0, obj_slice(j)][:2], 0.0)
+        cands = scene_candidates(cfg, demos, names, pos, radii)
+        args = (demos, chain, base, base_t, fcol, boxes, jerk_limit, stats)
+        evaluate(cfg, cands, *args)
+        best, geo, n_ok = replay_round(cfg, env, i, cands, demos, names, stats, m, True)
+        if best is None:
+            more = compose_candidates(cfg, cands, demos)
+            if more:
+                evaluate(cfg, more, *args)
+                best, g2, n2 = replay_round(
+                    cfg, env, i, more, demos, names, stats, m, False
                 )
-                if tg is None:
-                    dps.append(dbs[-1] * 0.0)
-                else:
-                    end = x["obs"][min(op + 10, len(x["obs"]) - 1), obj_slice(j)][:2]
-                    dps.append(np.append(pos[names[tg]][:2] - end, 0.0))
-            for c in candidates(cfg, x, dbs, dps):
-                c["d"] = d
-                c["radii"] = [
-                    radii[names[j]] if j is not None else 0.0 for j in x["held"]
-                ]
-                cands.append(c)
-        if len(cands) > cfg.max_cands:
-            keep = rng.choice(len(cands), cfg.max_cands, replace=False)
-            keep = sorted(
-                set(keep) | {k for k, c in enumerate(cands) if c["fam"] == "none"}
-            )
-            print(f"   subsampled {len(cands)} -> {len(keep)} candidates")
-            cands = [cands[k] for k in keep]
-        tm = max(len(demos[c["d"]]["act"]) for c in cands)
-        q_all = solve_seq(
-            chain,
-            np.stack([tpad(c["ee_t"], tm) for c in cands], axis=1),
-            np.stack([tpad(c["quat"], tm) for c in cands], axis=1),
-            np.stack([demos[c["d"]]["act"][0, ARM] for c in cands]),
-            cfg.ik_iters,
-            cfg.ik_damping,
-            base,
-        )
-        ach_pos, ach_quat = fk(chain, q_all.reshape(-1, 7), base)
-        achieved = ach_pos.reshape(tm, len(cands), 3)
-        ach_quat = ach_quat.reshape(tm, len(cands), 4)
-        for k, c in enumerate(cands):
-            x = demos[c["d"]]
-            nf = len(x["act"])
-            q = q_all[:nf, k]
-            err = np.linalg.norm(achieved[:nf, k] - c["ee_t"], axis=1).max()
-            rot_err = R.from_quat(ach_quat[:nf, k]) * R.from_quat(c["quat"]).inv()
-            assert isinstance(rot_err, R)
-            rot_err = rot_err.magnitude().max()
-            jerk = np.abs(np.diff(q, n=2, axis=0)).max()
-            c["ik_ok"] = err < 0.02 and rot_err < np.radians(15) and jerk < jerk_limit
-            c["prof"] = clearance_profile(fcol, base_t, q, c, x, box, c["radii"])
-            c["clear"] = float(min(c["prof"][0].min(), c["prof"][1].min()))
-            act = x["act"].copy()
-            act[:, ARM] = q
-            c["act"] = act.astype(np.float32)
-            s = stats[c["fam"]]
-            s[0] += 1
-            s[1] += c["ik_ok"]
-            s[2] += c["ik_ok"] and c["clear"] > 0
-        ok = [c for c in cands if c["ik_ok"]]
-        ok.sort(key=lambda c: -c["clear"])
-        to_replay = [c for c in ok if c["fam"] == "none"] + [
-            c for c in ok if c["fam"] != "none"
-        ][: cfg.replay_max]
-        best = None
-        for c in to_replay:
-            x = demos[c["d"]]
-            held = [names[j] for j in x["held"] if j is not None]
-            col, suc, label, info = replay(env, i, c["act"], cfg.hold, held)
-            if cfg.verbose and (c["fam"] == "none" or not col):
-                hit = label.split("/")[1] if col else ""
-                print(
-                    f"   {c['fam']:8s} {c['label'].round(2)} col={int(col)} "
-                    f"succ={int(suc)} {hit} {info} clear={c['clear']:+.3f} :: "
-                    f"{phase_report(c['prof'], x['segs'], m)}"
-                )
-            s = stats[c["fam"]]
-            s[3] += 1
-            s[4] += not col
-            s[5] += suc and not col
-            if suc and not col and best is None:
-                best = c
+                geo, n_ok = geo + g2, n_ok + n2
         scene_success.append(best is not None)
         desc = (
             "none"
             if best is None
-            else f"{best['fam']} {best['label'].round(2)} clear={best['clear']:.3f}"
+            else f"{best['fam']} {fmt(best['combo'])} clear={best['clear']:.3f}"
         )
         print(
-            f"scene {i} {env.obstacle[0]}: geo-clean {sum(c['clear'] > 0 for c in ok)}"
-            f"/{len(ok)} | first collision-free success: {desc}",
+            f"scene {i} {env.obstacle[0]} boxes={len(boxes)}: geo-clean {geo}/{n_ok} | "
+            f"first collision-free success: {desc}",
             flush=True,
         )
 
     print(
-        f"{'family':10s} {'cands':>6s} {'ik_ok':>6s} {'geo':>6s} "
+        f"{'family':11s} {'cands':>6s} {'ik_ok':>6s} {'geo':>6s} "
         f"{'replay':>6s} {'nocol':>6s} {'succ':>6s}"
     )
-    for fam, s in stats.items():
-        print(f"{fam:10s} " + " ".join(f"{v:6d}" for v in s))
+    for fam, s in sorted(stats.items()):
+        print(f"{fam:11s} " + " ".join(f"{v:6d}" for v in s))
     aug = sum(s[5] for f, s in stats.items() if f != "none")
     print(
         f"RESULT {cfg.env.suite} task {cfg.env.task_id} level {cfg.env.level}: "

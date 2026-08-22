@@ -209,19 +209,43 @@ def task_files(cfg: LiberoConfig, safe_root: Path) -> tuple[Path, Path]:
     return bddl, init
 
 
-def body_aabb(e, name: str) -> np.ndarray:
+def geom_boxes(e, name: str) -> np.ndarray:
     m, d = e.sim.model._model, e.sim.data._data
     b = m.body(f"{name}_main").id
     signs = np.array(np.meshgrid(*[[-1, 1]] * 3)).reshape(3, -1).T
-    corners = []
+    boxes = []
     for g in range(m.ngeom):
         if m.body_rootid[m.geom_bodyid[g]] != b:
             continue
+        if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0:
+            continue
         local = m.geom_aabb[g, :3] + signs * m.geom_aabb[g, 3:]
-        corners.append(d.geom_xpos[g] + local @ d.geom_xmat[g].reshape(3, 3).T)
-    pts = np.concatenate(corners)
-    lo, hi = pts.min(0), pts.max(0)
+        pts = d.geom_xpos[g] + local @ d.geom_xmat[g].reshape(3, 3).T
+        lo, hi = pts.min(0), pts.max(0)
+        boxes.append(np.concatenate([(lo + hi) / 2, (hi - lo) / 2]))
+    return np.stack(boxes)
+
+
+def union_box(boxes: np.ndarray) -> np.ndarray:
+    lo = (boxes[:, :3] - boxes[:, 3:]).min(0)
+    hi = (boxes[:, :3] + boxes[:, 3:]).max(0)
     return np.concatenate([(lo + hi) / 2, (hi - lo) / 2])
+
+
+def body_aabb(e, name: str) -> np.ndarray:
+    return union_box(geom_boxes(e, name))
+
+
+def obstacle_geom_boxes(e, name: str) -> np.ndarray:
+    boxes = geom_boxes(e, name)
+    ob = union_box(boxes)
+    for other in e.env.objects_dict:
+        if "base" not in other or other == name:
+            continue
+        bb = body_aabb(e, other)
+        if np.all(np.abs(bb[:2] - ob[:2]) < bb[3:5] + ob[3:5]):
+            boxes = np.concatenate([boxes, geom_boxes(e, other)])
+    return boxes
 
 
 def demo_to_episode(env, g) -> tuple[np.ndarray, np.ndarray]:
@@ -376,7 +400,8 @@ class LiberoEnv:
                 hits.append(m.body(b2).name)
             elif m.body_rootid[b2] == b and m.body_rootid[b1] != b:
                 hits.append(m.body(b1).name)
-        hits = [h for h in hits if not h.startswith(("table", "floor", "main_table"))]
+        skip = ("table", "floor", "main_table", "box_small_base", "box_base")
+        hits = [h for h in hits if not h.startswith(skip)]
         other = hits[0] if hits else "none"
         phase = "post" if grasped else "pre"
         return f"{name}/{other}/{phase}-grasp/t{self.step // 20 * 20}"
@@ -397,7 +422,7 @@ class LiberoEnv:
         boxes = np.tile([1e3, 1e3, 1e3, 0.01, 0.01, 0.01], (len(self.envs), 1))
         for i, e in enumerate(self.envs):
             if self.obstacle[i] is not None:
-                boxes[i] = body_aabb(e, self.obstacle[i])
+                boxes[i] = union_box(obstacle_geom_boxes(e, self.obstacle[i]))
         return boxes.astype(np.float32)
 
     @property
