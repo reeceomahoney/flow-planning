@@ -37,10 +37,10 @@ class Config:
     n_demos: int = 3
     margin: float = 0.3
     phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
-    n_theta: int = 6
+    n_theta: int = 4
     alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
     top_k: int = 4
-    replay_max: int = 16
+    replay_max: int = 12
     ik_iters: int = 8
     ik_damping: float = 0.05
     hold: int = 20
@@ -118,6 +118,13 @@ def grasp_rotation(ee, quat, w0, close, opened, m, centre, alpha):
     return new_ee, rot.as_quat().astype(np.float32)
 
 
+def bulge_delta(ee, s0, s1, phi, theta):
+    d = bend_delta(ee, s0, s1, phi, theta)
+    if d.any():
+        d[s0:s1] += ee[s0:s1] - np.linspace(ee[s0], ee[s1 - 1], s1 - s0)
+    return d
+
+
 def seg_options(cfg, held):
     if held is None:
         return [ZERO]
@@ -140,10 +147,10 @@ def build(cfg, x, base_shift, combo):
             ee, quat = grasp_rotation(ee, quat, w0, c, o, m, centre, np.radians(a))
             fam.add("rot")
         if pa:
-            ee = ee + bend_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
+            ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
             fam.add("app")
         if pt:
-            d = bend_delta(ee, c + m, o - m, pt * np.pi, tt)
+            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt)
             ee = ee + d
             objs[k] = objs[k] + d
             fam.add("tra")
@@ -157,20 +164,32 @@ def build(cfg, x, base_shift, combo):
     )
 
 
-def clearance_profile(fcol, base_t, q, c, x, boxes, radii):
+def clearance_batch(fcol, base_t, q_all, cands, demos, boxes, chunk=48):
+    tm, B = q_all.shape[:2]
     bx = torch.as_tensor(np.asarray(boxes, np.float32), device=DEV)
-    pts = fcol.arm_points(torch.as_tensor(q, dtype=torch.float32, device=DEV)) + base_t
-    d = torch.stack([box_sdf(pts, b[:3], b[3:]) for b in bx]).amin(0) - fcol.radius
-    per_frame, worst_pt = d.min(dim=1)
-    held = torch.ones(len(q), device=DEV)
-    for (c0, o0), path, r in zip(x["segs"], c["objs"], radii):
-        if path is None:
-            continue
-        p = torch.as_tensor(path[c0:o0], dtype=torch.float32, device=DEV)
-        dh = torch.stack([box_sdf(p, b[:3], b[3:]) for b in bx]).amin(0) - r
-        held[c0:o0] = torch.minimum(held[c0:o0], dh)
-    link = [fcol.frames[int(fcol.owner[i])] for i in worst_pt.cpu().numpy()]
-    return per_frame.cpu().numpy(), held.cpu().numpy(), link
+    c, h = bx[:, :3], bx[:, 3:]
+    arm = np.zeros((B, tm), np.float32)
+    worst = np.zeros((B, tm), np.int64)
+    q_t = torch.as_tensor(q_all, dtype=torch.float32, device=DEV)
+    for s0 in range(0, B, chunk):
+        q = q_t[:, s0 : s0 + chunk].reshape(-1, 7)
+        pts = fcol.arm_points(q) + base_t
+        d = box_sdf(pts[..., None, :], c, h).amin(-1) - fcol.radius
+        per_pt, idx = d.min(dim=1)
+        n = q.shape[0] // tm
+        arm[s0 : s0 + n] = per_pt.reshape(tm, n).T.cpu().numpy()
+        worst[s0 : s0 + n] = idx.reshape(tm, n).T.cpu().numpy()
+    held = np.ones((B, tm), np.float32)
+    for k, cd in enumerate(cands):
+        x = demos[cd["d"]]
+        for (c0, o0), path, r in zip(x["segs"], cd["objs"], cd["radii"]):
+            if path is None:
+                continue
+            p = torch.as_tensor(path[c0:o0], dtype=torch.float32, device=DEV)
+            dh = (box_sdf(p[:, None, :], c, h).amin(-1) - r).cpu().numpy()
+            held[k, c0:o0] = np.minimum(held[k, c0:o0], dh)
+    owner = fcol.owner.cpu().numpy()
+    return arm, held, owner[worst]
 
 
 def seg_windows(segs, m, T):
@@ -204,34 +223,57 @@ def phase_report(prof, segs, m):
     return " | ".join(out)
 
 
-def run(env, act, hold, names):
-    z0 = [env.obs[0][f"{n}_pos"][2] for n in names]
+def run(env, act, hold, names, targets=()):
+    p0 = [env.obs[0][f"{n}_pos"].copy() for n in names]
     lift = [0.0] * len(names)
     for a in act:
         env.apply_action(a[None])
         for j, n in enumerate(names):
-            lift[j] = max(lift[j], env.obs[0][f"{n}_pos"][2] - z0[j])
+            lift[j] = max(lift[j], env.obs[0][f"{n}_pos"][2] - p0[j][2])
         if env.collided[0]:
             break
     for _ in range(hold):
         if env.collided[0]:
             break
         env.apply_action(act[-1][None])
-    info = "lift " + "/".join(f"{v:.3f}" for v in lift)
+    o = env.obs[0]
+    moved = [np.linalg.norm(o[f"{n}_pos"][:2] - p[:2]) for n, p in zip(names, p0)]
+    dist = [
+        np.linalg.norm(o[f"{n}_pos"][:2] - o[f"{t}_pos"][:2]) if t else np.nan
+        for n, t in zip(names, targets)
+    ]
+    info = (
+        "lift "
+        + "/".join(f"{v:.3f}" for v in lift)
+        + " moved "
+        + "/".join(f"{v:.3f}" for v in moved)
+        + " to-target "
+        + "/".join(f"{v:.3f}" for v in dist)
+    )
     return bool(env.collided[0]), bool(env.succ[0]), env.contact[0], info
 
 
-def replay(env, init_idx, act, hold, names):
+def replay(env, init_idx, act, hold, names, targets):
     env.episode_idx = init_idx
     env.reset()
-    return run(env, act, hold, names)
+    return run(env, act, hold, names, targets)
 
 
-def source_replay(env, state0, act, hold, names):
+def source_replay(env, state0, act, hold, names, targets):
     env.reset()
     env.obs[0] = env.envs[0].set_init_state(state0)
     env.succ[:] = False
-    return run(env, act, hold, names)
+    return run(env, act, hold, names, targets)
+
+
+def held_names(names, x):
+    hn = [names[j] for j in x["held"] if j is not None]
+    tn = [
+        names[t] if t is not None else ""
+        for j, t in zip(x["held"], x["targets"])
+        if j is not None
+    ]
+    return hn, tn
 
 
 def load_demos(cfg, free_env, goals):
@@ -267,9 +309,12 @@ def load_demos(cfg, free_env, goals):
                 quat=quat,
             )
         )
-        hn = [names[j] for j in held if j is not None]
         _, suc, _, info = source_replay(
-            free_env, f["data"][k]["states"][0], act, cfg.hold, hn
+            free_env,
+            f["data"][k]["states"][0],
+            act,
+            cfg.hold,
+            *held_names(names, demos[-1]),
         )
         nm = [names[j] if j is not None else None for j in held + targets]
         print(
@@ -294,6 +339,7 @@ def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, st
     ach_pos, ach_quat = fk(chain, q_all.reshape(-1, 7), base)
     achieved = ach_pos.reshape(tm, len(cands), 3)
     ach_quat = ach_quat.reshape(tm, len(cands), 4)
+    arm, held, link = clearance_batch(fcol, base_t, q_all, cands, demos, boxes)
     for k, c in enumerate(cands):
         x = demos[c["d"]]
         nf = len(x["act"])
@@ -304,7 +350,7 @@ def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, st
         rot_err = rot_err.magnitude().max()
         jerk = np.abs(np.diff(q, n=2, axis=0)).max()
         c["ik_ok"] = err < 0.02 and rot_err < np.radians(15) and jerk < jerk_limit
-        c["prof"] = clearance_profile(fcol, base_t, q, c, x, boxes, c["radii"])
+        c["prof"] = (arm[k, :nf], held[k, :nf], [fcol.frames[j] for j in link[k, :nf]])
         frame = np.minimum(c["prof"][0], c["prof"][1])
         c["clear"] = float(frame.min())
         c["seg_clear"] = [
@@ -327,8 +373,9 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     best = None
     for c in to_replay:
         x = demos[c["d"]]
-        held = [names[j] for j in x["held"] if j is not None]
-        col, suc, label, info = replay(env, i, c["act"], cfg.hold, held)
+        col, suc, label, info = replay(
+            env, i, c["act"], cfg.hold, *held_names(names, x)
+        )
         if cfg.verbose and (c["fam"] == "none" or not col):
             hit = label.split("/")[1] if col else ""
             print(

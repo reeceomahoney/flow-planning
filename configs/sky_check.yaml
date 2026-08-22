@@ -2,8 +2,8 @@ name: flow-check
 
 resources:
   infra: ssh/ori
-  accelerators: RTX4090:1
-  cpus: 8
+  accelerators: RTX4090:0.5
+  cpus: 6
 
 envs:
   HF_TOKEN:
