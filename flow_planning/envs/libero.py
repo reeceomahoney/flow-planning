@@ -272,7 +272,6 @@ class LiberoEnv:
         if cfg.render:
             os.environ.setdefault("MUJOCO_GL", "egl")
         safe_root = libero_setup()
-        from libero.libero.envs.env_wrapper import ControlEnv
 
         self.cfg = cfg
         self.viewer = viewer
@@ -283,19 +282,7 @@ class LiberoEnv:
         )
         bddl, init = task_files(cfg, safe_root)
         self.init_states = np.asarray(torch.load(init, weights_only=False))
-        self.envs = [
-            ControlEnv(
-                bddl_file_name=str(bddl),
-                controller="JOINT_POSITION",
-                use_camera_obs=cfg.render and i == 0,
-                has_offscreen_renderer=cfg.render and i == 0,
-                has_renderer=False,
-                camera_names=["agentview"] if cfg.render and i == 0 else [],
-                camera_heights=cfg.render_size,
-                camera_widths=cfg.render_size,
-            )
-            for i in range(cfg.world_count)
-        ]
+        self.envs = [self.make_env(cfg, bddl, i) for i in range(cfg.world_count)]
         for e in self.envs:
             e.seed(0)
             c = e.env.robot_configs[0]["controller_config"]
@@ -320,6 +307,26 @@ class LiberoEnv:
         self.reset()
         self.objects = [n for n in self.objects if f"{n}_pos" in self.obs[0]]
         self.episode_idx = 0
+
+    def make_env(self, cfg: LiberoConfig, bddl: Path, i: int):
+        from libero.libero.envs.env_wrapper import ControlEnv
+        from robosuite.utils.errors import RandomizationError
+
+        for attempt in range(10):
+            try:
+                return ControlEnv(
+                    bddl_file_name=str(bddl),
+                    controller="JOINT_POSITION",
+                    use_camera_obs=cfg.render and i == 0,
+                    has_offscreen_renderer=cfg.render and i == 0,
+                    has_renderer=False,
+                    camera_names=["agentview"] if cfg.render and i == 0 else [],
+                    camera_heights=cfg.render_size,
+                    camera_widths=cfg.render_size,
+                )
+            except RandomizationError:
+                np.random.seed(attempt + 1)
+        raise RuntimeError(f"could not build {bddl}")
 
     def reset(self):
         n = len(self.envs)
