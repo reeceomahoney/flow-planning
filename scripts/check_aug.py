@@ -417,17 +417,10 @@ def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, st
         s[2] += c["ik_ok"] and c["clear"] > 0
 
 
-def replay_round(cfg, env, free_env, i, cands, demos, names, stats, m, replay_none):
+def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     ok = [c for c in cands if c["ik_ok"]]
     ok.sort(key=lambda c: -c["clear"])
     to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
-    for c in to_replay:
-        hn = held_names(names, demos[c["d"]])
-        _, suc, _, info = replay(free_env, i, c["act"], cfg.hold, hn, c["expected"])
-        stats["free"][3] += 1
-        stats["free"][5] += suc
-        if cfg.verbose:
-            print(f"   free-scene  demo {c['d']} succ={int(suc)} {info}")
     aug = [c for c in ok if c["fam"] != "none"]
     groups = defaultdict(list)
     for c in aug:
@@ -466,6 +459,20 @@ def fmt(combo):
         f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} {'ar'[int(md)]}]"
         for a, pa, ta, pt, tt, md in combo
     )
+
+
+def scene_geometry(env, target_names):
+    o = env.obs[0]
+    sim = env.envs[0].sim
+    names = env.objects
+    pos = {n: o[f"{n}_pos"] for n in names}
+    yaws = {n: yaw_of_quat(o[f"{n}_quat"]) for n in names}
+    halves = {n: body_aabb(env.envs[0], n)[3:5] for n in names}
+    radii = {n: float(halves[n].max()) for n in names}
+    tpos = {}
+    for t in target_names:
+        tpos[t] = pos[t] if t in pos else sim.data.get_site_xpos(t).copy()
+    return pos, yaws, radii, halves, tpos
 
 
 def scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos):
@@ -551,6 +558,7 @@ def main(cfg: Config):
     goals = env.goals()
     print(f"task {env.name} level {cfg.env.level}: objects {names} goals {goals}")
     demos, chain, base = load_demos(cfg, free_env, goals)
+    tn = sorted({t for x in demos for t in x["targets"] if t is not None})
     base_t = torch.as_tensor(base, device=DEV)
     fcol = FrankaCollision(DEV, base, 0.0)
     jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
@@ -559,32 +567,33 @@ def main(cfg: Config):
     stats = defaultdict(lambda: np.zeros(6, int))
     scene_success = []
     for i in range(cfg.n_inits):
+        free_env.episode_idx = i
+        free_env.reset()
+        control = scene_candidates(cfg, demos, names, *scene_geometry(free_env, tn))
+        control = [c for c in control if c["fam"] == "none"]
         env.episode_idx = i
         env.reset()
         boxes = obstacle_geom_boxes(env.envs[0], env.obstacle[0])
-        o = env.obs[0]
-        sim = env.envs[0].sim
-        pos = {n: o[f"{n}_pos"] for n in names}
-        yaws = {n: yaw_of_quat(o[f"{n}_quat"]) for n in names}
-        halves = {n: body_aabb(env.envs[0], n)[3:5] for n in names}
-        radii = {n: float(halves[n].max()) for n in names}
-        tpos = {}
-        for x in demos:
-            for t in x["targets"]:
-                if t is not None and t not in tpos:
-                    tpos[t] = pos[t] if t in pos else sim.data.get_site_xpos(t)
-        cands = scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos)
         args = (demos, chain, base, base_t, fcol, boxes, jerk_limit, stats)
+        evaluate(cfg, control, *args)
+        for c in control:
+            if not c["ik_ok"]:
+                continue
+            hn = held_names(names, demos[c["d"]])
+            _, suc, _, info = replay(free_env, i, c["act"], cfg.hold, hn, c["expected"])
+            stats["free"][3] += 1
+            stats["free"][5] += suc
+            if cfg.verbose:
+                print(f"   free-scene  demo {c['d']} succ={int(suc)} {info}")
+        cands = scene_candidates(cfg, demos, names, *scene_geometry(env, tn))
         evaluate(cfg, cands, *args)
-        best, geo, n_ok = replay_round(
-            cfg, env, free_env, i, cands, demos, names, stats, m, True
-        )
+        best, geo, n_ok = replay_round(cfg, env, i, cands, demos, names, stats, m, True)
         if best is None:
             more = compose_candidates(cfg, cands, demos)
             if more:
                 evaluate(cfg, more, *args)
                 best, g2, n2 = replay_round(
-                    cfg, env, free_env, i, more, demos, names, stats, m, False
+                    cfg, env, i, more, demos, names, stats, m, False
                 )
                 geo, n_ok = geo + g2, n_ok + n2
         scene_success.append(best is not None)
