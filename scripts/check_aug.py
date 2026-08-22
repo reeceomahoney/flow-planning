@@ -27,7 +27,7 @@ from flow_planning.selector import FrankaCollision, box_sdf
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 OBJ0 = 18
-ZERO = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+ZERO = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -48,7 +48,6 @@ class Config:
     arcs: str = "additive,replace"
     vel_frac: float = 0.8
     ik_tol: float = 0.01
-    site_pull: float = 0.05
 
 
 def obj_slice(k):
@@ -146,7 +145,7 @@ def bulge_delta(ee, s0, s1, phi, theta, mode="additive"):
     return d
 
 
-def seg_options(cfg, held, site_target):
+def seg_options(cfg, held):
     if held is None:
         return [ZERO]
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
@@ -158,14 +157,7 @@ def seg_options(cfg, held, site_target):
         for p in cfg.phis
         for th in thetas
     ]
-    pulls = [0.0, 1.0] if site_target else [0.0]
-    return [
-        (a, *ap, *tr, pl)
-        for a in cfg.alphas
-        for ap in arcs
-        for tr in transit
-        for pl in pulls
-    ]
+    return [(a, *ap, *tr) for a in cfg.alphas for ap in arcs for tr in transit]
 
 
 def grasp_width(x, k, a_eff):
@@ -173,13 +165,6 @@ def grasp_width(x, k, a_eff):
     ax = R.from_quat(x["quat"][c]).as_matrix()[:2, 1]
     ax = rotz(a_eff)[:2, :2] @ ax
     return 2 * float(np.abs(ax) @ x["half"][k])
-
-
-def place_shift(x, combo):
-    return [
-        d if (not site or pl) else np.zeros(3)
-        for d, site, (*_, pl) in zip(x["dps"], x["site"], combo)
-    ]
 
 
 def build(cfg, x, combo):
@@ -197,10 +182,10 @@ def build(cfg, x, combo):
     w0 = 0
     fam = set()
     modes = cfg.arcs.split(",")
-    dps = place_shift(x, combo)
+    dps = x["dps"]
     base_shift = shift_path(len(x["act"]), segs, m, x["dbs"], dps)
     expected = [e + d for e, d, j in zip(x["ends"], dps, x["held"]) if j is not None]
-    for k, ((c, o), (a, pa, ta, pt, tt, mode, _)) in enumerate(zip(segs, combo)):
+    for k, ((c, o), (a, pa, ta, pt, tt, mode)) in enumerate(zip(segs, combo)):
         if a:
             centre = x["obs"][0, obj_slice(x["held"][k])]
             w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
@@ -475,8 +460,8 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
 
 def fmt(combo):
     return " ".join(
-        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} {'ar'[int(md)]}{'p' * int(pl)}]"
-        for a, pa, ta, pt, tt, md, pl in combo
+        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} {'ar'[int(md)]}]"
+        for a, pa, ta, pt, tt, md in combo
     )
 
 
@@ -494,12 +479,12 @@ def scene_geometry(env, target_names):
     return pos, yaws, radii, halves, tpos
 
 
-def scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos):
+def scene_candidates(cfg, demos, names, geo, tshift):
+    pos, yaws, radii, halves, tpos = geo
     cands = []
     for d, x in enumerate(demos):
-        dbs, dps, dyaw, diag, ends, site = [], [], [], [], [], []
+        dbs, dps, dyaw, diag, ends = [], [], [], [], []
         for (c, op), j, tg in zip(x["segs"], x["held"], x["targets"]):
-            site.append(tg is not None and tg not in names)
             if j is None:
                 dbs.append(np.zeros(3))
                 dps.append(np.zeros(3))
@@ -515,13 +500,12 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos):
             diag.append(f"{names[j]} d={db.round(3)} dyaw={np.degrees(dyaw[-1]):.0f}")
             if tg is None:
                 dps.append(np.zeros(3))
-            else:
+            elif tg in names:
                 end = x["obs"][min(op + 10, len(x["obs"]) - 1), sl][:2]
-                dp = tpos[tg][:2] - end
-                if tg not in names:
-                    dp = dp * min(1.0, cfg.site_pull / max(np.linalg.norm(dp), 1e-6))
-                dps.append(np.append(dp, 0.0))
-        x["dbs"], x["dps"], x["ends"], x["site"] = dbs, dps, ends, site
+                dps.append(np.append(tpos[tg][:2] - end, 0.0))
+            else:
+                dps.append(np.append(tshift[tg][:2], 0.0))
+        x["dbs"], x["dps"], x["ends"] = dbs, dps, ends
         x["radii"] = [radii[names[j]] if j is not None else 0.0 for j in x["held"]]
         x["half"] = [
             halves[names[j]] if j is not None else np.ones(2) for j in x["held"]
@@ -532,7 +516,7 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos):
         n = len(x["segs"])
         combos = [tuple([ZERO] * n)]
         for k in range(n):
-            for opt in seg_options(cfg, x["held"][k], site[k]):
+            for opt in seg_options(cfg, x["held"][k]):
                 if opt != ZERO:
                     combos.append(tuple(opt if j == k else ZERO for j in range(n)))
         for combo in combos:
@@ -587,7 +571,9 @@ def main(cfg: Config):
     for i in range(cfg.n_inits):
         free_env.episode_idx = i
         free_env.reset()
-        control = scene_candidates(cfg, demos, names, *scene_geometry(free_env, tn))
+        geo_free = scene_geometry(free_env, tn)
+        zero = {t: np.zeros(3) for t in tn}
+        control = scene_candidates(cfg, demos, names, geo_free, zero)
         control = [c for c in control if c["fam"] == "none"]
         env.episode_idx = i
         env.reset()
@@ -603,7 +589,14 @@ def main(cfg: Config):
             stats["free"][5] += suc
             if cfg.verbose:
                 print(f"   free-scene  demo {c['d']} succ={int(suc)} {info}")
-        cands = scene_candidates(cfg, demos, names, *scene_geometry(env, tn))
+        geo = scene_geometry(env, tn)
+        tshift = {t: geo[4][t] - geo_free[4][t] for t in tn}
+        if tn:
+            print(
+                "   fixture shift "
+                + " ".join(f"{t}={tshift[t][:2].round(3)}" for t in tn)
+            )
+        cands = scene_candidates(cfg, demos, names, geo, tshift)
         evaluate(cfg, cands, *args)
         best, geo, n_ok = replay_round(cfg, env, i, cands, demos, names, stats, m, True)
         if best is None:
