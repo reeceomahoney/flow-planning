@@ -347,12 +347,15 @@ def load_demos(cfg, free_env, goals):
                 quat=quat,
             )
         )
+        x = demos[-1]
+        ends = [x["obs"][-1, obj_slice(j)] for j in held if j is not None]
         _, suc, _, info = source_replay(
             free_env,
             f["data"][k]["states"][0],
             act,
             cfg.hold,
-            *held_names(names, demos[-1]),
+            held_names(names, x),
+            ends,
         )
         nm = [names[j] if j is not None else None for j in held] + targets
         print(
