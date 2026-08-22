@@ -48,6 +48,7 @@ class Config:
     arcs: str = "additive,replace"
     vel_frac: float = 0.8
     ik_tol: float = 0.01
+    site_pull: float = 0.05
 
 
 def obj_slice(k):
@@ -496,7 +497,10 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii, halves, tpos):
                 dps.append(np.zeros(3))
             else:
                 end = x["obs"][min(op + 10, len(x["obs"]) - 1), sl][:2]
-                dps.append(np.append(tpos[tg][:2] - end, 0.0))
+                dp = tpos[tg][:2] - end
+                if tg not in names:
+                    dp = dp * min(1.0, cfg.site_pull / max(np.linalg.norm(dp), 1e-6))
+                dps.append(np.append(dp, 0.0))
         x["base_shift"] = shift_path(
             len(x["act"]), x["segs"], round(cfg.margin * cfg.env.fps), dbs, dps
         )
