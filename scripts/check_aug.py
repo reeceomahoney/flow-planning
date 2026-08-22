@@ -448,8 +448,9 @@ def replay_round(cfg, env, free_env, i, cands, demos, names, stats, m, replay_no
     best = None
     for c in to_replay:
         x = demos[c["d"]]
+        hn, tn = held_names(names, x)
         col, suc, label, info = replay(
-            env, i, c["act"], cfg.hold, *held_names(names, x)
+            env, i, c["act"], cfg.hold, hn, tn, c["expected"]
         )
         if cfg.verbose and (c["fam"] == "none" or not col):
             hit = label.split("/")[1] if col else ""
