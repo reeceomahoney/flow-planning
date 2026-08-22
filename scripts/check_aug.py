@@ -164,16 +164,18 @@ def build(cfg, x, base_shift, combo):
     )
 
 
-def clearance_batch(fcol, base_t, q_all, cands, demos, boxes, chunk=48):
+def clearance_batch(fcol, base_t, q_all, cands, demos, boxes, stride=4):
     tm, B = q_all.shape[:2]
     bx = torch.as_tensor(np.asarray(boxes, np.float32), device=DEV)
     c, h = bx[:, :3], bx[:, 3:]
     arm = np.zeros((B, tm), np.float32)
     worst = np.zeros((B, tm), np.int64)
     q_t = torch.as_tensor(q_all, dtype=torch.float32, device=DEV)
+    n_pts = (len(fcol.owner) + stride - 1) // stride
+    chunk = max(1, int(2e8 / (tm * n_pts * len(bx) * 12)))
     for s0 in range(0, B, chunk):
         q = q_t[:, s0 : s0 + chunk].reshape(-1, 7)
-        pts = fcol.arm_points(q) + base_t
+        pts = fcol.arm_points(q)[:, ::stride] + base_t
         d = box_sdf(pts[..., None, :], c, h).amin(-1) - fcol.radius
         per_pt, idx = d.min(dim=1)
         n = q.shape[0] // tm
@@ -188,7 +190,7 @@ def clearance_batch(fcol, base_t, q_all, cands, demos, boxes, chunk=48):
             p = torch.as_tensor(path[c0:o0], dtype=torch.float32, device=DEV)
             dh = (box_sdf(p[:, None, :], c, h).amin(-1) - r).cpu().numpy()
             held[k, c0:o0] = np.minimum(held[k, c0:o0], dh)
-    owner = fcol.owner.cpu().numpy()
+    owner = fcol.owner.cpu().numpy()[::stride]
     return arm, held, owner[worst]
 
 
@@ -336,9 +338,13 @@ def evaluate(cfg, cands, demos, chain, base, base_t, fcol, boxes, jerk_limit, st
         cfg.ik_damping,
         base,
     )
-    ach_pos, ach_quat = fk(chain, q_all.reshape(-1, 7), base)
-    achieved = ach_pos.reshape(tm, len(cands), 3)
-    ach_quat = ach_quat.reshape(tm, len(cands), 4)
+    achieved = np.zeros((tm, len(cands), 3), np.float32)
+    ach_quat = np.zeros((tm, len(cands), 4), np.float32)
+    for s0 in range(0, len(cands), 64):
+        pos, quat = fk(chain, q_all[:, s0 : s0 + 64].reshape(-1, 7), base)
+        n = q_all[:, s0 : s0 + 64].shape[1]
+        achieved[:, s0 : s0 + n] = pos.reshape(tm, n, 3)
+        ach_quat[:, s0 : s0 + n] = quat.reshape(tm, n, 4)
     arm, held, link = clearance_batch(fcol, base_t, q_all, cands, demos, boxes)
     for k, c in enumerate(cands):
         x = demos[c["d"]]
