@@ -151,8 +151,21 @@ def seg_options(cfg, held):
     return [(a, *ap, *tr) for a in cfg.alphas for ap in arcs for tr in arcs]
 
 
+def grasp_width(x, k, a_eff):
+    c = x["segs"][k][0]
+    ax = R.from_quat(x["quat"][c]).as_matrix()[:2, 1]
+    ax = rotz(a_eff)[:2, :2] @ ax
+    return 2 * float(np.abs(ax) @ x["half"][k])
+
+
 def build(cfg, x, base_shift, combo):
     segs, m = x["segs"], round(cfg.margin * cfg.env.fps)
+    for k, (a, *_) in enumerate(combo):
+        if x["held"][k] is None:
+            continue
+        a_eff = wrap(np.radians(a) + x["dyaw"][k])
+        if grasp_width(x, k, a_eff) > grasp_width(x, k, x["dyaw"][k]) + 0.01:
+            return None
     ee, quat = x["ee"].copy(), x["quat"].copy()
     objs = [
         x["obs"][:, obj_slice(j)].copy() if j is not None else None for j in x["held"]
@@ -405,14 +418,17 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     ok = [c for c in cands if c["ik_ok"]]
     ok.sort(key=lambda c: -c["clear"])
     to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
-    cap = (cfg.replay_max + 1) // 2
-    used = defaultdict(int)
+    aug = [c for c in ok if c["fam"] != "none"]
+    groups = defaultdict(list)
+    for c in aug:
+        groups[tuple(a for a, *_ in c["combo"])].append(c)
     picked = []
-    for c in ok:
-        g = tuple(a for a, *_ in c["combo"])
-        if c["fam"] != "none" and used[g] < cap and len(picked) < cfg.replay_max:
-            used[g] += 1
-            picked.append(c)
+    while len(picked) < cfg.replay_max // 2 and any(groups.values()):
+        for g in list(groups):
+            if groups[g] and len(picked) < cfg.replay_max // 2:
+                picked.append(groups[g].pop(0))
+    ids = {id(c) for c in picked}
+    picked += [c for c in aug if id(c) not in ids][: cfg.replay_max - len(picked)]
     to_replay += picked
     best = None
     for c in to_replay:
@@ -442,7 +458,7 @@ def fmt(combo):
     )
 
 
-def scene_candidates(cfg, demos, names, pos, yaws, radii):
+def scene_candidates(cfg, demos, names, pos, yaws, radii, halves):
     cands = []
     for d, x in enumerate(demos):
         dbs, dps, dyaw, diag = [], [], [], []
@@ -467,6 +483,9 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii):
             len(x["act"]), x["segs"], round(cfg.margin * cfg.env.fps), dbs, dps
         )
         x["radii"] = [radii[names[j]] if j is not None else 0.0 for j in x["held"]]
+        x["half"] = [
+            halves[names[j]] if j is not None else np.ones(2) for j in x["held"]
+        ]
         x["dyaw"] = dyaw
         if d == 0:
             print("   retarget " + " | ".join(diag))
@@ -478,8 +497,9 @@ def scene_candidates(cfg, demos, names, pos, yaws, radii):
                     combos.append(tuple(opt if j == k else ZERO for j in range(n)))
         for combo in combos:
             c = build(cfg, x, x["base_shift"], combo)
-            c["d"], c["radii"] = d, x["radii"]
-            cands.append(c)
+            if c is not None:
+                c["d"], c["radii"] = d, x["radii"]
+                cands.append(c)
     return cands
 
 
@@ -500,8 +520,9 @@ def compose_candidates(cfg, cands, demos):
             if sum(o != ZERO for o in combo) < 2:
                 continue
             c = build(cfg, x, x["base_shift"], combo)
-            c["d"], c["radii"] = d, x["radii"]
-            out.append(c)
+            if c is not None:
+                c["d"], c["radii"] = d, x["radii"]
+                out.append(c)
     return out
 
 
@@ -529,8 +550,9 @@ def main(cfg: Config):
         o = env.obs[0]
         pos = {n: o[f"{n}_pos"] for n in names}
         yaws = {n: yaw_of_quat(o[f"{n}_quat"]) for n in names}
-        radii = {n: float(body_aabb(env.envs[0], n)[3:5].max()) for n in names}
-        cands = scene_candidates(cfg, demos, names, pos, yaws, radii)
+        halves = {n: body_aabb(env.envs[0], n)[3:5] for n in names}
+        radii = {n: float(halves[n].max()) for n in names}
+        cands = scene_candidates(cfg, demos, names, pos, yaws, radii, halves)
         args = (demos, chain, base, base_t, fcol, boxes, jerk_limit, stats)
         evaluate(cfg, cands, *args)
         best, geo, n_ok = replay_round(cfg, env, i, cands, demos, names, stats, m, True)
