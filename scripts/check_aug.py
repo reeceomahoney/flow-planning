@@ -53,7 +53,7 @@ def obj_slice(k):
 
 def held_object(obs, close, opened, n_obj):
     ee = obs[close:opened, EE] - obs[close, EE]
-    best, best_err = None, 0.02
+    best, best_err = None, 0.05
     for k in range(n_obj):
         p = obs[close:opened, obj_slice(k)] - obs[close, obj_slice(k)]
         err = np.abs(p - ee).mean()
@@ -87,6 +87,19 @@ def shift_path(T, segs, m, dbs, dps):
     k, v = k[keep], np.stack(vals)[keep]
     t = np.arange(T)
     return np.stack([np.interp(t, k, v[:, j]) for j in range(3)], axis=1)
+
+
+def yaw_of_rot6d(r6):
+    return float(np.arctan2(r6[1], r6[0]))
+
+
+def yaw_of_quat(q):
+    m = R.from_quat(q).as_matrix()
+    return float(np.arctan2(m[1, 0], m[0, 0]))
+
+
+def wrap(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
 
 
 def rotz(a):
@@ -378,16 +391,15 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     ok = [c for c in cands if c["ik_ok"]]
     ok.sort(key=lambda c: -c["clear"])
     to_replay = [c for c in ok if c["fam"] == "none"] if replay_none else []
-    aug = [c for c in ok if c["fam"] != "none"]
-    seen = set()
+    groups = defaultdict(list)
+    for c in ok:
+        if c["fam"] != "none":
+            groups[tuple(a for a, *_ in c["combo"])].append(c)
     picked = []
-    for c in aug:
-        key = (c["d"],) + tuple((a, pt, tt) for a, _, _, pt, tt in c["combo"])
-        if key not in seen and len(picked) < cfg.replay_max:
-            seen.add(key)
-            picked.append(c)
-    ids = {id(c) for c in picked}
-    picked += [c for c in aug if id(c) not in ids][: cfg.replay_max - len(picked)]
+    while len(picked) < cfg.replay_max and any(groups.values()):
+        for g in list(groups):
+            if groups[g] and len(picked) < cfg.replay_max:
+                picked.append(groups[g].pop(0))
     to_replay += picked
     best = None
     for c in to_replay:
@@ -417,27 +429,34 @@ def fmt(combo):
     )
 
 
-def scene_candidates(cfg, demos, names, pos, radii):
+def scene_candidates(cfg, demos, names, pos, yaws, radii):
     cands = []
     for d, x in enumerate(demos):
-        dbs, dps = [], []
+        dbs, dps, dyaw, diag = [], [], [], []
         for (c, op), j, tg in zip(x["segs"], x["held"], x["targets"]):
             if j is None:
                 dbs.append(np.zeros(3))
                 dps.append(np.zeros(3))
+                dyaw.append(0.0)
                 continue
-            dbs.append(
-                np.append(pos[names[j]][:2] - x["obs"][0, obj_slice(j)][:2], 0.0)
-            )
+            sl = obj_slice(j)
+            db = pos[names[j]] - x["obs"][0, sl]
+            dbs.append(db)
+            r6 = x["obs"][0, sl.stop : sl.stop + 6]
+            dyaw.append(wrap(yaws[names[j]] - yaw_of_rot6d(r6)))
+            diag.append(f"{names[j]} d={db.round(3)} dyaw={np.degrees(dyaw[-1]):.0f}")
             if tg is None:
                 dps.append(np.zeros(3))
             else:
-                end = x["obs"][min(op + 10, len(x["obs"]) - 1), obj_slice(j)][:2]
+                end = x["obs"][min(op + 10, len(x["obs"]) - 1), sl][:2]
                 dps.append(np.append(pos[names[tg]][:2] - end, 0.0))
         x["base_shift"] = shift_path(
             len(x["act"]), x["segs"], round(cfg.margin * cfg.env.fps), dbs, dps
         )
         x["radii"] = [radii[names[j]] if j is not None else 0.0 for j in x["held"]]
+        x["dyaw"] = dyaw
+        if d == 0:
+            print("   retarget " + " | ".join(diag))
         n = len(x["segs"])
         combos = [tuple([ZERO] * n)]
         for k in range(n):
@@ -496,8 +515,9 @@ def main(cfg: Config):
         boxes = obstacle_geom_boxes(env.envs[0], env.obstacle[0])
         o = env.obs[0]
         pos = {n: o[f"{n}_pos"] for n in names}
+        yaws = {n: yaw_of_quat(o[f"{n}_quat"]) for n in names}
         radii = {n: float(body_aabb(env.envs[0], n)[3:5].max()) for n in names}
-        cands = scene_candidates(cfg, demos, names, pos, radii)
+        cands = scene_candidates(cfg, demos, names, pos, yaws, radii)
         args = (demos, chain, base, base_t, fcol, boxes, jerk_limit, stats)
         evaluate(cfg, cands, *args)
         best, geo, n_ok = replay_round(cfg, env, i, cands, demos, names, stats, m, True)
