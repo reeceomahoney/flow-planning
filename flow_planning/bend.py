@@ -96,3 +96,177 @@ def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
 
 def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
     return np.concatenate([a, np.repeat(a[-1:], tm - len(a), axis=0)])
+
+
+OBJ0 = 18
+SEG_ZERO = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+LABEL_DIM = 7
+
+
+def obj_slice(k):
+    return slice(OBJ0 + 9 * k, OBJ0 + 9 * k + 3)
+
+
+def held_object(obs, close, opened, n_obj):
+    ee = obs[close:opened, EE] - obs[close, EE]
+    best, best_err = None, 0.05
+    for k in range(n_obj):
+        p = obs[close:opened, obj_slice(k)] - obs[close, obj_slice(k)]
+        err = np.abs(p - ee).mean()
+        if err < best_err and np.linalg.norm(p[-1]) > 0.02:
+            best, best_err = k, err
+    return best
+
+
+def wrap(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def rotz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def yaw_of_rot6d(r6):
+    return float(np.arctan2(r6[1], r6[0]))
+
+
+def yaw_of_quat(q):
+    from scipy.spatial.transform import Rotation as R
+
+    m = R.from_quat(q).as_matrix()
+    return float(np.arctan2(m[1, 0], m[0, 0]))
+
+
+def shift_path(T, segs, m, dbs, dps):
+    knots, vals = [0], [np.zeros(3)]
+    for (c, o), db, dp in zip(segs, dbs, dps):
+        for t, v in [(c - m, db), (c + m, db), (o - m, dp), (o + m, dp)]:
+            knots.append(t)
+            vals.append(v)
+    knots.append(T - 1)
+    vals.append(vals[-1])
+    k = np.array(knots)
+    for i in range(1, len(k)):
+        k[i] = max(k[i], k[i - 1] + 1)
+    keep = k < T
+    k, v = k[keep], np.stack(vals)[keep]
+    t = np.arange(T)
+    return np.stack([np.interp(t, k, v[:, j]) for j in range(3)], axis=1)
+
+
+def bulge_delta(ee, s0, s1, phi, theta, mode="additive"):
+    d = bend_delta(ee, s0, s1, phi, theta)
+    if d.any() and mode == "additive":
+        d[s0:s1] += ee[s0:s1] - np.linspace(ee[s0], ee[s1 - 1], s1 - s0)
+    return d
+
+
+def grasp_rotation(ee, quat, w0, close, opened, w1, m, centre, alpha):
+    from scipy.spatial.transform import Rotation as R
+
+    T = len(ee)
+    a1 = max(close - m, w0 + 1)
+    centre = np.array([centre[0], centre[1], 0.0])
+    oh = ee[close] - centre
+    oh[2] = 0.0
+    t = np.arange(T)
+    ramp = np.clip((t - w0) / (a1 - w0), 0.0, 1.0)
+    if w1 is not None:
+        decay = np.clip(1 - (t - opened) / max(w1 - opened, 1), 0.0, 1.0)
+        ramp = np.where(t > opened, decay, ramp)
+    new_ee = ee.copy()
+    off = rotz(alpha) @ oh - oh
+    for i in range(w0, T):
+        if i < a1:
+            new_ee[i] = centre + rotz(ramp[i] * alpha) @ (ee[i] - centre)
+        else:
+            new_ee[i] = ee[i] + ramp[i] * off
+    yaw = wrap(alpha)
+    if np.isclose(abs(yaw), np.pi):
+        yaw = -np.pi
+    rot = R.from_euler("z", (ramp * yaw)[:, None]) * R.from_quat(quat)
+    assert isinstance(rot, R)
+    return new_ee, rot.as_quat().astype(np.float32)
+
+
+def grasp_width(x, k, a_eff):
+    from scipy.spatial.transform import Rotation as R
+
+    c = x["segs"][k][0]
+    ax = R.from_quat(x["quat"][c]).as_matrix()[:2, 1]
+    ax = rotz(a_eff)[:2, :2] @ ax
+    return 2 * float(np.abs(ax) @ x["half"][k])
+
+
+def seg_options(alphas, phis, n_theta, modes):
+    thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
+    arcs = [(0.0, 0.0)] + [(p, th) for p in phis for th in thetas]
+    transit = [(0.0, 0.0, 0.0)] + [
+        (p, th, float(i)) for i, _ in enumerate(modes) for p in phis for th in thetas
+    ]
+    return [(a, *ap, *tr) for a in alphas for ap in arcs for tr in transit]
+
+
+def encode_label(combo, n_seg):
+    out = np.zeros(LABEL_DIM * n_seg, np.float32)
+    for k, (a, pa, ta, pt, tt, md) in enumerate(combo[:n_seg]):
+        r = np.radians(a)
+        out[LABEL_DIM * k : LABEL_DIM * (k + 1)] = [
+            np.sin(r),
+            1 - np.cos(r),
+            pa * np.cos(ta),
+            pa * np.sin(ta),
+            pt * np.cos(tt),
+            pt * np.sin(tt),
+            md,
+        ]
+    return out
+
+
+def build(x, combo, m, modes):
+    """x: demo dict (segs, held, obs, ee, quat, dyaw, half, dbs, dps, ends).
+
+    Returns None if a rotation widens the grasp beyond the demo's."""
+    segs = x["segs"]
+    for k, (a, *_) in enumerate(combo):
+        if x["held"][k] is None:
+            continue
+        a_eff = wrap(np.radians(a) + x["dyaw"][k])
+        if grasp_width(x, k, a_eff) > grasp_width(x, k, x["dyaw"][k]) + 0.01:
+            return None
+    ee, quat = x["ee"].copy(), x["quat"].copy()
+    objs = [
+        x["obs"][:, obj_slice(j)].copy() if j is not None else None for j in x["held"]
+    ]
+    w0 = 0
+    fam = set()
+    base_shift = shift_path(len(x["ee"]), segs, m, x["dbs"], x["dps"])
+    expected = [
+        e + d for e, d, j in zip(x["ends"], x["dps"], x["held"]) if j is not None
+    ]
+    for k, ((c, o), (a, pa, ta, pt, tt, mode)) in enumerate(zip(segs, combo)):
+        a_eff = wrap(np.radians(a) + x["dyaw"][k]) if x["held"][k] is not None else 0.0
+        if abs(a_eff) > 1e-3:
+            centre = x["obs"][0, obj_slice(x["held"][k])]
+            w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
+            ee, quat = grasp_rotation(ee, quat, w0, c, o, w1, m, centre, a_eff)
+        if a:
+            fam.add("rot")
+        if pa:
+            ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
+            fam.add("app")
+        if pt:
+            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt, modes[int(mode)])
+            ee = ee + d
+            objs[k] = objs[k] + d
+            fam.add("tra")
+        w0 = o
+    return dict(
+        fam="+".join(sorted(fam)) or "none",
+        combo=combo,
+        ee_t=ee + base_shift,
+        quat=quat,
+        objs=[o + base_shift if o is not None else None for o in objs],
+        expected=expected,
+    )

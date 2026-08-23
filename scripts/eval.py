@@ -13,6 +13,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tqdm import tqdm
 
+from flow_planning.bend import LABEL_DIM
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
@@ -52,6 +53,12 @@ class Config:
 
 
 def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
+    if bend.shape[1] >= LABEL_DIM:
+        rows = np.unique(bend[np.abs(bend).sum(1) > 0], axis=0)
+        assert len(rows), "dataset has no augmented episodes"
+        return torch.tensor(
+            rows[rng.choice(len(rows), k)], dtype=torch.float32, device=device
+        )
     arc = bend[:, :2]
     r = np.linalg.norm(arc, axis=1)
     nz = r > 0

@@ -11,7 +11,21 @@ import torch
 from huggingface_hub import hf_hub_download
 from scipy.spatial.transform import Rotation as R
 
-from flow_planning.bend import ARM, EE, bend_delta, fk, grasp_segments, solve_seq, tpad
+from flow_planning.bend import (
+    ARM,
+    SEG_ZERO,
+    build,
+    fk,
+    grasp_segments,
+    held_object,
+    obj_slice,
+    seg_options,
+    solve_seq,
+    tpad,
+    wrap,
+    yaw_of_quat,
+    yaw_of_rot6d,
+)
 from flow_planning.envs import EnvConfig
 from flow_planning.envs.libero import (
     HF_DEMOS,
@@ -26,8 +40,7 @@ from flow_planning.kinematics import EE_FRAME, build_franka_chain
 from flow_planning.selector import FrankaCollision, box_sdf
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-OBJ0 = 18
-ZERO = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+ZERO = SEG_ZERO
 
 
 @dataclass
@@ -50,21 +63,6 @@ class Config:
     ik_tol: float = 0.01
 
 
-def obj_slice(k):
-    return slice(OBJ0 + 9 * k, OBJ0 + 9 * k + 3)
-
-
-def held_object(obs, close, opened, n_obj):
-    ee = obs[close:opened, EE] - obs[close, EE]
-    best, best_err = None, 0.05
-    for k in range(n_obj):
-        p = obs[close:opened, obj_slice(k)] - obs[close, obj_slice(k)]
-        err = np.abs(p - ee).mean()
-        if err < best_err and np.linalg.norm(p[-1]) > 0.02:
-            best, best_err = k, err
-    return best
-
-
 def target_name(goals, objects, sites, name):
     for _, a, b in goals:
         if a != name:
@@ -75,139 +73,6 @@ def target_name(goals, objects, sites, name):
         if b in sites:
             return b
     return None
-
-
-def shift_path(T, segs, m, dbs, dps):
-    knots, vals = [0], [np.zeros(3)]
-    for (c, o), db, dp in zip(segs, dbs, dps):
-        for t, v in [(c - m, db), (c + m, db), (o - m, dp), (o + m, dp)]:
-            knots.append(t)
-            vals.append(v)
-    knots.append(T - 1)
-    vals.append(vals[-1])
-    k = np.array(knots)
-    for i in range(1, len(k)):
-        k[i] = max(k[i], k[i - 1] + 1)
-    keep = k < T
-    k, v = k[keep], np.stack(vals)[keep]
-    t = np.arange(T)
-    return np.stack([np.interp(t, k, v[:, j]) for j in range(3)], axis=1)
-
-
-def yaw_of_rot6d(r6):
-    return float(np.arctan2(r6[1], r6[0]))
-
-
-def yaw_of_quat(q):
-    m = R.from_quat(q).as_matrix()
-    return float(np.arctan2(m[1, 0], m[0, 0]))
-
-
-def wrap(a):
-    return (a + np.pi) % (2 * np.pi) - np.pi
-
-
-def rotz(a):
-    c, s = np.cos(a), np.sin(a)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def grasp_rotation(ee, quat, w0, close, opened, w1, m, centre, alpha):
-    T = len(ee)
-    a1 = max(close - m, w0 + 1)
-    centre = np.array([centre[0], centre[1], 0.0])
-    oh = ee[close] - centre
-    oh[2] = 0.0
-    t = np.arange(T)
-    ramp = np.clip((t - w0) / (a1 - w0), 0.0, 1.0)
-    if w1 is not None:
-        decay = np.clip(1 - (t - opened) / max(w1 - opened, 1), 0.0, 1.0)
-        ramp = np.where(t > opened, decay, ramp)
-    new_ee = ee.copy()
-    off = rotz(alpha) @ oh - oh
-    for i in range(w0, T):
-        if i < a1:
-            new_ee[i] = centre + rotz(ramp[i] * alpha) @ (ee[i] - centre)
-        else:
-            new_ee[i] = ee[i] + ramp[i] * off
-    yaw = (alpha + np.pi) % (2 * np.pi) - np.pi
-    if np.isclose(abs(yaw), np.pi):
-        yaw = -np.pi
-    rot = R.from_euler("z", (ramp * yaw)[:, None]) * R.from_quat(quat)
-    assert isinstance(rot, R)
-    return new_ee, rot.as_quat().astype(np.float32)
-
-
-def bulge_delta(ee, s0, s1, phi, theta, mode="additive"):
-    d = bend_delta(ee, s0, s1, phi, theta)
-    if d.any() and mode == "additive":
-        d[s0:s1] += ee[s0:s1] - np.linspace(ee[s0], ee[s1 - 1], s1 - s0)
-    return d
-
-
-def seg_options(cfg, held):
-    if held is None:
-        return [ZERO]
-    thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
-    arcs = [(0.0, 0.0)] + [(p, th) for p in cfg.phis for th in thetas]
-    modes = cfg.arcs.split(",")
-    transit = [(0.0, 0.0, 0.0)] + [
-        (p, th, float(i))
-        for i, _ in enumerate(modes)
-        for p in cfg.phis
-        for th in thetas
-    ]
-    return [(a, *ap, *tr) for a in cfg.alphas for ap in arcs for tr in transit]
-
-
-def grasp_width(x, k, a_eff):
-    c = x["segs"][k][0]
-    ax = R.from_quat(x["quat"][c]).as_matrix()[:2, 1]
-    ax = rotz(a_eff)[:2, :2] @ ax
-    return 2 * float(np.abs(ax) @ x["half"][k])
-
-
-def build(cfg, x, combo):
-    segs, m = x["segs"], round(cfg.margin * cfg.env.fps)
-    for k, (a, *_) in enumerate(combo):
-        if x["held"][k] is None:
-            continue
-        a_eff = wrap(np.radians(a) + x["dyaw"][k])
-        if grasp_width(x, k, a_eff) > grasp_width(x, k, x["dyaw"][k]) + 0.01:
-            return None
-    ee, quat = x["ee"].copy(), x["quat"].copy()
-    objs = [
-        x["obs"][:, obj_slice(j)].copy() if j is not None else None for j in x["held"]
-    ]
-    w0 = 0
-    fam = set()
-    modes = cfg.arcs.split(",")
-    dps = x["dps"]
-    base_shift = shift_path(len(x["act"]), segs, m, x["dbs"], dps)
-    expected = [e + d for e, d, j in zip(x["ends"], dps, x["held"]) if j is not None]
-    for k, ((c, o), (a, pa, ta, pt, tt, mode)) in enumerate(zip(segs, combo)):
-        if a:
-            centre = x["obs"][0, obj_slice(x["held"][k])]
-            w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
-            ee, quat = grasp_rotation(ee, quat, w0, c, o, w1, m, centre, np.radians(a))
-            fam.add("rot")
-        if pa:
-            ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
-            fam.add("app")
-        if pt:
-            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt, modes[int(mode)])
-            ee = ee + d
-            objs[k] = objs[k] + d
-            fam.add("tra")
-        w0 = o
-    return dict(
-        fam="+".join(sorted(fam)) or "none",
-        combo=combo,
-        ee_t=ee + base_shift,
-        quat=quat,
-        objs=[o + base_shift if o is not None else None for o in objs],
-        expected=expected,
-    )
 
 
 def clearance_batch(fcol, base_t, q_all, cands, demos, boxes, stride=4):
@@ -481,6 +346,7 @@ def scene_geometry(env, target_names):
 
 def scene_candidates(cfg, demos, names, geo, tshift):
     pos, yaws, radii, halves, tpos = geo
+    m = round(cfg.margin * cfg.env.fps)
     cands = []
     for d, x in enumerate(demos):
         dbs, dps, dyaw, diag, ends = [], [], [], [], []
@@ -516,11 +382,15 @@ def scene_candidates(cfg, demos, names, geo, tshift):
         n = len(x["segs"])
         combos = [tuple([ZERO] * n)]
         for k in range(n):
-            for opt in seg_options(cfg, x["held"][k]):
+            for opt in (
+                seg_options(cfg.alphas, cfg.phis, cfg.n_theta, cfg.arcs.split(","))
+                if x["held"][k] is not None
+                else [ZERO]
+            ):
                 if opt != ZERO:
                     combos.append(tuple(opt if j == k else ZERO for j in range(n)))
         for combo in combos:
-            c = build(cfg, x, combo)
+            c = build(x, combo, m, cfg.arcs.split(","))
             if c is not None:
                 c["d"], c["radii"] = d, x["radii"]
                 cands.append(c)
@@ -528,6 +398,7 @@ def scene_candidates(cfg, demos, names, geo, tshift):
 
 
 def compose_candidates(cfg, cands, demos):
+    m = round(cfg.margin * cfg.env.fps)
     out = []
     for d, x in enumerate(demos):
         n = len(x["segs"])
@@ -543,7 +414,7 @@ def compose_candidates(cfg, cands, demos):
         for combo in product(*tops):
             if sum(o != ZERO for o in combo) < 2:
                 continue
-            c = build(cfg, x, combo)
+            c = build(x, combo, m, cfg.arcs.split(","))
             if c is not None:
                 c["d"], c["radii"] = d, x["radii"]
                 out.append(c)

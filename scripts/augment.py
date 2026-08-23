@@ -7,15 +7,23 @@ import pytorch_kinematics as pk
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from scipy.signal import lfilter, lfilter_zi
+from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 
 from flow_planning.bend import (
     ARM,
     CUBE,
     EE,
+    LABEL_DIM,
     ROT,
+    SEG_ZERO,
     bend_delta,
+    build,
+    encode_label,
     fk,
+    grasp_segments,
+    held_object,
+    seg_options,
     solve_seq,
     tpad,
     transit_segments,
@@ -39,6 +47,14 @@ class Config:
     ik_damping: float = 0.05
     seed: int = 0
     env: EnvConfig = field(default_factory=FrankaConfig)  # table geometry only
+
+    phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
+    n_theta: int = 4
+    alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
+    arcs: str = "additive,replace"
+    ik_tol: float = 0.01
+    vel_frac: float = 0.8
+    hold: int = 20
 
     demogen: bool = False
     wall_h_min: float = 0.10
@@ -64,17 +80,181 @@ def held_block(obs, close, opened, n_obj) -> slice:
     return slice(CUBE.start + 9 * k, CUBE.start + 9 * k + 3)
 
 
-def write(dst, obs, act, bend):
+def write(dst, obs, act, bend, task="pick_place"):
     for f in range(len(obs)):
         dst.add_frame(
             {
                 "observation.state": obs[f],
                 "action": act[f],
                 "bend": bend.astype(np.float32),
-                "task": "pick_place",
+                "task": task,
             }
         )
     dst.save_episode()
+
+
+def replay_libero(env, state0, act, hold):
+    env.reset()
+    env.obs[0] = env.envs[0].set_init_state(state0)
+    env.succ[:] = False
+    obs = []
+    for a in act:
+        obs.append(env.get_obs()[0])
+        env.apply_action(a[None])
+    for _ in range(hold):
+        env.apply_action(act[-1][None])
+    return bool(env.succ[0]), np.stack(obs)
+
+
+def augment_libero(cfg):
+    import h5py
+    from huggingface_hub import hf_hub_download
+
+    from flow_planning.envs.libero import (
+        HF_DEMOS,
+        SOURCE_SUITE,
+        LiberoConfig,
+        LiberoEnv,
+        body_aabb,
+        demo_to_episode,
+    )
+
+    assert isinstance(cfg.env, LiberoConfig)
+    rng = np.random.default_rng(cfg.seed)
+    env = LiberoEnv(replace(cfg.env, world_count=1, obstacle=False))
+    names = env.objects
+    base = np.asarray(env.robot_base_pos, np.float32)
+    chain, _, _ = build_franka_chain("cpu")
+    chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
+    fcol = FrankaCollision(DEV, base, 0.0)
+    path = hf_hub_download(
+        HF_DEMOS,
+        f"{SOURCE_SUITE[cfg.env.suite]}/{env.name}_demo.hdf5",
+        repo_type="dataset",
+    )
+    f = h5py.File(path, "r")
+    keys = sorted(f["data"].keys(), key=lambda k: int(k.split("_")[1]))
+    keys = keys[: cfg.limit or len(keys)]
+    m = round(cfg.bend_margin * cfg.env.fps)
+    modes = cfg.arcs.split(",")
+    options = seg_options(cfg.alphas, cfg.phis, cfg.n_theta, modes)
+
+    demos: list[dict[str, Any]] = []
+    for k in tqdm(keys, desc="demos"):
+        obs, act = demo_to_episode(env, f["data"][k])
+        segs = grasp_segments(act[:, 7])
+        held = [held_object(obs, c, o, len(names)) for c, o in segs]
+        ee, quat = fk(chain, act[:, ARM], base)
+        env.set_state(0, f["data"][k]["states"][0])
+        half = [
+            body_aabb(env.envs[0], names[j])[3:5] if j is not None else np.ones(2)
+            for j in held
+        ]
+        demos.append(
+            dict(
+                key=k,
+                obs=obs,
+                act=act,
+                segs=segs,
+                held=held,
+                ee=ee,
+                quat=quat,
+                half=half,
+                dyaw=[0.0] * len(segs),
+                dbs=[np.zeros(3)] * len(segs),
+                dps=[np.zeros(3)] * len(segs),
+                ends=[np.zeros(3)] * len(segs),
+            )
+        )
+    n_seg = max(len(x["segs"]) for x in demos)
+    print(f"{len(demos)} demos, {n_seg} grasp segments, label dim {LABEL_DIM * n_seg}")
+
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": demos[0]["obs"].shape[1:],
+            "names": None,
+        },
+        "action": {"dtype": "float32", "shape": (8,), "names": None},
+        "bend": {"dtype": "float32", "shape": (LABEL_DIM * n_seg,), "names": None},
+    }
+    dst = LeRobotDataset.create(
+        repo_id=cfg.dst_repo, fps=cfg.env.fps, features=features, use_videos=False
+    )
+    for x in demos:
+        write(dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language)
+
+    cands: list[dict[str, Any]] = []
+    for d, x in enumerate(demos):
+        tries = 0
+        while sum(c["d"] == d for c in cands) < cfg.copies and tries < 10 * cfg.copies:
+            tries += 1
+            combo = tuple(
+                options[rng.integers(len(options))] if j is not None else SEG_ZERO
+                for j in x["held"]
+            )
+            if all(o == SEG_ZERO for o in combo):
+                continue
+            c = build(x, combo, m, modes)
+            if c is not None:
+                c["d"] = d
+                cands.append(c)
+    print(f"{len(cands)} candidates")
+
+    tm = max(len(x["act"]) for x in demos)
+    q_all = solve_seq(
+        chain,
+        np.stack([tpad(c["ee_t"], tm) for c in cands], axis=1),
+        np.stack([tpad(c["quat"], tm) for c in cands], axis=1),
+        np.stack([demos[c["d"]]["act"][0, ARM] for c in cands]),
+        cfg.ik_iters,
+        cfg.ik_damping,
+        base,
+    )
+    jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
+    written = rej_ik = rej_body = rej_replay = 0
+    labels = []
+    for i, c in enumerate(tqdm(cands, desc="replay")):
+        x = demos[c["d"]]
+        nf = len(x["act"])
+        q = q_all[:nf, i]
+        pos, quat = fk(chain, q, base)
+        err = np.linalg.norm(pos - c["ee_t"], axis=1).max()
+        rot_err = R.from_quat(quat) * R.from_quat(c["quat"]).inv()
+        assert isinstance(rot_err, R)
+        ok = (
+            err < cfg.ik_tol
+            and rot_err.magnitude().max() < np.radians(15)
+            and np.abs(np.diff(q, n=2, axis=0)).max() < jerk_limit
+            and np.abs(np.diff(q, axis=0)).max() < cfg.vel_frac * cfg.env.delta_max
+        )
+        if not ok:
+            rej_ik += 1
+            continue
+        body, _ = fcol.body_penetration(
+            torch.as_tensor(q, dtype=torch.float32, device=DEV), None
+        )
+        if float(body.max()) > 0.0:
+            rej_body += 1
+            continue
+        act = x["act"].copy()
+        act[:, ARM] = q
+        succ, obs = replay_libero(env, f["data"][x["key"]]["states"][0], act, cfg.hold)
+        if not succ:
+            rej_replay += 1
+            continue
+        label = encode_label(c["combo"], n_seg)
+        write(dst, obs.astype(np.float32), act.astype(np.float32), label, env.language)
+        labels.append(label)
+        written += 1
+    print(
+        f"wrote {written}/{len(cands)} copies; rejected {rej_ik} IK, "
+        f"{rej_body} self-collision, {rej_replay} replay failure"
+    )
+    if labels:
+        lab = np.stack(labels)
+        print("label nonzero fraction per dim:", (np.abs(lab) > 0).mean(0).round(2))
+    dst.finalize()
 
 
 def sdf_np(p, center, half):
@@ -135,6 +315,9 @@ def lag_states(x, chain, base, alpha):
 
 @draccus.wrap()
 def main(cfg: Config):
+    if not isinstance(cfg.env, FrankaConfig):
+        augment_libero(cfg)
+        return
     rng = np.random.default_rng(cfg.seed)
 
     # build kinematic chain
