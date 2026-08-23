@@ -20,9 +20,9 @@ pixi run python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset 
 EVAL="pixi run python scripts/eval.py $ENV --repo_id $REPO --episodes ${EPISODES:-10}"
 
 echo "=== free space ==="
-$EVAL --cond zero 2>&1 | grep -v "it/s"
+$EVAL --cond zero 2>&1 | grep --line-buffered -v "it/s"
 
 for L in $LEVELS; do
   echo "=== SafeLIBERO level $L ==="
-  $EVAL --env.obstacle true --env.level $L --cond search --n_cond 8 2>&1 | grep -v "it/s"
+  $EVAL --env.obstacle true --env.level $L --cond search --n_cond 8 2>&1 | grep --line-buffered -v "it/s"
 done
