@@ -65,9 +65,7 @@ def record(env, cfg, x, c, path, writer):
         draw(f, plan, GREEN, 1)
         draw(f, project(sim, np.stack(trace), cfg.size), CYAN, 2)
         draw(f, plan[t : t + 1], RED, 5)
-        cv2.putText(
-            f, path.stem, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
-        )
+        cv2.putText(f, path.stem, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         writer.write(f[..., ::-1])
     for _ in range(cfg.hold):
         env.apply_action(c["act"][-1][None])
