@@ -2,8 +2,8 @@ name: flow-suite
 
 resources:
   infra: ssh/ori
-  accelerators: RTX4090:0.5
-  cpus: 7
+  accelerators: RTX4090:1
+  cpus: 14
 
 envs:
   HF_TOKEN:
