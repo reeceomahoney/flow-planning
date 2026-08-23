@@ -222,6 +222,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.selector_fn = None  # optional plan scorer for candidate selection
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
+        self.stall_tol = (
+            0.05  # normalized joint motion per replan below which we escape
+        )
+        self.latched_idx = None
+        self.blocked = None
+        self.prev_state = None
+        self.escapes = 0
         self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
         self.guidance_scale = 1.0  # CFG on the bend/posture latent; 1 = off
         self.reset()
@@ -236,6 +243,17 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
         self.latched_cond = None  # per-world bend picked at the first replan
+        self.latched_idx = None
+        self.blocked = None
+        self.prev_state = None
+        self.escapes = 0
+
+    def stalled(self, state: Tensor) -> Tensor:
+        moved = torch.ones(state.shape[0], dtype=torch.bool, device=state.device)
+        if self.prev_state is not None:
+            moved = (state[:, :7] - self.prev_state[:, :7]).norm(dim=1) > self.stall_tol
+        self.prev_state = state.clone()
+        return ~moved
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         # full-trajectory window: [state, action] per step, both normalized. The
@@ -308,13 +326,20 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # where the selector keeps the plan with the lowest collision score
         cond, k, searching = None, 1, False
         if self.config.cond_dim and self.cond_candidates is not None:
-            if self.latched_cond is not None:  # best-of-n_samples in the held mode
-                k = max(self.n_samples, 1)
-                cond = self.latched_cond.repeat_interleave(k, dim=0)
-            else:
-                searching = True
-                k = self.cond_candidates.shape[0]
-                cond = self.cond_candidates.repeat(n_worlds, 1)
+            searching = True
+            k = self.cond_candidates.shape[0]
+            cond = self.cond_candidates.repeat(n_worlds, 1)
+            if self.blocked is None:
+                self.blocked = torch.zeros(
+                    n_worlds, k, dtype=torch.bool, device=obs.device
+                )
+            stalled = self.stalled(obs[:, : self.state_dim])
+            if self.latched_idx is not None:
+                rows = torch.arange(n_worlds, device=obs.device)
+                esc = stalled & ~self.blocked.all(dim=1)
+                self.blocked[rows[esc], self.latched_idx[esc]] = True
+                self.escapes += int(esc.sum())
+                self.latched_idx = torch.where(esc, -1, self.latched_idx)
         else:
             k = max(self.n_samples, 1)
             if self.config.cond_dim and self.cond is not None:
@@ -341,11 +366,25 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             ]
         )
         if sel is not None and k > 1:  # lowest-scoring candidate per world
-            pick = sel(x).view(n_worlds, k).argmin(dim=1)
+            score = sel(x).view(n_worlds, k)
+            if searching:  # held pick unless escaped; escaped picks stay blocked
+                assert self.blocked is not None
+                score = score.masked_fill(
+                    self.blocked & ~self.blocked.all(1, True), torch.inf
+                )
+                if self.latched_idx is not None:
+                    held = self.latched_idx >= 0
+                    keep = torch.zeros_like(score, dtype=torch.bool)
+                    keep[held] = F.one_hot(
+                        self.latched_idx[held].clamp(min=0), k
+                    ).bool()
+                    score = score.masked_fill(held[:, None] & ~keep, torch.inf)
+            pick = score.argmin(dim=1)
             rows = torch.arange(len(pick), device=x.device)
             x = x.view(-1, k, *x.shape[1:])[rows, pick]
-            if searching:  # commit to the picked bend mode for later replans
+            if searching:
                 assert cond is not None
+                self.latched_idx = pick
                 self.latched_cond = cond.view(-1, k, cond.shape[-1])[rows, pick]
         acts = x[..., sd:]  # normalized action dims
         if self.action_clip is not None:

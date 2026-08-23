@@ -195,6 +195,8 @@ def main(cfg: Config):
             sel.set_boxes(env.obstacle_boxes())
         if cfg.cond is Cond.RANDOM and bend is not None:
             policy.cond = sample_cond(bend, n, rng, device)
+        if cfg.cond is Cond.SEARCH and bend is not None:
+            policy.cond_candidates = sample_cond(bend, cfg.n_cond, rng, device)
         succ = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
         frame = 0
@@ -285,6 +287,7 @@ def main(cfg: Config):
     if contacts:
         hits = "  ".join(f"{k}:{v}" for k, v in contacts.most_common())
         print(f"wall contacts (n={sum(contacts.values())}): {hits}")
+    print(f"escapes {policy.escapes}")
     lc = policy.latched_cond
     if searching and lc is not None:
         lc = lc.cpu().numpy()
