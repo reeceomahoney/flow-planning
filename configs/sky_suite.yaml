@@ -22,13 +22,12 @@ workdir: .
 run: |
   export PATH="$HOME/.pixi/bin:$PATH"
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
+  run() { LEVELS="$1" bash scripts/pipeline_libero.sh $SUITE $T 2>&1 | grep -vE "it/s\]|Warning|WARNING|macro"; }
   for T in $TASKS; do
-    LV="I II"
-    [ "$SUITE $T" = "safelibero_goal 3" ] && LV="I|II"
-    for L in ${LV//|/ }; do
-      [ "$LV" = "I II" ] && L="I II"
-      echo "##### $SUITE task $T levels $L"
-      LEVELS="$L" bash scripts/pipeline_libero.sh $SUITE $T 2>&1 | grep -vE "it/s\]|Warning|WARNING|macro"
-      [ "$LV" = "I II" ] && break
-    done
+    echo "##### $SUITE task $T"
+    if [ "$SUITE $T" = "safelibero_goal 3" ]; then
+      run I; run II
+    else
+      run "I II"
+    fi
   done
