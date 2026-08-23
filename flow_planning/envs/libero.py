@@ -182,8 +182,17 @@ def register_obstacles(root: Path):
         register_object(type(camel, (MujocoXMLObject,), {"__init__": init}))
 
 
+def disable_robosuite_file_log():
+    spec = importlib.util.find_spec("robosuite")
+    assert spec is not None and spec.submodule_search_locations
+    f = Path(list(spec.submodule_search_locations)[0]) / "macros_private.py"
+    if not f.exists():
+        f.write_text("FILE_LOGGING_LEVEL = None\n")
+
+
 def libero_setup() -> Path:
     ensure_libero_config()
+    disable_robosuite_file_log()
     patch_robosuite()
     root = safelibero_root()
     register_obstacles(root)
