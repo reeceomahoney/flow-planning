@@ -54,11 +54,12 @@ class Config:
 
 def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
     if bend.shape[1] >= LABEL_DIM:
-        rows = np.unique(bend[np.abs(bend).sum(1) > 0], axis=0)
-        assert len(rows), "dataset has no augmented episodes"
-        return torch.tensor(
-            rows[rng.choice(len(rows), k)], dtype=torch.float32, device=device
+        rows, counts = np.unique(
+            bend[np.abs(bend).sum(1) > 0], axis=0, return_counts=True
         )
+        assert len(rows), "dataset has no augmented episodes"
+        pick = rng.choice(len(rows), k, p=counts / counts.sum())
+        return torch.tensor(rows[pick], dtype=torch.float32, device=device)
     arc = bend[:, :2]
     r = np.linalg.norm(arc, axis=1)
     nz = r > 0
