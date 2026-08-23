@@ -106,27 +106,18 @@ def replay_libero(env, state0, act, hold):
     return bool(env.succ[0]), np.stack(obs)
 
 
-def augment_libero(cfg):
+def libero_demos(cfg, env, chain, base, limit):
     import h5py
     from huggingface_hub import hf_hub_download
 
     from flow_planning.envs.libero import (
         HF_DEMOS,
         SOURCE_SUITE,
-        LiberoConfig,
-        LiberoEnv,
         body_aabb,
         demo_to_episode,
     )
 
-    assert isinstance(cfg.env, LiberoConfig)
-    rng = np.random.default_rng(cfg.seed)
-    env = LiberoEnv(replace(cfg.env, world_count=1, obstacle=False))
     names = env.objects
-    base = np.asarray(env.robot_base_pos, np.float32)
-    chain, _, _ = build_franka_chain("cpu")
-    chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
-    fcol = FrankaCollision(DEV, base, 0.0)
     path = hf_hub_download(
         HF_DEMOS,
         f"{SOURCE_SUITE[cfg.env.suite]}/{env.name}_demo.hdf5",
@@ -134,13 +125,8 @@ def augment_libero(cfg):
     )
     f = h5py.File(path, "r")
     keys = sorted(f["data"].keys(), key=lambda k: int(k.split("_")[1]))
-    keys = keys[: cfg.limit or len(keys)]
-    m = round(cfg.bend_margin * cfg.env.fps)
-    modes = cfg.arcs.split(",")
-    options = seg_options(cfg.alphas, cfg.phis, cfg.n_theta, modes)
-
     demos: list[dict[str, Any]] = []
-    for k in tqdm(keys, desc="demos"):
+    for k in tqdm(keys[: limit or len(keys)], desc="demos"):
         obs, act = demo_to_episode(env, f["data"][k])
         segs = grasp_segments(act[:, 7])
         held = [held_object(obs, c, o, len(names)) for c, o in segs]
@@ -153,6 +139,7 @@ def augment_libero(cfg):
         demos.append(
             dict(
                 key=k,
+                state0=f["data"][k]["states"][0],
                 obs=obs,
                 act=act,
                 segs=segs,
@@ -166,6 +153,82 @@ def augment_libero(cfg):
                 ends=[np.zeros(3)] * len(segs),
             )
         )
+    return demos
+
+
+def libero_candidates(cfg, demos, rng, per_demo):
+    m = round(cfg.bend_margin * cfg.env.fps)
+    modes = cfg.arcs.split(",")
+    options = seg_options(cfg.alphas, cfg.phis, cfg.n_theta, modes)
+    cands: list[dict[str, Any]] = []
+    for d, x in enumerate(demos):
+        tries, mine = 0, 0
+        while mine < per_demo and tries < 10 * per_demo:
+            tries += 1
+            combo = tuple(
+                options[rng.integers(len(options))] if j is not None else SEG_ZERO
+                for j in x["held"]
+            )
+            if all(o == SEG_ZERO for o in combo):
+                continue
+            c = build(x, combo, m, modes)
+            if c is not None:
+                c["d"] = d
+                cands.append(c)
+                mine += 1
+    return cands
+
+
+def libero_solve(cfg, cands, demos, chain, base, fcol):
+    """IK + feasibility gate; sets c["act"] / c["ok"] / c["why"] in place."""
+    tm = max(len(x["act"]) for x in demos)
+    q_all = solve_seq(
+        chain,
+        np.stack([tpad(c["ee_t"], tm) for c in cands], axis=1),
+        np.stack([tpad(c["quat"], tm) for c in cands], axis=1),
+        np.stack([demos[c["d"]]["act"][0, ARM] for c in cands]),
+        cfg.ik_iters,
+        cfg.ik_damping,
+        base,
+    )
+    jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
+    for i, c in enumerate(cands):
+        x = demos[c["d"]]
+        nf = len(x["act"])
+        q = q_all[:nf, i]
+        pos, quat = fk(chain, q, base)
+        err = np.linalg.norm(pos - c["ee_t"], axis=1).max()
+        rot_err = R.from_quat(quat) * R.from_quat(c["quat"]).inv()
+        assert isinstance(rot_err, R)
+        act = x["act"].copy()
+        act[:, ARM] = q
+        c["act"] = act.astype(np.float32)
+        c["ok"], c["why"] = True, ""
+        if err > cfg.ik_tol or rot_err.magnitude().max() > np.radians(15):
+            c["ok"], c["why"] = False, "ik"
+        elif np.abs(np.diff(q, n=2, axis=0)).max() > jerk_limit:
+            c["ok"], c["why"] = False, "jerk"
+        elif np.abs(np.diff(q, axis=0)).max() > cfg.vel_frac * cfg.env.delta_max:
+            c["ok"], c["why"] = False, "vel"
+        else:
+            body, _ = fcol.body_penetration(
+                torch.as_tensor(q, dtype=torch.float32, device=DEV), None
+            )
+            if float(body.max()) > 0.0:
+                c["ok"], c["why"] = False, "self"
+
+
+def augment_libero(cfg):
+    from flow_planning.envs.libero import LiberoConfig, LiberoEnv
+
+    assert isinstance(cfg.env, LiberoConfig)
+    rng = np.random.default_rng(cfg.seed)
+    env = LiberoEnv(replace(cfg.env, world_count=1, obstacle=False))
+    base = np.asarray(env.robot_base_pos, np.float32)
+    chain, _, _ = build_franka_chain("cpu")
+    chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
+    fcol = FrankaCollision(DEV, base, 0.0)
+    demos = libero_demos(cfg, env, chain, base, cfg.limit)
     n_seg = max(len(x["segs"]) for x in demos)
     print(f"{len(demos)} demos, {n_seg} grasp segments, label dim {LABEL_DIM * n_seg}")
 
@@ -184,78 +247,30 @@ def augment_libero(cfg):
     for x in demos:
         write(dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language)
 
-    cands: list[dict[str, Any]] = []
-    for d, x in enumerate(demos):
-        tries, mine = 0, 0
-        while mine < 4 * cfg.copies and tries < 40 * cfg.copies:
-            tries += 1
-            combo = tuple(
-                options[rng.integers(len(options))] if j is not None else SEG_ZERO
-                for j in x["held"]
-            )
-            if all(o == SEG_ZERO for o in combo):
-                continue
-            c = build(x, combo, m, modes)
-            if c is not None:
-                c["d"] = d
-                cands.append(c)
-                mine += 1
+    cands = libero_candidates(cfg, demos, rng, 4 * cfg.copies)
     print(f"{len(cands)} candidates")
-
-    tm = max(len(x["act"]) for x in demos)
-    q_all = solve_seq(
-        chain,
-        np.stack([tpad(c["ee_t"], tm) for c in cands], axis=1),
-        np.stack([tpad(c["quat"], tm) for c in cands], axis=1),
-        np.stack([demos[c["d"]]["act"][0, ARM] for c in cands]),
-        cfg.ik_iters,
-        cfg.ik_damping,
-        base,
-    )
-    jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
-    written = rej_ik = rej_body = rej_replay = 0
+    libero_solve(cfg, cands, demos, chain, base, fcol)
+    written = rej_replay = 0
+    why: dict[str, int] = {}
     labels = []
     per_demo = np.zeros(len(demos), int)
-    for i, c in enumerate(tqdm(cands, desc="replay")):
+    for c in tqdm(cands, desc="replay"):
+        if not c["ok"]:
+            why[c["why"]] = why.get(c["why"], 0) + 1
+            continue
         if per_demo[c["d"]] >= cfg.copies:
             continue
         x = demos[c["d"]]
-        nf = len(x["act"])
-        q = q_all[:nf, i]
-        pos, quat = fk(chain, q, base)
-        err = np.linalg.norm(pos - c["ee_t"], axis=1).max()
-        rot_err = R.from_quat(quat) * R.from_quat(c["quat"]).inv()
-        assert isinstance(rot_err, R)
-        ok = (
-            err < cfg.ik_tol
-            and rot_err.magnitude().max() < np.radians(15)
-            and np.abs(np.diff(q, n=2, axis=0)).max() < jerk_limit
-            and np.abs(np.diff(q, axis=0)).max() < cfg.vel_frac * cfg.env.delta_max
-        )
-        if not ok:
-            rej_ik += 1
-            continue
-        body, _ = fcol.body_penetration(
-            torch.as_tensor(q, dtype=torch.float32, device=DEV), None
-        )
-        if float(body.max()) > 0.0:
-            rej_body += 1
-            continue
-        act = x["act"].copy()
-        act[:, ARM] = q
-        succ, obs = replay_libero(env, f["data"][x["key"]]["states"][0], act, cfg.hold)
+        succ, obs = replay_libero(env, x["state0"], c["act"], cfg.hold)
         if not succ:
             rej_replay += 1
             continue
         label = encode_label(c["combo"], n_seg)
-        write(dst, obs.astype(np.float32), act.astype(np.float32), label, env.language)
+        write(dst, obs.astype(np.float32), c["act"], label, env.language)
         labels.append(label)
         written += 1
         per_demo[c["d"]] += 1
-    print(
-        f"wrote {written}/{len(cands)} copies; rejected {rej_ik} IK, "
-        f"{rej_body} self-collision, {rej_replay} replay failure"
-    )
+    print(f"wrote {written}/{len(cands)} copies; rejected {why}, {rej_replay} replay")
     if labels:
         lab = np.stack(labels)
         print("label nonzero fraction per dim:", (np.abs(lab) > 0).mean(0).round(2))
