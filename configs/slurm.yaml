@@ -24,11 +24,17 @@ clusters:
     host: civo
     remote_path: /users/kebl6123/flow-planning
     time: 12
-    gpu: nvidia_b200
+    gpu: nvidia_a100-sxm4-80gb
     ngpu: 1
-    cpus: 27
-    mem: 11G
-    partition: allgpus
+    cpus: 12
+    mem: 4G
+    partition: a100
+    envs:
+      - HF_TOKEN
+      - WANDB_API_KEY
+      - MUJOCO_GL: egl
+      - CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      - HF_DATASETS_DISABLE_PROGRESS_BARS: "1"
 
 # envs:
 #   - WANDB_API_KEY
