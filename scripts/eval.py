@@ -141,7 +141,7 @@ def main(cfg: Config):
         joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
         sel.fc.calibrate_self(torch.as_tensor(joints, device=device))
         if cfg.cond in (Cond.SEARCH, Cond.SAMPLE) or (
-            cfg.cond is Cond.ORACLE and cfg.n_cond > 1
+            cfg.cond in (Cond.ORACLE, Cond.FIXED) and cfg.n_cond > 1
         ):
             policy.selector_fn = sel.score
     if cfg.cond is Cond.SAMPLE:
