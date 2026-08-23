@@ -17,6 +17,7 @@ envs:
   COPIES: 6
   ITERS: 20000
   EPISODES: 10
+  TAG: aug
 workdir: .
 
 run: |
