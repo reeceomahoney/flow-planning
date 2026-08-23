@@ -78,6 +78,8 @@ class FlowMatchingConfig(PreTrainedConfig):
         }
     )
 
+    pretrained_revision: str | None = None
+
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
             lr=self.optimizer_lr, weight_decay=self.optimizer_weight_decay
@@ -321,8 +323,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 cond = self.cond.expand(n_worlds * k, -1)
         if k > 1:
             obs = obs.repeat_interleave(k, dim=0)
-        sd, gd = self.state_dim, self.config.goal_dim
-        state, goal = obs[:, :sd], obs[:, -gd:]
+        sd = self.state_dim
+        state, goal = obs[:, :sd], obs[:, sd:]
         m = obs.shape[0]
         x = torch.randn(m, self.config.horizon, self.traj_dim, device=obs.device)
         # micro-batch cap for a 24GB card: memory scales with horizon, so hold
@@ -370,6 +372,8 @@ def alias_goal_stats(
     are the same physical quantity, so normalize the goal with that block's stats.
     Then the commanded goal lands in that block's space and inpainting can clamp it
     onto the trajectory directly, no per-call renormalization."""
+    if goal_dim == 0:
+        return stats
     stats = copy.deepcopy(stats)
     o = stats[OBS_STATE]
     gs = goal_state_start
