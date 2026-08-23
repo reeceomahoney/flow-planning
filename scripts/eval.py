@@ -31,6 +31,7 @@ class Cond(enum.StrEnum):
     SEARCH = "search"  # n_cond uniform candidates, selector-scored and latched
     SAMPLE = "sample"  # null token, n_cond noise draws, selector picks each replan
     ORACLE = "oracle"  # true wall [height, width] as the label (DemoGen arm)
+    FIXED = "fixed"  # the label given by --fixed (comma-separated), no search
 
 
 @dataclass
@@ -48,6 +49,7 @@ class Config:
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
     cond: Cond = Cond.SEARCH
     n_cond: int = 8  # search: uniform candidates drawn at startup
+    fixed: str = ""  # cond=fixed: comma-separated label values
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
     guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
 
@@ -152,6 +154,11 @@ def main(cfg: Config):
         bend = hf_column(dataset.hf_dataset, "bend")
         if cfg.cond is Cond.ZERO:
             policy.cond = torch.zeros(1, policy.config.cond_dim, device=device)
+        elif cfg.cond is Cond.FIXED:
+            vals = [float(v) for v in cfg.fixed.split(",")]
+            vals += [0.0] * (policy.config.cond_dim - len(vals))
+            policy.cond = torch.tensor([vals], dtype=torch.float32, device=device)
+            policy.n_samples = cfg.n_cond
         elif cfg.cond is Cond.ORACLE:
             assert isinstance(cfg.env, FrankaConfig) and cfg.env.obstacle
             policy.cond = torch.tensor(
