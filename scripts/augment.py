@@ -186,8 +186,8 @@ def augment_libero(cfg):
 
     cands: list[dict[str, Any]] = []
     for d, x in enumerate(demos):
-        tries = 0
-        while sum(c["d"] == d for c in cands) < cfg.copies and tries < 10 * cfg.copies:
+        tries, mine = 0, 0
+        while mine < 4 * cfg.copies and tries < 40 * cfg.copies:
             tries += 1
             combo = tuple(
                 options[rng.integers(len(options))] if j is not None else SEG_ZERO
@@ -199,6 +199,7 @@ def augment_libero(cfg):
             if c is not None:
                 c["d"] = d
                 cands.append(c)
+                mine += 1
     print(f"{len(cands)} candidates")
 
     tm = max(len(x["act"]) for x in demos)
@@ -214,7 +215,10 @@ def augment_libero(cfg):
     jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
     written = rej_ik = rej_body = rej_replay = 0
     labels = []
+    per_demo = np.zeros(len(demos), int)
     for i, c in enumerate(tqdm(cands, desc="replay")):
+        if per_demo[c["d"]] >= cfg.copies:
+            continue
         x = demos[c["d"]]
         nf = len(x["act"])
         q = q_all[:nf, i]
@@ -247,6 +251,7 @@ def augment_libero(cfg):
         write(dst, obs.astype(np.float32), act.astype(np.float32), label, env.language)
         labels.append(label)
         written += 1
+        per_demo[c["d"]] += 1
     print(
         f"wrote {written}/{len(cands)} copies; rejected {rej_ik} IK, "
         f"{rej_body} self-collision, {rej_replay} replay failure"
