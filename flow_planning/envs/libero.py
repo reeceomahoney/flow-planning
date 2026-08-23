@@ -346,6 +346,8 @@ class LiberoEnv:
         self.succ = np.zeros(n, dtype=bool)
         self.contact = [""] * n
         self.step = 0
+        self.path = None
+        self.trace: list = []
         for i, e in enumerate(self.envs):
             e.reset()
             s = self.init_states[self.episode_idx % len(self.init_states)]
@@ -446,11 +448,33 @@ class LiberoEnv:
         box = self.obstacle_boxes()[0]
         return {"center": box[:3].tolist(), "half_extents": box[3:].tolist()}
 
+    def project(self, pts):
+        from robosuite.utils.camera_utils import (
+            get_camera_transform_matrix,
+            project_points_from_world_to_camera,
+        )
+
+        n = self.cfg.render_size
+        mat = get_camera_transform_matrix(self.envs[0].sim, "agentview", n, n)
+        px = project_points_from_world_to_camera(np.asarray(pts), mat, n, n)
+        return n - 1 - px[..., ::-1]
+
     def get_frame(self):
-        return np.ascontiguousarray(self.obs[0]["agentview_image"][::-1, ::-1])
+        import cv2
+
+        f = np.ascontiguousarray(self.obs[0]["agentview_image"][::-1, ::-1])
+        self.trace.append(self.obs[0]["robot0_eef_pos"].copy())
+        for pts, colour, r in (
+            (self.path, (0, 220, 0), 2),
+            (np.stack(self.trace), (255, 200, 0), 2),
+        ):
+            if pts is not None and len(pts):
+                for u, v in self.project(pts):
+                    cv2.circle(f, (int(u), int(v)), r, colour, -1)
+        return f
 
     def set_predicted_path(self, positions):
-        pass
+        self.path = np.asarray(positions)
 
     def render(self):
         pass
