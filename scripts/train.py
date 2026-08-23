@@ -4,6 +4,7 @@ import math
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, cast
 
 import draccus
@@ -39,6 +40,7 @@ class Config:
     ema_decay: float = 0.999
     device: str = "cuda"
     out_dir: str = "outputs"
+    run_dir: str = ""  # non-empty: exact output directory instead of a timestamp
     eval_every: int = 10_000
     eval_episodes: int = 256
     log_every: int = 100
@@ -125,7 +127,9 @@ def save_policy(policy, out_dir):
 def main(cfg: Config):
     torch.set_float32_matmul_precision("high")
     device = cfg.device if torch.cuda.is_available() else "cpu"
-    out_dir = make_run_dir(cfg.out_dir, cfg.env.type)
+    out_dir = (
+        Path(cfg.run_dir) if cfg.run_dir else make_run_dir(cfg.out_dir, cfg.env.type)
+    )
     print(f"Output directory: {out_dir}")
 
     mode = cast(Literal["online", "offline", "disabled"], cfg.wandb_mode)
