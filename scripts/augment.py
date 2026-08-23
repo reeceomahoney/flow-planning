@@ -23,7 +23,6 @@ from flow_planning.bend import (
     fk,
     grasp_segments,
     held_object,
-    seg_options,
     solve_seq,
     tpad,
     transit_segments,
@@ -156,17 +155,29 @@ def libero_demos(cfg, env, chain, base, limit):
     return demos
 
 
+def sample_option(cfg, rng):
+    thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
+    a = rng.choice(cfg.alphas[1:]) if rng.random() < 0.5 else 0.0
+    app = (
+        (rng.choice(cfg.phis), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
+    )
+    if rng.random() < 0.5:
+        tr = (rng.choice(cfg.phis), rng.choice(thetas), float(rng.integers(2)))
+    else:
+        tr = (0.0, 0.0, 0.0)
+    return (a, *app, *tr)
+
+
 def libero_candidates(cfg, demos, rng, per_demo):
     m = round(cfg.bend_margin * cfg.env.fps)
     modes = cfg.arcs.split(",")
-    options = seg_options(cfg.alphas, cfg.phis, cfg.n_theta, modes)
     cands: list[dict[str, Any]] = []
     for d, x in enumerate(demos):
         tries, mine = 0, 0
         while mine < per_demo and tries < 10 * per_demo:
             tries += 1
             combo = tuple(
-                options[rng.integers(len(options))] if j is not None else SEG_ZERO
+                sample_option(cfg, rng) if j is not None else SEG_ZERO
                 for j in x["held"]
             )
             if all(o == SEG_ZERO for o in combo):
@@ -177,6 +188,10 @@ def libero_candidates(cfg, demos, rng, per_demo):
                 cands.append(c)
                 mine += 1
     return cands
+
+
+def held_combo(combo, held):
+    return [o for o, j in zip(combo, held) if j is not None]
 
 
 def libero_solve(cfg, cands, demos, chain, base, fcol):
@@ -229,7 +244,7 @@ def augment_libero(cfg):
     chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
     fcol = FrankaCollision(DEV, base, 0.0)
     demos = libero_demos(cfg, env, chain, base, cfg.limit)
-    n_seg = max(len(x["segs"]) for x in demos)
+    n_seg = max(sum(j is not None for j in x["held"]) for x in demos)
     print(f"{len(demos)} demos, {n_seg} grasp segments, label dim {LABEL_DIM * n_seg}")
 
     features = {
@@ -265,7 +280,7 @@ def augment_libero(cfg):
         if not succ:
             rej_replay += 1
             continue
-        label = encode_label(c["combo"], n_seg)
+        label = encode_label(held_combo(c["combo"], x["held"]), n_seg)
         write(dst, obs.astype(np.float32), c["act"], label, env.language)
         labels.append(label)
         written += 1

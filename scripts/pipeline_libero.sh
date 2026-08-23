@@ -5,7 +5,7 @@ SUITE=${1:-safelibero_goal}
 TASK=${2:-0}
 LEVELS=${LEVELS:-"I II"}
 LEVEL=${LEVELS%% *}
-REPO=reece-omahoney/${SUITE}_${TASK}_aug
+REPO=reece-omahoney/${SUITE}_${TASK}_${TAG:-aug}
 [ "$SUITE $TASK" = "safelibero_goal 3" ] && REPO=${REPO}_$LEVEL
 ENV="--env.type libero --env.suite $SUITE --env.task_id $TASK --env.level $LEVEL"
 CACHE=~/.cache/huggingface/lerobot/$REPO
