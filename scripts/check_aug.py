@@ -326,8 +326,9 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
 
 def fmt(combo):
     return " ".join(
-        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} {'ar'[int(md)]}]"
-        for a, pa, ta, pt, tt, md in combo
+        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} {'ar'[int(md)]}"
+        + (f" z{rest[0]:.2f}]" if rest else "]")
+        for a, pa, ta, pt, tt, md, *rest in combo
     )
 
 
