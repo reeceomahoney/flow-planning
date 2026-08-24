@@ -52,6 +52,7 @@ class Config:
     alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
     arcs: str = "additive,replace"
     focus: bool = False
+    orig_copies: int = 1
     ik_tol: float = 0.01
     vel_frac: float = 0.8
     hold: int = 20
@@ -269,7 +270,8 @@ def augment_libero(cfg):
         repo_id=cfg.dst_repo, fps=cfg.env.fps, features=features, use_videos=False
     )
     for x in demos:
-        write(dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language)
+        for _ in range(cfg.orig_copies):
+            write(dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language)
 
     cands = libero_candidates(cfg, demos, rng, 4 * cfg.copies)
     print(f"{len(cands)} candidates")

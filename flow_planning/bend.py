@@ -162,6 +162,16 @@ def bulge_delta(ee, s0, s1, phi, theta, mode="additive"):
     return d
 
 
+def descend_delta(ee, s0, s1, h):
+    d = np.zeros_like(ee)
+    n = s1 - s0
+    if h < 1e-3 or n < 4:
+        return d
+    s = np.linspace(0.0, 1.0, n)
+    d[s0:s1, 2] = h * np.sin(np.pi * s**2.5)
+    return d
+
+
 def grasp_rotation(ee, quat, w0, close, opened, w1, m, centre, alpha):
     from scipy.spatial.transform import Rotation as R
 
@@ -199,13 +209,19 @@ def grasp_width(x, k, a_eff):
     return 2 * float(np.abs(ax) @ x["half"][k])
 
 
-def seg_options(alphas, phis, n_theta, modes):
+def seg_options(alphas, phis, n_theta, modes, descents=(0.0,)):
     thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
     arcs = [(0.0, 0.0)] + [(p, th) for p in phis for th in thetas]
     transit = [(0.0, 0.0, 0.0)] + [
         (p, th, float(i)) for i, _ in enumerate(modes) for p in phis for th in thetas
     ]
-    return [(a, *ap, *tr) for a in alphas for ap in arcs for tr in transit]
+    return [
+        (a, *ap, *tr) if dz == 0.0 else (a, *ap, *tr, dz)
+        for a in alphas
+        for ap in arcs
+        for tr in transit
+        for dz in descents
+    ]
 
 
 def encode_label(combo, n_seg):
@@ -245,7 +261,8 @@ def build(x, combo, m, modes):
     expected = [
         e + d for e, d, j in zip(x["ends"], x["dps"], x["held"]) if j is not None
     ]
-    for k, ((c, o), (a, pa, ta, pt, tt, mode)) in enumerate(zip(segs, combo)):
+    for k, ((c, o), (a, pa, ta, pt, tt, mode, *rest)) in enumerate(zip(segs, combo)):
+        dz = rest[0] if rest else 0.0
         a_eff = wrap(np.radians(a) + x["dyaw"][k]) if x["held"][k] is not None else 0.0
         if abs(a_eff) > 1e-3:
             centre = x["obs"][0, obj_slice(x["held"][k])]
@@ -256,6 +273,9 @@ def build(x, combo, m, modes):
         if pa:
             ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
             fam.add("app")
+        if dz:
+            ee = ee + descend_delta(ee, w0 + m if k else 1, c, dz)
+            fam.add("desc")
         if pt:
             d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt, modes[int(mode)])
             ee = ee + d

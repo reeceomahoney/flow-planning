@@ -61,6 +61,7 @@ class Config:
     arcs: str = "additive,replace"
     vel_frac: float = 0.8
     ik_tol: float = 0.01
+    descents: list[float] = field(default_factory=lambda: [0.0])
 
 
 def target_name(goals, objects, sites, name):
@@ -383,7 +384,13 @@ def scene_candidates(cfg, demos, names, geo, tshift):
         combos = [tuple([ZERO] * n)]
         for k in range(n):
             for opt in (
-                seg_options(cfg.alphas, cfg.phis, cfg.n_theta, cfg.arcs.split(","))
+                seg_options(
+                    cfg.alphas,
+                    cfg.phis,
+                    cfg.n_theta,
+                    cfg.arcs.split(","),
+                    cfg.descents,
+                )
                 if x["held"][k] is not None
                 else [ZERO]
             ):
