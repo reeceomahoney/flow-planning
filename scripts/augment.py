@@ -159,7 +159,7 @@ def libero_demos(cfg, env, chain, base, limit):
 def sample_option(cfg, rng):
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
     if cfg.focus:
-        a = rng.choice([90.0, 270.0])
+        a = 0.0 if rng.random() < 0.25 else rng.choice([90.0, 180.0, 270.0])
         app = (max(cfg.phis), rng.choice(thetas))
         if rng.random() < 0.5:
             tr = (0.5, rng.choice(thetas), 0.0)
