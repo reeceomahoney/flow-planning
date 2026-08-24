@@ -2,8 +2,8 @@ name: flow-planning
 
 resources:
   infra: ssh/ori
-  accelerators: RTX4090:2
-  cpus: 30
+  accelerators: RTX4090:1
+  cpus: 14
 
 envs:
   HF_TOKEN:
@@ -11,9 +11,6 @@ envs:
   CUDA_VISIBLE_DEVICES: 1
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
-  TRAIN: 1
-  AUG: 1
-  VIDEO: 0
 workdir: .
 
 setup: |
@@ -24,5 +21,15 @@ setup: |
 run: |
   export PATH="$HOME/.pixi/bin:$PATH"
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
-
-  bash scripts/pipeline_libero.sh safelibero_goal 0
+  SUITE=safelibero_object
+  TASKS="0 1 2 3"
+  export TAG=aug COPIES=6 ITERS=20000 EPISODES=10
+  run() { LEVELS="$1" bash scripts/pipeline_libero.sh $SUITE $T 2>&1 | grep -vE "it/s\]|Warning|WARNING|macro"; }
+  for T in $TASKS; do
+    echo "##### $SUITE task $T"
+    if [ "$SUITE $T" = "safelibero_goal 3" ]; then
+      run I; run II
+    else
+      run "I II"
+    fi
+  done

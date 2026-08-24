@@ -51,8 +51,6 @@ class Config:
     n_cond: int = 8  # search: uniform candidates drawn at startup
     fixed: str = ""  # cond=fixed: comma-separated label values
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
-    progress: float = 0.0  # selector weight on plan-EE reach toward the object
-    stall_tol: float = 0.0  # escape threshold override; 0 keeps the policy default
     gap: bool = False  # print per-episode plan vs executed min obstacle clearance
     guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
 
@@ -91,8 +89,6 @@ def main(cfg: Config):
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
     policy.guidance_scale = cfg.guidance_scale
-    if cfg.stall_tol:
-        policy.stall_tol = cfg.stall_tol
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
@@ -142,9 +138,7 @@ def main(cfg: Config):
             cube_size=env.cube_size,
             cube_index=getattr(env, "cube_index", 18),
             pointcloud=cloud,
-            ee_index=env.ee_state_index,
         )
-        sel.progress_w = cfg.progress
         joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
         sel.fc.calibrate_self(torch.as_tensor(joints, device=device))
         if cfg.cond in (Cond.SEARCH, Cond.SAMPLE) or (
@@ -333,7 +327,6 @@ def main(cfg: Config):
     if contacts:
         hits = "  ".join(f"{k}:{v}" for k, v in contacts.most_common())
         print(f"wall contacts (n={sum(contacts.values())}): {hits}")
-    print(f"escapes {policy.escapes}")
     lc = policy.latched_cond
     if searching and lc is not None:
         lc = lc.cpu().numpy()

@@ -1,25 +1,4 @@
 clusters:
-  isambard:
-    host: u6jz.aip2.isambard
-    remote_path: /home/u6jz/reece.u6jz/flow-planning
-    time: 12
-    gpu: ""
-    ngpu: 1
-    cpus: 72
-    mem: 1600M
-    partition: workq
-
-  arc:
-    host: htc
-    remote_path: /data/engs-robotics-ml/kebl6123/flow-planning
-    time: 4
-    gpu: h100
-    ngpu: 1
-    cpus: 24
-    mem: 8G
-    partition: short
-    priority: true
-
   civo:
     host: civo
     remote_path: /users/kebl6123/flow-planning
@@ -29,30 +8,27 @@ clusters:
     cpus: 12
     mem: 4G
     partition: a100
-    envs:
-      - HF_TOKEN
-      - WANDB_API_KEY
-      - MUJOCO_GL: egl
-      - CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      - HF_DATASETS_DISABLE_PROGRESS_BARS: "1"
 
-# envs:
-#   - WANDB_API_KEY
-#   - HF_TOKEN
-#   - PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-#
-#   # cpu thread limits
-#   - OPENBLAS_NUM_THREADS: 8
-#   - OMP_NUM_THREADS: 8
-#   - MKL_NUM_THREADS: 8
-#
-#   # cache directories
-#   - TORCHINDUCTOR_CACHE_DIR: $HOME/.cache/torchinductor
-#   - TRITON_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/triton
-#   - UV_PROJECT_ENVIRONMENT: /scratch/u6jz/reece.u6jz/flow-planning/.venv
-#   - UV_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/uv
-#   - HF_HOME: /scratch/u6jz/reece.u6jz/.cache/huggingface
-#   - RATTLER_CACHE_DIR: /scratch/u6jz/reece.u6jz/.cache/rattler
+envs:
+  - HF_TOKEN
+  - WANDB_API_KEY
+  - MUJOCO_GL: egl
+  - CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  - HF_DATASETS_DISABLE_PROGRESS_BARS: "1"
+  - PYTHONUNBUFFERED: "1"
+  - SUITE: safelibero_object
+  - TASKS: "0 1 2 3"
+  - TAG: aug4
+  - COPIES: "20"
+  - ITERS: "40000"
+  - EPISODES: "50"
+  - LEVELS: "I II"
+  - AUG_ARGS: "--focus true --orig_copies 5"
 
 command: |-
-  nvidia-smi
+  export PATH=$HOME/.pixi/bin:$PATH
+  for T in $TASKS; do
+    cp scripts/pipeline_libero.sh /tmp/pipe_${SLURM_JOB_ID}_$T.sh
+    bash /tmp/pipe_${SLURM_JOB_ID}_$T.sh $SUITE $T 2>&1 |
+      grep --line-buffered -vE 'it/s\]|Warning|WARNING|macro'
+  done

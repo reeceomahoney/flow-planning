@@ -164,7 +164,6 @@ class AnalyticSelector:
         cube_index: int | None = 18,
         n_arm: int = 7,
         pointcloud=None,
-        ee_index: int | None = None,
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.device = device
@@ -184,10 +183,6 @@ class AnalyticSelector:
             self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
         self.rad = self.fc.radius
-        self.om = torch.as_tensor(obs_stats["mean"], **f32)
-        self.ov = torch.as_tensor(obs_stats["std"], **f32)
-        self.ee_index = ee_index
-        self.progress_w = 0.0
 
     def set_boxes(self, boxes):
         boxes = np.asarray(boxes, dtype=np.float32)
@@ -207,15 +202,7 @@ class AnalyticSelector:
             c = traj[i : i + 32]
             pen = (-self.clearance_t(c, boxes[i : i + 32])).clamp(min=0.0).sum(dim=1)
             out.append(pen + self.body_penetration(c))
-        score = torch.cat(out)
-        if self.progress_w and self.ee_index is not None:
-            obj = self.cube(traj)
-            if obj is not None:
-                j = self.ee_index
-                ee = traj[..., j : j + 3] * self.ov[j : j + 3] + self.om[j : j + 3]
-                reach = (ee - obj[:, :1]).norm(dim=-1).amin(dim=1)
-                score = score + self.progress_w * reach
-        return score
+        return torch.cat(out)
 
     def dist(self, points: Tensor, box: Tensor) -> Tensor:
         if self.cloud is None:

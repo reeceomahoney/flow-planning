@@ -14,9 +14,10 @@
 - All real compute — training, eval, sweeps, recording, even quick diagnostics —
   goes remote, in this order: `civo` first, `flow` second, local GPU last
   resort.
-- civo (A100 slurm): `pixi run slurm run --cluster civo --command "..."`, or
-  `scripts/slurm_suite.sh` for per-task pipelines. Logs land in
-  `civo:~/flow-planning/slurm/slurm-<id>.out`. QOS caps 4 concurrent GPUs.
+- civo (A100 slurm): put the command in `command:` of `configs/slurm.yaml` and
+  launch with `pixi run slurm run --cluster civo` (or pass `--command "..."` for
+  one-offs). Logs land in `civo:~/flow-planning/slurm/slurm-<id>.out`. QOS caps
+  4 concurrent GPUs.
 - flow (SkyPilot): check `sky status flow` first; put the command in `run:` of
   `configs/sky.yaml` and launch with `pixi run launch flow`. `outputs/` is
   gitignored, so each cluster uses its own checkpoints, not the local ones.
