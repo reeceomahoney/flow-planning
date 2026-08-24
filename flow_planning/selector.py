@@ -169,7 +169,7 @@ class AnalyticSelector:
         f32 = {"dtype": torch.float32, "device": device}
         self.device = device
         self.fc = FrankaCollision(device, base_pos, cube_size)
-        self.box = torch.as_tensor(box, **f32).view(-1, 6)
+        self.box = torch.as_tensor(box, **f32).view(-1, 6)[:, None]
         self.cloud = None if pointcloud is None else torch.as_tensor(pointcloud, **f32)
         self.jm = torch.as_tensor(joint_stats["mean"], **f32)[:n_arm]
         self.js = torch.as_tensor(joint_stats["std"], **f32)[:n_arm]
@@ -191,7 +191,8 @@ class AnalyticSelector:
 
     def set_boxes(self, boxes):
         boxes = np.asarray(boxes, dtype=np.float32)
-        self.box = torch.as_tensor(boxes, device=self.device).view(-1, 6)
+        t = torch.as_tensor(boxes, device=self.device)
+        self.box = t.reshape(-1, 6)[:, None] if t.dim() < 3 else t
 
     @torch.no_grad()
     def score(self, traj: Tensor) -> Tensor:
@@ -218,8 +219,17 @@ class AnalyticSelector:
 
     def dist(self, points: Tensor, box: Tensor) -> Tensor:
         if self.cloud is None:
+            if box.dim() == 2:
+                box = box[:, None]
             shape = (len(box),) + (1,) * (points.dim() - 2) + (3,)
-            return box_sdf(points, box[:, :3].view(shape), box[:, 3:].view(shape))
+            return torch.stack(
+                [
+                    box_sdf(
+                        points, box[:, k, :3].view(shape), box[:, k, 3:].view(shape)
+                    )
+                    for k in range(box.shape[1])
+                ]
+            ).amin(dim=0)
         p = points.reshape(-1, 3)
         step = 1 << 19
         out = [

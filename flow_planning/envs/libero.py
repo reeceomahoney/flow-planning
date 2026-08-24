@@ -437,15 +437,22 @@ class LiberoEnv:
         return [g for g in self.envs[0].env.parsed_problem["goal_state"] if len(g) == 3]
 
     def obstacle_boxes(self):
-        boxes = np.tile([1e3, 1e3, 1e3, 0.01, 0.01, 0.01], (len(self.envs), 1))
-        for i, e in enumerate(self.envs):
-            if self.obstacle[i] is not None:
-                boxes[i] = union_box(obstacle_geom_boxes(e, self.obstacle[i]))
-        return boxes.astype(np.float32)
+        far = np.array([1e3, 1e3, 1e3, 0.01, 0.01, 0.01], np.float32)
+        per = [
+            obstacle_geom_boxes(e, self.obstacle[i])
+            if self.obstacle[i] is not None
+            else far[None]
+            for i, e in enumerate(self.envs)
+        ]
+        k = max(len(b) for b in per)
+        out = np.tile(far, (len(per), k, 1)).astype(np.float32)
+        for i, b in enumerate(per):
+            out[i, : len(b)] = b
+        return out
 
     @property
     def obstacle_geometry(self):
-        box = self.obstacle_boxes()[0]
+        box = union_box(self.obstacle_boxes()[0])
         return {"center": box[:3].tolist(), "half_extents": box[3:].tolist()}
 
     def project(self, pts):
