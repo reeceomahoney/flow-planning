@@ -164,7 +164,8 @@ def main(cfg: Config):
             vals = [float(v) for v in cfg.fixed.split(",")]
             vals += [0.0] * (policy.config.cond_dim - len(vals))
             policy.cond = torch.tensor([vals], dtype=torch.float32, device=device)
-            policy.n_samples = cfg.n_cond
+            if policy.selector_fn is not None:
+                policy.n_samples = cfg.n_cond
         elif cfg.cond is Cond.ORACLE:
             assert isinstance(cfg.env, FrankaConfig) and cfg.env.obstacle
             policy.cond = torch.tensor(
