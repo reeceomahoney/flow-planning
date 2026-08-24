@@ -51,6 +51,7 @@ class Config:
     n_theta: int = 4
     alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
     arcs: str = "additive,replace"
+    focus: bool = False
     ik_tol: float = 0.01
     vel_frac: float = 0.8
     hold: int = 20
@@ -157,6 +158,14 @@ def libero_demos(cfg, env, chain, base, limit):
 
 def sample_option(cfg, rng):
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
+    if cfg.focus:
+        a = rng.choice([90.0, 270.0])
+        app = (max(cfg.phis), rng.choice(thetas))
+        if rng.random() < 0.5:
+            tr = (0.5, rng.choice(thetas), 0.0)
+        else:
+            tr = (0.0, 0.0, 0.0)
+        return (a, *app, *tr)
     a = rng.choice(cfg.alphas[1:]) if rng.random() < 0.5 else 0.0
     app = (
         (rng.choice(cfg.phis), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
@@ -289,6 +298,8 @@ def augment_libero(cfg):
     if labels:
         lab = np.stack(labels)
         print("label nonzero fraction per dim:", (np.abs(lab) > 0).mean(0).round(2))
+        rows, counts = np.unique(lab.round(3), axis=0, return_counts=True)
+        print(f"{len(rows)} unique labels, episodes per label:", np.sort(counts)[::-1])
     dst.finalize()
 
 

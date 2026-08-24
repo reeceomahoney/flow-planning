@@ -11,8 +11,12 @@
 
 ## Running on the cluster
 
-- Prefer the `flow` cluster over the local GPU for any real compute — training,
-  eval, sweeps, recording. First check `sky status flow`: if nothing is running
-  (cluster idle), this is the preferred method. Put the command in `run:` of
+- All real compute — training, eval, sweeps, recording, even quick diagnostics —
+  goes remote, in this order: `civo` first, `flow` second, local GPU last
+  resort.
+- civo (A100 slurm): `pixi run slurm run --cluster civo --command "..."`, or
+  `scripts/slurm_suite.sh` for per-task pipelines. Logs land in
+  `civo:~/flow-planning/slurm/slurm-<id>.out`. QOS caps 4 concurrent GPUs.
+- flow (SkyPilot): check `sky status flow` first; put the command in `run:` of
   `configs/sky.yaml` and launch with `pixi run launch flow`. `outputs/` is
-  gitignored, so the cluster uses its own checkpoints, not the local ones.
+  gitignored, so each cluster uses its own checkpoints, not the local ones.

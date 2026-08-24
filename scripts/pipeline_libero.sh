@@ -13,7 +13,7 @@ RUN=outputs/libero/${REPO##*/}
 
 pixi run python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset as D; D('$REPO')" \
   2>/dev/null || (rm -rf $CACHE && pixi run python scripts/augment.py $ENV \
-  --dst_repo $REPO --bend_margin 0.3 --copies ${COPIES:-6})
+  --dst_repo $REPO --bend_margin 0.3 --copies ${COPIES:-6} ${AUG_ARGS:-})
 
 [ "${TRAIN:-1}" = 0 ] || pixi run python scripts/train.py $ENV --repo_id $REPO \
   --num_iters ${ITERS:-20000} --eval_episodes 20 --run_dir $RUN
@@ -25,5 +25,5 @@ $EVAL --cond zero 2>&1 | grep --line-buffered -v "it/s"
 
 for L in $LEVELS; do
   echo "=== SafeLIBERO level $L ==="
-  $EVAL --env.obstacle true --env.level $L --cond search --n_cond 8 2>&1 | grep --line-buffered -v "it/s"
+  $EVAL --env.obstacle true --env.level $L --cond search --n_cond ${NCOND:-8} ${EVAL_ARGS:-} 2>&1 | grep --line-buffered -v "it/s"
 done
