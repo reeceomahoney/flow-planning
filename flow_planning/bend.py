@@ -100,7 +100,7 @@ def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
 
 OBJ0 = 18
 SEG_ZERO = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-LABEL_DIM = 7
+LABEL_DIM = 8
 
 
 def obj_slice(k):
@@ -226,7 +226,7 @@ def seg_options(alphas, phis, n_theta, modes, descents=(0.0,)):
 
 def encode_label(combo, n_seg):
     out = np.zeros(LABEL_DIM * n_seg, np.float32)
-    for k, (a, pa, ta, pt, tt, md) in enumerate(combo[:n_seg]):
+    for k, (a, pa, ta, pt, tt, md, *rest) in enumerate(combo[:n_seg]):
         r = np.radians(a)
         out[LABEL_DIM * k : LABEL_DIM * (k + 1)] = [
             np.sin(r),
@@ -236,6 +236,7 @@ def encode_label(combo, n_seg):
             pt * np.cos(tt),
             pt * np.sin(tt),
             md,
+            rest[0] if rest else 0.0,
         ]
     return out
 
