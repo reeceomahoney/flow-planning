@@ -261,7 +261,7 @@ def main(cfg: Config):
                 succ |= env.success()
                 if stages is not None:
                     max_stage = np.maximum(max_stage, env.stage())
-                if not cfg.video and (succ | env.failure()).all():
+                if not cfg.video and succ.all():
                     break
             if live:
                 env.render()
@@ -309,7 +309,7 @@ def main(cfg: Config):
             f"timeout {(total - total_succ - total_fail) / total:.3f} "
             f"({total} episodes, cond {cfg.cond})"
         )
-        if total_task != total_succ:
+        if total_fail:
             print(
                 f"overall task success incl. collisions {total_task / total:.3f} "
                 f"collision avoidance {1 - total_fail / total:.3f}"
