@@ -11,7 +11,7 @@ ENV="--env.type libero --env.suite $SUITE --env.task_id $TASK --env.level $LEVEL
 CACHE=~/.cache/huggingface/lerobot/$REPO
 RUN=outputs/libero/${REPO##*/}
 
-pixi run python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset as D; D('$REPO')" \
+pixi run python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset as D; import numpy as np; d = D('$REPO'); assert np.abs(np.asarray(d.hf_dataset.with_format('numpy')['bend'])).max() > 0" \
   2>/dev/null || (rm -rf $CACHE && pixi run python scripts/augment.py $ENV \
   --dst_repo $REPO --bend_margin 0.3 --copies ${COPIES:-6} ${AUG_ARGS:-})
 
