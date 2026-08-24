@@ -1,0 +1,26 @@
+strategy:
+  type: base
+
+inference:
+  type: sync
+
+robot:
+  type: piper
+  teleop_mode: false
+  action_ema_alpha: 1.0
+  clip_action: false
+  action_bias_path: null
+  apply_bias_to_obs: false
+  arms: [right]
+
+policy:
+  path: reece-omahoney/piper-pick-and-place
+  n_action_steps: 20
+  dtype: bfloat16
+
+
+fps: 20
+task: Pick and place the pepper shaker
+use_torch_compile: true
+display_data: false
+device: cuda

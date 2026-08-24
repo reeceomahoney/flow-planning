@@ -1,0 +1,22 @@
+robot:
+  type: piper
+  arms: [right]
+
+teleop:
+  type: piper_teleop
+  arms: [right]
+
+dataset:
+  repo_id: reece-omahoney/pick-and-place
+  single_task: Pick and place the pepper shaker
+  fps: 20
+  episode_time_s: 600
+  reset_time_s: 10
+  num_episodes: 50
+  streaming_encoding: true
+  encoder_threads: 5
+  vcodec: auto
+  push_to_hub: true
+
+display_data: false
+display_compressed_images: true

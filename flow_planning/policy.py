@@ -78,6 +78,8 @@ class FlowMatchingConfig(PreTrainedConfig):
         }
     )
 
+    pretrained_revision: str | None = None
+
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
             lr=self.optimizer_lr, weight_decay=self.optimizer_weight_decay

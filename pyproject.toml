@@ -22,7 +22,14 @@ cmake = ">=4.4.2,<5"
 
 [tool.pixi.pypi-dependencies]
 flow_planning = { path = ".", editable = true }
-lerobot = { version = ">=0.6.1, <0.7", extras = ["dataset"] }
+lerobot = { version = ">=0.6.1, <0.7", extras = [
+  "dataset",
+  "hardware",
+  "viz",
+  "intelrealsense",
+] }
+lerobot_robot_piper = { git = "https://github.com/reeceomahoney/lerobot-piper", subdirectory = "lerobot_robot_piper" }
+lerobot_teleoperator_piper = { git = "https://github.com/reeceomahoney/lerobot-piper", subdirectory = "lerobot_teleoperator_piper" }
 newton = { version = "==1.4.0", extras = ["examples"] }
 pre-commit = ">=4.6.0"
 pytorch-volumetric = ">=0.6.0"
@@ -43,6 +50,8 @@ torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu1
 
 [tool.pixi.tasks]
 video = "python scripts/record.py --record False --episodes 1 --env.type franka --env.world_count 1 --video out.mp4"
+record = "lerobot-record --config_path=configs/record.yaml"
+rollout = "lerobot-rollout --config_path=configs/rollout.yaml --discover_packages_path=flow_planning"
 
 [tool.pixi.tasks.launch]
 args = [{ "arg" = "cluster_id", "default" = "" }]
