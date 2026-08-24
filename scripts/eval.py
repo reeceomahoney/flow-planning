@@ -53,6 +53,7 @@ class Config:
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
     progress: float = 0.0  # selector weight on plan-EE reach toward the object
     stall_tol: float = 0.0  # escape threshold override; 0 keeps the policy default
+    gap: bool = False  # print per-episode plan vs executed min obstacle clearance
     guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
 
 
@@ -214,6 +215,17 @@ def main(cfg: Config):
         succ = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
         frame = 0
+        if cfg.gap and sel is not None:
+            exec_min = torch.full((n,), torch.inf, device=device)
+            plan_min = torch.full((n,), torch.inf, device=device)
+            last_plan_id = 0
+
+            def clear_min(q):
+                b, t = q.shape[:2]
+                pts = sel.fc.arm_points(q.reshape(-1, 7).float()).reshape(b, t, -1, 3)
+                d = sel.dist(pts + sel.fc.base_pos, sel.box) - sel.rad
+                return d.amin(dim=(1, 2))
+
         pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
         while frame < frames and viewer.is_running():
             if viewer.should_step():
@@ -221,6 +233,21 @@ def main(cfg: Config):
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
                 phys = postprocessor(action).numpy().astype(np.float32)
                 env.apply_action(phys)
+                if cfg.gap and sel is not None:
+                    exec_min = torch.minimum(
+                        exec_min, clear_min(obs[:, None, :7].to(device))
+                    )
+                    if (
+                        policy.last_chunk is not None
+                        and id(policy.last_chunk) != last_plan_id
+                    ):
+                        last_plan_id = id(policy.last_chunk)
+                        qp = policy.last_chunk[..., :7] * torch.as_tensor(
+                            act_std[:7], dtype=torch.float32, device=device
+                        ) + torch.as_tensor(
+                            act_mean[:7], dtype=torch.float32, device=device
+                        )
+                        plan_min = torch.minimum(plan_min, clear_min(qp))
                 if live and policy.last_chunk is not None:
                     chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
                     if arm:
@@ -262,6 +289,11 @@ def main(cfg: Config):
             f"batch {ep}: success {succ.mean():.3f} "
             f"failure {fail.mean():.3f} timeout {stuck.mean():.3f}"
         )
+        if cfg.gap and sel is not None:
+            print(
+                f"gap: plan min clearance {plan_min.cpu().numpy().round(3)} "
+                f"exec {exec_min.cpu().numpy().round(3)} fail {fail.astype(int)}"
+            )
         if hasattr(env, "contact_labels") and fail.any():
             contacts.update(env.contact_labels()[fail].tolist())
         if stages is not None:
