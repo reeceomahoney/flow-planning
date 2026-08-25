@@ -37,16 +37,16 @@ rerun-sdk = ">=0.26.2"
 scipy = ">=1.17"
 skypilot = { version = ">=0.12.3.post1", extras = ["kubernetes"] }
 slurm-tools = { git = "https://github.com/reeceomahoney/slurm-tools.git" }
-torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu126" }
+torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu130" }
 ty = ">=0.0.46"
 wandb = ">=0.24.2"
 
 [tool.pixi.pypi-options.dependency-overrides]
-torch = { version = ">=2.11.0", index = "https://download.pytorch.org/whl/cu126" }
+torch = { version = ">=2.11.0", index = "https://download.pytorch.org/whl/cu130" }
 mujoco = "==3.10.0"
 mujoco-warp = "==3.10.0.3"
-torchvision = { version = ">=0.27", index = "https://download.pytorch.org/whl/cu126" }
-torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu126" }
+torchvision = { version = ">=0.27", index = "https://download.pytorch.org/whl/cu130" }
+torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu130" }
 
 [tool.pixi.tasks]
 video = "python scripts/record.py --record False --episodes 1 --env.type franka --env.world_count 1 --video out.mp4"
