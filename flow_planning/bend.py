@@ -20,6 +20,14 @@ def transit_segments(gripper: np.ndarray) -> tuple[int, int]:
     return close, opened
 
 
+def carry_segment(gripper, closed_thresh):
+    closed = np.concatenate([[False], gripper < closed_thresh, [False]])
+    edges = np.flatnonzero(np.diff(closed.astype(int)))
+    inner = [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2]) if a > 0]
+    inner = [s for s in inner if s[1] < len(gripper)]
+    return max(inner, key=lambda s: s[1] - s[0]) if inner else None
+
+
 def grasp_segments(gripper: np.ndarray, min_len: int = 5) -> list[tuple[int, int]]:
     closed = np.concatenate([[False], gripper < 0.03, [False]])
     edges = np.flatnonzero(np.diff(closed.astype(int)))
@@ -60,23 +68,28 @@ def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
     return pos, quat
 
 
-def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base):
+def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base, limits=None):
     """(T, B, 3/4) world targets + (B, 7) initial joints -> (T, B, 7).
 
     Damped least squares, batched over copies and SEQUENTIAL over frames: each
     frame warm-starts from the last. Independent solves hop posture families
     and are unusably jerky."""
 
-    lo, hi = (torch.tensor(x, device=chain.device) for x in chain.get_joint_limits())
+    limits = limits or chain.get_joint_limits()
+    lo, hi = (torch.tensor(x, device=chain.device) for x in limits)
     eye = damping * torch.eye(6, device=chain.device)
     p = torch.as_tensor(ee_t - base, dtype=torch.float32, device=chain.device)
     q = torch.as_tensor(
         quat_t[..., [3, 0, 1, 2]], dtype=torch.float32, device=chain.device
     )
     rot = quaternion_to_matrix(q)
-    th = torch.as_tensor(seed0, dtype=torch.float32, device=chain.device)
-    out = torch.empty(p.shape[:2] + (7,), device=chain.device)
+    seed = torch.as_tensor(seed0, dtype=torch.float32, device=chain.device)
+    traj = seed.dim() == 3  # (T, B, n): carry the delta from a reference path
+    th = seed[0] if traj else seed
+    out = torch.empty(p.shape[:2] + (th.shape[-1],), device=chain.device)
     for t in range(len(p)):
+        if traj and t > 0:
+            th = seed[t] + (th - seed[t - 1])
         # IK loop
         for _ in range(iters):
             jac, m = chain.jacobian(th, ret_eef_pose=True)

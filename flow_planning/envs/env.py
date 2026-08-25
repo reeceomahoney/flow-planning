@@ -25,6 +25,7 @@ class PiperConfig(EnvConfig):
     fps: int = 20
     goal_dim: int = 0
     n_action_steps: int = 30
+    gripper_closed: float = 1.5
 
 
 def world_offset(viewer, first=False):

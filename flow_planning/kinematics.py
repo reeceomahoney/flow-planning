@@ -2,6 +2,7 @@
 Validated to match newton's eval_fk to floating-point precision."""
 
 import re
+from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -41,3 +42,11 @@ def ee_positions(chain, q: Tensor) -> Tensor:
     pad = q.new_zeros(q.shape[0], njoints - q.shape[1])
     fk = chain.forward_kinematics(torch.cat([q, pad], dim=1))
     return fk[EE_FRAME].get_matrix()[:, :3, 3]
+
+
+def build_piper_chain(device: str):
+    import pytorch_kinematics as pk
+
+    urdf = (Path(__file__).parent / "assets/piper.urdf").read_bytes()
+    chain = pk.SerialChain(pk.build_chain_from_urdf(urdf), "link6")
+    return chain.to(dtype=torch.float32, device=device)

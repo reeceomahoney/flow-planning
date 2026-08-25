@@ -66,6 +66,7 @@ class FlowMatchingConfig(PreTrainedConfig):
     # bend-parameter conditioning (0 disables); dropout trains the null token
     cond_dim: int = 0
     cond_dropout: float = 0.15
+    zero_cond: bool = False
 
     # training
     optimizer_lr: float = 1e-4
@@ -319,6 +320,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             k = max(self.n_samples, 1)
             if self.config.cond_dim and self.cond is not None:
                 cond = self.cond.expand(n_worlds * k, -1)
+            elif self.config.cond_dim and self.config.zero_cond:
+                cond = obs.new_zeros(n_worlds * k, self.config.cond_dim)
         if k > 1:
             obs = obs.repeat_interleave(k, dim=0)
         sd = self.state_dim

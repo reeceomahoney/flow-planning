@@ -14,8 +14,9 @@ robot:
   arms: [right]
 
 policy:
-  path: reece-omahoney/piper-pick-and-place
-  n_action_steps: 20
+  path: reece-omahoney/piper-pick-and-place-aug
+  n_action_steps: 30
+  zero_cond: true
   dtype: bfloat16
 
 

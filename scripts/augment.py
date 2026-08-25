@@ -19,6 +19,7 @@ from flow_planning.bend import (
     SEG_ZERO,
     bend_delta,
     build,
+    carry_segment,
     encode_label,
     fk,
     grasp_segments,
@@ -28,7 +29,8 @@ from flow_planning.bend import (
     transit_segments,
 )
 from flow_planning.envs import EnvConfig, FrankaConfig
-from flow_planning.kinematics import EE_FRAME, build_franka_chain
+from flow_planning.envs.env import PiperConfig
+from flow_planning.kinematics import EE_FRAME, build_franka_chain, build_piper_chain
 from flow_planning.selector import FrankaCollision, box_sdf
 from flow_planning.utils import hf_column, quat_to_rot6d
 
@@ -402,8 +404,140 @@ def lag_states(x, chain, base, alpha):
     return new.astype(np.float32)
 
 
+def augment_piper(cfg):
+    # ponytail: carry-phase bends only, IK error + jerk as the only filters;
+    # phase-wide bends and a self-collision check are the upgrades
+    assert isinstance(cfg.env, PiperConfig)
+    rng = np.random.default_rng(cfg.seed)
+    chain = build_piper_chain(DEV)
+    base = np.zeros(3, np.float32)
+    arm = slice(0, 6)
+
+    src = LeRobotDataset(cfg.src_repo)
+    hf = src.hf_dataset
+    epi = hf_column(hf, "episode_index")
+    obs_all = hf_column(hf, "observation.state")
+    act_all = hf_column(hf, "action")
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": obs_all.shape[1:],
+            "names": None,
+        },
+        "action": {"dtype": "float32", "shape": act_all.shape[1:], "names": None},
+        "bend": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    dst = LeRobotDataset.create(
+        repo_id=cfg.dst_repo, fps=src.fps, features=features, use_videos=False
+    )
+    lo, hi = chain.get_joint_limits()
+    q_all = np.radians(act_all[:, arm])
+    limits = (
+        np.minimum(lo, q_all.min(0)).tolist(),
+        np.maximum(hi, q_all.max(0)).tolist(),
+    )
+
+    todo: list[dict[str, Any]] = []
+    grid = np.zeros(len(ALPHAS))
+    margin = round(cfg.bend_margin * src.fps)
+    n_src = min(src.num_episodes, cfg.limit or src.num_episodes)
+    for e in tqdm(range(n_src), desc="originals"):
+        sel = epi == e
+        obs, act = obs_all[sel].copy(), act_all[sel].copy()
+        write(dst, obs, act, np.zeros(2))
+        grid += track_error(obs[:, arm], act[:, arm]) / n_src
+        seg = carry_segment(act[:, 6], cfg.env.gripper_closed)
+        if seg is None or seg[1] - seg[0] < 2 * margin:
+            continue
+        ee, quat = fk(chain, np.radians(act[:, arm]), base)
+        obs_ee = fk(chain, np.radians(obs[:, arm]), base)[0]
+        todo.append(
+            dict(
+                obs=obs,
+                act=act,
+                close=seg[0],
+                opened=seg[1],
+                ee=ee,
+                quat=quat,
+                obs_ee=obs_ee,
+            )
+        )
+
+    j = int(grid.argmin())
+    alpha = float(ALPHAS[j])
+    print(f"tracking fit: alpha {alpha:.2f}")
+    print(f"  joint MAE {grid[j]:.3f} deg vs {grid[0]:.3f} unfiltered")
+    print(f"{len(todo)}/{n_src} episodes bendable")
+
+    ee_err: list[np.ndarray] = []
+    written = rej_ik = 0
+    jerk_limit = 0.6 * (50 / src.fps) ** 2
+    pending = [dict(x) for x in todo for _ in range(cfg.copies)]
+    bar = tqdm(total=len(pending), desc="bends")
+    for attempt in range(4):
+        if not pending:
+            break
+        bar.write(f"attempt {attempt}: {len(pending)} pending")
+        phis = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max, len(pending))
+        thetas = rng.uniform(0.0, np.pi, len(pending))
+        for x, phi, theta in zip(pending, phis, thetas):
+            d = bend_delta(
+                x["obs_ee"], x["close"] + margin, x["opened"] - margin, phi, theta
+            )
+            x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
+            x["ee_t"] = x["ee"] + d
+            x["bent"] = np.linalg.norm(d, axis=1) > 1e-6
+
+        tm = max(len(x["act"]) for x in pending)
+        na_j = solve_seq(
+            chain,
+            np.stack([tpad(x["ee_t"], tm) for x in pending], axis=1),
+            np.stack([tpad(x["quat"], tm) for x in pending], axis=1),
+            np.radians(np.stack([tpad(x["act"][:, arm], tm) for x in pending], axis=1)),
+            cfg.ik_iters,
+            cfg.ik_damping,
+            base,
+            limits,
+        )
+        achieved = fk(chain, na_j.reshape(-1, 6), base)[0].reshape(tm, len(pending), 3)
+        rejected = []
+        for i, x in enumerate(pending):
+            nf = len(x["act"])
+            err = np.linalg.norm(achieved[:nf, i] - x["ee_t"], axis=1)
+            jerk = np.abs(np.diff(na_j[:nf, i], n=2, axis=0)).max()
+            if err.max() > cfg.ik_tol or jerk > jerk_limit:
+                rejected.append(x)
+                rej_ik += 1
+                continue
+            na = x["act"].copy()
+            na[:, arm] = np.degrees(na_j[:nf, i])
+            new_obs = x["obs"].copy()
+            new_obs[:, arm] += smooth(na[:, arm] - x["act"][:, arm], alpha)
+            write(dst, new_obs.astype(np.float32), na.astype(np.float32), x["label"])
+            written += 1
+            bar.update(1)
+            if x["bent"].any():
+                ee_err.append(err[x["bent"]])
+        pending = rejected
+    bar.close()
+
+    total = written + len(pending)
+    print(f"wrote {written}/{total} copies ({len(pending)} dropped after retries)")
+    print(f"rejected: {rej_ik} on IK/jerk")
+    if ee_err:
+        err = np.concatenate(ee_err)
+        print(
+            f"bent-frame IK error: mean {err.mean():.4f} "
+            f"p95 {np.percentile(err, 95):.4f}"
+        )
+    dst.finalize()
+
+
 @draccus.wrap()
 def main(cfg: Config):
+    if isinstance(cfg.env, PiperConfig):
+        augment_piper(cfg)
+        return
     if not isinstance(cfg.env, FrankaConfig):
         augment_libero(cfg)
         return
