@@ -185,10 +185,18 @@ def libero_candidates(cfg, demos, rng, per_demo):
         tries, mine = 0, 0
         while mine < per_demo and tries < 10 * per_demo:
             tries += 1
-            combo = tuple(
-                sample_option(cfg, rng) if j is not None else SEG_ZERO
-                for j in x["held"]
-            )
+            held_idx = [k for k, j in enumerate(x["held"]) if j is not None]
+            if cfg.focus:
+                pick = held_idx[rng.integers(len(held_idx))]
+                combo = tuple(
+                    sample_option(cfg, rng) if k == pick else SEG_ZERO
+                    for k in range(len(x["held"]))
+                )
+            else:
+                combo = tuple(
+                    sample_option(cfg, rng) if j is not None else SEG_ZERO
+                    for j in x["held"]
+                )
             if all(o == SEG_ZERO for o in combo):
                 continue
             c = build(x, combo, m, modes)
