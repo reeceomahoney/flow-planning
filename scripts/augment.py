@@ -53,6 +53,7 @@ class Config:
     arcs: str = "additive,replace"
     focus: bool = False
     orig_copies: int = 1
+    retarget: float = 0.0
     ik_tol: float = 0.01
     vel_frac: float = 0.8
     hold: int = 20
@@ -94,8 +95,14 @@ def write(dst, obs, act, bend, task="pick_place"):
     dst.save_episode()
 
 
-def replay_libero(env, state0, act, hold):
+def replay_libero(env, state0, act, hold, shift=None):
     env.reset()
+    state0 = np.asarray(state0, np.float64).copy()
+    if shift is not None:
+        name, delta = shift
+        m = env.envs[0].sim.model._model
+        adr = m.jnt_qposadr[m.body(f"{name}_main").jntadr[0]]
+        state0[1 + adr : 1 + adr + 2] += delta[:2]
     env.obs[0] = env.envs[0].set_init_state(state0)
     env.succ[:] = False
     obs = []
@@ -186,22 +193,33 @@ def libero_candidates(cfg, demos, rng, per_demo):
         while mine < per_demo and tries < 10 * per_demo:
             tries += 1
             held_idx = [k for k, j in enumerate(x["held"]) if j is not None]
+            shift = None
+            xd = x
             if cfg.focus:
                 pick = held_idx[rng.integers(len(held_idx))]
                 combo = tuple(
                     sample_option(cfg, rng) if k == pick else SEG_ZERO
                     for k in range(len(x["held"]))
                 )
+                if cfg.retarget > 0:
+                    delta = np.append(rng.uniform(-cfg.retarget, cfg.retarget, 2), 0.0)
+                    dbs = [np.zeros(3)] * len(x["segs"])
+                    dbs[pick] = delta
+                    xd = dict(x) | {"dbs": dbs}
+                    shift = (pick, delta)
+                    if rng.random() < 0.3:
+                        combo = tuple(SEG_ZERO for _ in x["held"])
             else:
                 combo = tuple(
                     sample_option(cfg, rng) if j is not None else SEG_ZERO
                     for j in x["held"]
                 )
-            if all(o == SEG_ZERO for o in combo):
+            if shift is None and all(o == SEG_ZERO for o in combo):
                 continue
-            c = build(x, combo, m, modes)
+            c = build(xd, combo, m, modes)
             if c is not None:
                 c["d"] = d
+                c["shift"] = shift
                 cands.append(c)
                 mine += 1
     return cands
@@ -294,7 +312,11 @@ def augment_libero(cfg):
         if per_demo[c["d"]] >= cfg.copies:
             continue
         x = demos[c["d"]]
-        succ, obs = replay_libero(env, x["state0"], c["act"], cfg.hold)
+        shift = c.get("shift")
+        if shift is not None:
+            seg, delta = shift
+            shift = (env.objects[x["held"][seg]], delta)
+        succ, obs = replay_libero(env, x["state0"], c["act"], cfg.hold, shift)
         if not succ:
             rej_replay += 1
             continue
