@@ -60,7 +60,7 @@ cmd = """
 {%- if exec -%}
 sky exec vast configs/vast.yaml -d --env HF_TOKEN --env WANDB_API_KEY
 {%- else -%}
-sky launch configs/vast.yaml -c vast -y -d --env HF_TOKEN --env WANDB_API_KEY
+sky launch configs/vast.yaml -c vast -y -d --env HF_TOKEN --env WANDB_API_KEY; python scripts/vast_guard.py || sky down vast -y
 {%- endif -%}
 """
 

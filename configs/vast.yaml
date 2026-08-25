@@ -2,10 +2,10 @@ name: flow-planning
 
 resources:
   infra: vast
-  accelerators: RTX4090:1
-  cpus: 8+
+  accelerators: RTX5090:1
+  cpus: 16+
   memory: 32+
-  disk_size: 80
+  disk_size: 60
   image_id: docker:nvidia/cuda:13.0.3-runtime-ubuntu22.04
 
 envs:
