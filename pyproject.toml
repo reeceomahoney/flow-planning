@@ -36,6 +36,7 @@ pytorch-volumetric = ">=0.6.0"
 rerun-sdk = ">=0.26.2"
 scipy = ">=1.17"
 skypilot = { version = ">=0.12.3.post1", extras = ["kubernetes", "vast"] }
+vastai-sdk = ">=1.5"
 slurm-tools = { git = "https://github.com/reeceomahoney/slurm-tools.git" }
 torchcodec = { version = ">=0.12", index = "https://download.pytorch.org/whl/cu130" }
 ty = ">=0.0.46"
