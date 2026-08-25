@@ -3,7 +3,7 @@ name: flow-planning
 resources:
   infra: ssh/ori
   accelerators: RTX4090:1
-  cpus: 14
+  cpus: 31
 
 envs:
   HF_TOKEN:
@@ -23,7 +23,8 @@ run: |
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
   SUITE=safelibero_object
   TASKS="0 1 2 3"
-  export TAG=aug COPIES=6 ITERS=20000 EPISODES=10
+  export TAG=aug8 COPIES=20 ITERS=40000 EPISODES=50
+  export AUG_ARGS="--focus true --orig_copies 5 --retarget 0.25 --retarget_place 0.12 --retarget_only 0.15"
   run() { LEVELS="$1" bash scripts/pipeline_libero.sh $SUITE $T 2>&1 | grep -vE "it/s\]|Warning|WARNING|macro"; }
   for T in $TASKS; do
     echo "##### $SUITE task $T"

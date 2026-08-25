@@ -54,6 +54,8 @@ class Config:
     focus: bool = False
     orig_copies: int = 1
     retarget: float = 0.0
+    retarget_place: float = 0.0
+    retarget_only: float = 0.3
     ik_tol: float = 0.01
     vel_frac: float = 0.8
     hold: int = 20
@@ -98,10 +100,12 @@ def write(dst, obs, act, bend, task="pick_place"):
 def replay_libero(env, state0, act, hold, shift=None):
     env.reset()
     state0 = np.asarray(state0, np.float64).copy()
-    if shift is not None:
-        name, delta = shift
-        m = env.envs[0].sim.model._model
-        adr = m.jnt_qposadr[m.body(f"{name}_main").jntadr[0]]
+    m = env.envs[0].sim.model._model
+    for name, delta in shift or []:
+        jnt = m.body(f"{name}_main").jntadr[0]
+        if jnt < 0:
+            continue
+        adr = m.jnt_qposadr[jnt]
         state0[1 + adr : 1 + adr + 2] += delta[:2]
     env.obs[0] = env.envs[0].set_init_state(state0)
     env.succ[:] = False
@@ -203,11 +207,16 @@ def libero_candidates(cfg, demos, rng, per_demo):
                 )
                 if cfg.retarget > 0:
                     delta = np.append(rng.uniform(-cfg.retarget, cfg.retarget, 2), 0.0)
+                    r = cfg.retarget_place
+                    dplace = np.append(rng.uniform(-r, r, 2), 0.0) if r else None
                     dbs = [np.zeros(3)] * len(x["segs"])
+                    dps = [np.zeros(3)] * len(x["segs"])
                     dbs[pick] = delta
-                    xd = dict(x) | {"dbs": dbs}
-                    shift = (pick, delta)
-                    if rng.random() < 0.3:
+                    if dplace is not None:
+                        dps[pick] = dplace
+                    xd = dict(x) | {"dbs": dbs, "dps": dps}
+                    shift = (pick, delta, dplace)
+                    if rng.random() < cfg.retarget_only:
                         combo = tuple(SEG_ZERO for _ in x["held"])
             else:
                 combo = tuple(
@@ -314,8 +323,11 @@ def augment_libero(cfg):
         x = demos[c["d"]]
         shift = c.get("shift")
         if shift is not None:
-            seg, delta = shift
-            shift = (env.objects[x["held"][seg]], delta)
+            seg, delta, dplace = shift
+            held_name = env.objects[x["held"][seg]]
+            shift = [(held_name, delta)]
+            if dplace is not None:
+                shift += [(n, dplace) for n in env.objects if n != held_name]
         succ, obs = replay_libero(env, x["state0"], c["act"], cfg.hold, shift)
         if not succ:
             rej_replay += 1
