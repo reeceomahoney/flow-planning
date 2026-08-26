@@ -67,6 +67,7 @@ class FlowMatchingConfig(PreTrainedConfig):
     cond_dim: int = 0
     cond_dropout: float = 0.15
     zero_cond: bool = False
+    cloud_points: int = 0
 
     # training
     optimizer_lr: float = 1e-4
@@ -167,11 +168,23 @@ class FlowTransformer(nn.Module):
         self.traj_in = nn.Linear(traj_dim, d)
         self.time_mlp = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
         self.pos_emb = nn.Parameter(torch.randn(self.horizon, d) * 0.02)
+        if cfg.cond_dim or cfg.cloud_points:
+            self.null_cond = nn.Parameter(torch.zeros(d))
         if cfg.cond_dim:
             self.cond_mlp = nn.Sequential(
                 nn.Linear(cfg.cond_dim, d), nn.GELU(), nn.Linear(d, d)
             )
-            self.null_cond = nn.Parameter(torch.zeros(d))
+        if cfg.cloud_points:
+            self.cloud_enc = nn.Sequential(
+                nn.Linear(3, 64),
+                nn.GELU(),
+                nn.Linear(64, 128),
+                nn.GELU(),
+                nn.Linear(128, d),
+            )
+            self.cloud_out = nn.Linear(d, d)
+            nn.init.zeros_(self.cloud_out.weight)
+            nn.init.zeros_(self.cloud_out.bias)
         self.layers = nn.ModuleList(
             EncoderLayer(d, cfg.n_heads, 4 * d) for _ in range(cfg.n_layers)
         )
@@ -184,16 +197,23 @@ class FlowTransformer(nn.Module):
         t: Tensor,
         cond: Tensor | None = None,
         cond_drop: Tensor | None = None,
+        cloud: Tensor | None = None,
     ) -> Tensor:
-        # x_t: (B, H, traj_dim), t: (B,), cond: (B, cond_dim) or None (-> null).
+        # x_t: (B, H, traj_dim), t: (B,), cond: (B, cond_dim) or None (-> null),
+        # cloud: (B, N, 3) with all-zero rows as padding (no valid point -> null).
         temb = self.time_mlp(sinusoidal_embedding(t, self.pos_emb.shape[-1]))
         c = temb
-        if hasattr(self, "cond_mlp"):
+        if hasattr(self, "null_cond"):
             ce = self.null_cond.expand(x_t.shape[0], -1)
             if cond is not None:
                 ce = self.cond_mlp(cond)
-                if cond_drop is not None:
-                    ce = torch.where(cond_drop[:, None], self.null_cond, ce)
+            elif cloud is not None:
+                valid = cloud.abs().sum(-1) > 0
+                h = self.cloud_enc(cloud).masked_fill(~valid[..., None], -1e4)
+                h = h.amax(1)
+                ce = torch.where(valid.any(1)[:, None], self.cloud_out(h), ce)
+            if cond_drop is not None:
+                ce = torch.where(cond_drop[:, None], self.null_cond, ce)
             c = c + ce
         h = self.traj_in(x_t) + self.pos_emb
         for layer in self.layers:
@@ -224,6 +244,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.action_clip = None  # optional (low, high) normalized action bounds
         self.selector_fn = None  # optional plan scorer for candidate selection
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
+        self.cloud = None  # scene point cloud (1, N, 3) for cloud_points models
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.latched_idx = None
         self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
@@ -261,12 +282,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         x_t[:, 0, :sd] = x_1[:, 0, :sd]
         x_t[:, -1, gs : gs + gd] = x_1[:, -1, gs : gs + gd]
         cond = batch.get("bend") if self.config.cond_dim else None
+        cloud = batch.get("cloud") if self.config.cloud_points else None
         drop = None
-        if cond is not None:
+        if cond is not None or cloud is not None:
             drop = (
-                torch.rand(cond.shape[0], device=cond.device) < self.config.cond_dropout
+                torch.rand(x_1.shape[0], device=x_1.device) < self.config.cond_dropout
             )
-        v = self.model(x_t, t, cond, drop)
+        v = self.model(x_t, t, cond, drop, cloud)
         err = (v - (x_1 - x_0)) ** 2
         mask = torch.ones_like(err)
         mask[:, 0, :sd] = 0.0
@@ -280,6 +302,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         state: Tensor,
         goal: Tensor,
         cond: Tensor | None,
+        cloud: Tensor | None = None,
     ) -> Tensor:
         """ODE-integrate x from 0 to 1, re-clamping the boundary frames each step."""
         sd, gd = self.state_dim, self.config.goal_dim
@@ -295,7 +318,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 vu = self.model(x, t, None)
                 v = vu + self.guidance_scale * (vc - vu)
             else:
-                v = self.model(x, t, cond)
+                v = self.model(x, t, cond, None, cloud)
             x = x + dt * v
         return x
 
@@ -332,6 +355,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # plans x horizon constant instead of hard-coding a count (retiming took
         # the horizon 599 -> 832 and OOM'd a fixed 4096)
         mb = max(256, int(4096 * 600 / self.config.horizon))
+        cloud = None if self.cloud is None else self.cloud.expand(m, -1, -1)
         x = torch.cat(
             [
                 self.flow_integrate(
@@ -339,6 +363,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                     state[i : i + mb],
                     goal[i : i + mb],
                     None if cond is None else cond[i : i + mb],
+                    None if cloud is None else cloud[i : i + mb],
                 )
                 for i in range(0, m, mb)
             ]

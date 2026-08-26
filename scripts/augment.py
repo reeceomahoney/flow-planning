@@ -86,16 +86,17 @@ def held_block(obs, close, opened, n_obj) -> slice:
     return slice(CUBE.start + 9 * k, CUBE.start + 9 * k + 3)
 
 
-def write(dst, obs, act, bend, task="pick_place"):
+def write(dst, obs, act, bend, task="pick_place", wall=None):
     for f in range(len(obs)):
-        dst.add_frame(
-            {
-                "observation.state": obs[f],
-                "action": act[f],
-                "bend": bend.astype(np.float32),
-                "task": task,
-            }
-        )
+        frame = {
+            "observation.state": obs[f],
+            "action": act[f],
+            "bend": bend.astype(np.float32),
+            "task": task,
+        }
+        if wall is not None:
+            frame["wall"] = np.asarray(wall, np.float32)
+        dst.add_frame(frame)
     dst.save_episode()
 
 
@@ -576,6 +577,7 @@ def main(cfg: Config):
         },
         "action": {"dtype": "float32", "shape": act_all.shape[1:], "names": None},
         "bend": {"dtype": "float32", "shape": (2,), "names": None},
+        "wall": {"dtype": "float32", "shape": (6,), "names": None},
     }
 
     dst = LeRobotDataset.create(
@@ -592,7 +594,7 @@ def main(cfg: Config):
         sel = epi == e
         obs, act = obs_all[sel].copy(), act_all[sel].copy()
         close, opened = transit_segments(act[:, 7])
-        write(dst, obs, act, np.zeros(2))
+        write(dst, obs, act, np.zeros(2), wall=np.zeros(6))
         grid += track_error(obs, act) / n_src
 
         # fk bendable episodes
@@ -734,7 +736,8 @@ def main(cfg: Config):
                     rejected.append(x)
                     rej_wall += 1
                     continue
-            write(dst, new_obs, na, x["label"])
+            wall = np.concatenate(x["wall"]) if cfg.demogen else np.zeros(6)
+            write(dst, new_obs, na, x["label"], wall=wall)
             labels.append(x["label"])
             written += 1
             bar.update(1)

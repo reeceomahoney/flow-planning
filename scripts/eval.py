@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from flow_planning.bend import LABEL_DIM
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
+from flow_planning.envs.franka import subsample_cloud
 from flow_planning.kinematics import build_franka_chain, ee_positions
 from flow_planning.policy import (
     FlowMatchingPolicy,
@@ -32,6 +33,7 @@ class Cond(enum.StrEnum):
     SAMPLE = "sample"  # null token, n_cond noise draws, selector picks each replan
     ORACLE = "oracle"  # true wall [height, width] as the label (DemoGen arm)
     FIXED = "fixed"  # the label given by --fixed (comma-separated), no search
+    CLOUD = "cloud"  # scene point cloud into the checkpoint's point encoder
 
 
 @dataclass
@@ -121,6 +123,7 @@ def main(cfg: Config):
         )
         policy.action_clip = (low, high)
 
+    rng = np.random.default_rng(cfg.seed)
     searching = cfg.cond is Cond.SEARCH
     sel = None
     if cfg.env.obstacle and hasattr(env, "ee_state_index"):
@@ -138,18 +141,27 @@ def main(cfg: Config):
             cube_size=env.cube_size,
             cube_index=getattr(env, "cube_index", 18),
             pointcloud=cloud,
+            mesh=None if cloud is not None else getattr(env, "obstacle_mesh", None),
         )
         joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
         sel.fc.calibrate_self(torch.as_tensor(joints, device=device))
         if cfg.cond in (Cond.SEARCH, Cond.SAMPLE) or (
-            cfg.cond in (Cond.ORACLE, Cond.FIXED) and cfg.n_cond > 1
+            cfg.cond in (Cond.ORACLE, Cond.FIXED, Cond.CLOUD) and cfg.n_cond > 1
         ):
             policy.selector_fn = sel.score
+    if cfg.cond is Cond.CLOUD:
+        n_pts = getattr(policy.config, "cloud_points", 0)
+        assert n_pts, "checkpoint has no point encoder"
+        pts = env.scene_pointcloud() if cfg.env.obstacle else np.zeros((0, 3))
+        cloud = subsample_cloud(pts, n_pts, rng)
+        policy.cloud = torch.as_tensor(cloud, device=device)[None]
+        print(f"cloud cond: {len(pts)} scene points -> {n_pts}")
+        if policy.selector_fn is not None:
+            policy.n_samples = cfg.n_cond
     if cfg.cond is Cond.SAMPLE:
         assert policy.selector_fn is not None, "sample needs --env.obstacle"
         policy.n_samples = cfg.n_cond
         print(f"null-token best-of-{cfg.n_cond} over noise")
-    rng = np.random.default_rng(cfg.seed)
     bend = None
     if getattr(policy.config, "cond_dim", 0):
         bend = hf_column(dataset.hf_dataset, "bend")

@@ -15,9 +15,11 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.feature_utils import dataset_to_policy_features
+from safetensors.torch import load_file
 
 import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
+from flow_planning.envs.franka import box_pointcloud, subsample_cloud
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
@@ -36,6 +38,11 @@ class Config:
     dim_model: int = 256
     n_layers: int = 8
     cond_dim: int = -1  # -1: take it from the dataset's bend feature
+    cloud_points: int = 0  # >0: condition on a scene point cloud of this many points
+    init_from: str = ""  # checkpoint dir to fine-tune from (new cond pathway zero-init)
+    freeze_backbone: bool = False  # train only the conditioning pathway + AdaLN
+    episodes: int = 0  # >0: random subset of this many episodes
+    seed: int = 0
     warmup_iters: int = 500
     ema_decay: float = 0.999
     device: str = "cuda"
@@ -137,7 +144,12 @@ def main(cfg: Config):
     mode = cast(Literal["online", "offline", "disabled"], cfg.wandb_mode)
     wandb.init(project=cfg.wandb_project, mode=mode, config=draccus.encode(cfg))
 
-    dataset = LeRobotDataset(cfg.repo_id)
+    rng = np.random.default_rng(cfg.seed)
+    subset = None
+    if cfg.episodes > 0:
+        n_total = LeRobotDataset(cfg.repo_id).meta.total_episodes
+        subset = sorted(rng.choice(n_total, cfg.episodes, replace=False).tolist())
+    dataset = LeRobotDataset(cfg.repo_id, episodes=subset)
     features = dataset_to_policy_features(dataset.features)
     output_features = {
         k: v for k, v in features.items() if v.type is FeatureType.ACTION
@@ -158,6 +170,7 @@ def main(cfg: Config):
         else 0,
         dim_model=cfg.dim_model,
         n_layers=cfg.n_layers,
+        cloud_points=cfg.cloud_points,
     )
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
@@ -167,6 +180,20 @@ def main(cfg: Config):
     assert stats is not None
 
     policy = FlowMatchingPolicy(policy_cfg, dataset_stats=stats).to(device)
+    if cfg.init_from:
+        base = load_file(str(Path(cfg.init_from) / "model.safetensors"), device=device)
+        missing, unexpected = policy.load_state_dict(base, strict=False)
+        assert not unexpected, unexpected
+        print(f"init from {cfg.init_from}: new params {sorted(missing)}")
+        if hasattr(policy.model, "cond_mlp"):
+            for param in policy.model.cond_mlp[-1].parameters():
+                param.data.zero_()
+    if cfg.freeze_backbone:
+        keep = ("cond_mlp", "cloud_enc", "cloud_out", "null_cond", ".mod.")
+        for name, param in policy.named_parameters():
+            param.requires_grad = any(k in name for k in keep)
+        n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+        print(f"backbone frozen: {n_train / 1e6:.2f}M trainable")
     policy.model = cast(FlowTransformer, torch.compile(policy.model))
 
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
@@ -188,6 +215,25 @@ def main(cfg: Config):
     act_all = torch.from_numpy(hf_column(hf, "action"))
     bend_all = torch.from_numpy(hf_column(hf, "bend")) if policy_cfg.cond_dim else None
     ep = torch.as_tensor(hf_column(hf, "episode_index"), dtype=torch.long)
+    clouds = None
+    if policy_cfg.cloud_points:
+        walls = hf_column(hf, "wall")
+        first = np.unique(ep.numpy(), return_index=True)[1]
+        clouds = torch.zeros(int(ep.max()) + 1, policy_cfg.cloud_points, 3)
+        th = getattr(cfg.env, "table_height", 0.1)
+        table = [0.0, -0.5, 0.5 * th], [0.4, 0.4, 0.5 * th]
+        n_walls = 0
+        for f in first:
+            w = walls[f]
+            if np.abs(w).sum() == 0:
+                continue
+            pts = box_pointcloud([w[:3], table[0]], [w[3:], table[1]], th)
+            clouds[ep[f]] = torch.from_numpy(
+                subsample_cloud(pts, policy_cfg.cloud_points, rng)
+            )
+            n_walls += 1
+        clouds = clouds.to(device)
+        print(f"clouds: {n_walls}/{len(first)} episodes have a wall", flush=True)
     last = torch.zeros(int(ep.max()) + 1, dtype=torch.long)
     last[ep] = torch.arange(len(ep))  # sequential writes leave each episode's end
     ep_end = last[ep]
@@ -197,7 +243,7 @@ def main(cfg: Config):
     print(f"Loaded {n_samples} frames ({mb:.0f} MB) in RAM", flush=True)
 
     optimizer = torch.optim.AdamW(
-        policy.get_optim_params(),
+        [p for p in policy.get_optim_params() if p.requires_grad],
         lr=policy_cfg.optimizer_lr,
         weight_decay=policy_cfg.optimizer_weight_decay,
         fused=True,
@@ -220,6 +266,8 @@ def main(cfg: Config):
         batch = preprocessor({OBS_STATE: obs_all[rows], ACTION: act_all[rows]})
         if bend_all is not None:
             batch["bend"] = bend_all[idx].to(device, non_blocking=True)
+        if clouds is not None:
+            batch["cloud"] = clouds[ep[idx].to(device)]
         with amp:
             loss, _ = policy.forward(batch)
 
