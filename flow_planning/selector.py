@@ -195,7 +195,9 @@ class AnalyticSelector:
         -- the safest plan never approaches the cube at all -- so clearance buys
         nothing and every collision-free plan ties."""
         boxes = self.box
-        if len(boxes) > 1:
+        if len(boxes) == 1:
+            boxes = boxes.expand(len(traj), *boxes.shape[1:])
+        else:
             boxes = boxes.repeat_interleave(len(traj) // len(boxes), dim=0)
         out = []
         for i in range(0, len(traj), 32):
