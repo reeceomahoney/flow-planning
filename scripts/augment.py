@@ -196,10 +196,12 @@ def libero_candidates(cfg, demos, rng, per_demo):
     modes = cfg.arcs.split(",")
     cands: list[dict[str, Any]] = []
     for d, x in enumerate(demos):
+        held_idx = [k for k, j in enumerate(x["held"]) if j is not None]
+        if not held_idx:
+            continue
         tries, mine = 0, 0
         while mine < per_demo and tries < 10 * per_demo:
             tries += 1
-            held_idx = [k for k, j in enumerate(x["held"]) if j is not None]
             shift = None
             xd = x
             if cfg.focus:
