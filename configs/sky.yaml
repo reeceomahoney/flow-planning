@@ -11,6 +11,9 @@ envs:
   CUDA_VISIBLE_DEVICES: 1
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  ARM: detaug
+  ITERS: 20000
+  FREEZES: "true false"
 workdir: .
 
 setup: |
@@ -20,17 +23,32 @@ setup: |
 
 run: |
   export PATH="$HOME/.pixi/bin:$PATH"
+  SNAP=$(mktemp -d ~/snap.XXXXXX)
+  rsync -a --exclude .pixi --exclude outputs --exclude wandb ~/sky_workdir/ $SNAP/
+  ln -s ~/sky_workdir/.pixi $SNAP/.pixi; ln -s ~/sky_workdir/outputs $SNAP/outputs
+  cd $SNAP
+  grep -q cloud_points scripts/train.py || { echo "stale workdir"; exit 1; }
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
-  SUITE=safelibero_object
-  TASKS="0 1 2 3"
-  export TAG=aug8 COPIES=20 ITERS=40000 EPISODES=50
-  export AUG_ARGS="--focus true --orig_copies 5 --retarget 0.25 --retarget_place 0.12 --retarget_only 0.15"
-  run() { LEVELS="$1" bash scripts/pipeline_libero.sh $SUITE $T 2>&1 | grep -vE "it/s\]|Warning|WARNING|macro"; }
-  for T in $TASKS; do
-    echo "##### $SUITE task $T"
-    if [ "$SUITE $T" = "safelibero_goal 3" ]; then
-      run I; run II
-    else
-      run "I II"
-    fi
-  done
+  BASE=outputs/franka/2026-08-13/02-10-06
+  if [ "$ARM" = demogen ]; then
+    REPO=reece-omahoney/franka-demogen-pc
+    [ -d ~/.cache/huggingface/lerobot/$REPO ] || pixi run python scripts/augment.py \
+      --src_repo reece-omahoney/franka-src --dst_repo $REPO --demogen true 2>&1 | grep -vE "it/s|Warning"
+    TRAIN="--cond_dim 0 --cloud_points 256"; C="--cond cloud --n_cond 1"; FREE="--cond cloud"
+  else
+    REPO=reece-omahoney/franka-transit
+    TRAIN=""; C="--cond search --n_cond 8"; FREE="--cond zero"
+  fi
+  ev() { echo "##### $1"; shift; pixi run python scripts/eval.py --env.type franka --env.world_count 128 --episodes 1 \
+    --repo_id $REPO "$@" 2>&1 | grep -E "^overall|contacts|latched|cloud cond|pointcloud:|Error|Traceback|File \"/home/sky/snap"; }
+  for FREEZE in $FREEZES; do for N in 64 128 256 768; do
+    RUN=outputs/franka/ft/$ARM-f$FREEZE-n$N
+    echo "##### train $RUN"
+    [ -f $RUN/model.safetensors ] || pixi run python scripts/train.py --env.type franka --repo_id $REPO \
+      --init_from $BASE --freeze_backbone $FREEZE --episodes $N --num_iters $ITERS --eval_every 0 \
+      --run_dir $RUN $TRAIN 2>&1 | grep -vE "it/s|Warning"
+    ev "$RUN wall" --checkpoint $RUN --env.obstacle true $C
+    ev "$RUN bunny" --checkpoint $RUN --env.obstacle true --env.obstacle_mesh bunny $C
+    ev "$RUN free" --checkpoint $RUN --env.obstacle false $FREE
+  done; done
+  rm -rf $SNAP
