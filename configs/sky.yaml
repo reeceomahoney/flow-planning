@@ -13,7 +13,11 @@ envs:
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
   ARM: detaug
   ITERS: 20000
-  FREEZES: "true false"
+  SEEDS: "0 1 2"
+  AUGS: "16 32 64 128"
+  ORIG: 64
+  NCOND: 8
+  CSCALE: 1.0
 workdir: .
 
 setup: |
@@ -27,28 +31,29 @@ run: |
   rsync -a --exclude .pixi --exclude outputs --exclude wandb ~/sky_workdir/ $SNAP/
   ln -s ~/sky_workdir/.pixi $SNAP/.pixi; ln -s ~/sky_workdir/outputs $SNAP/outputs
   cd $SNAP
-  grep -q cloud_points scripts/train.py || { echo "stale workdir"; exit 1; }
+  grep -q aug_episodes scripts/train.py || { echo "stale workdir"; exit 1; }
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
   BASE=outputs/franka/2026-08-13/02-10-06
   if [ "$ARM" = demogen ]; then
     REPO=reece-omahoney/franka-demogen-pc
-    [ -d ~/.cache/huggingface/lerobot/$REPO ] || pixi run python scripts/augment.py \
-      --src_repo reece-omahoney/franka-src --dst_repo $REPO --demogen true 2>&1 | grep -vE "it/s|Warning"
     TRAIN="--cond_dim 0 --cloud_points 256"; C="--cond cloud --n_cond 1"; FREE="--cond cloud"
   else
     REPO=reece-omahoney/franka-transit
-    TRAIN=""; C="--cond search --n_cond 8"; FREE="--cond zero"
+    TRAIN=""; C="--cond search --n_cond $NCOND --cond_scale $CSCALE"; FREE="--cond zero"
   fi
   ev() { echo "##### $1"; shift; pixi run python scripts/eval.py --env.type franka --env.world_count 128 --episodes 1 \
-    --repo_id $REPO "$@" 2>&1 | grep -E "^overall|contacts|latched|cloud cond|pointcloud:|Error|Traceback|File \"/home/sky/snap"; }
-  for FREEZE in $FREEZES; do for N in 64 128 256 768; do
-    RUN=outputs/franka/ft/$ARM-f$FREEZE-n$N
+    --repo_id $REPO "$@" 2>&1 | grep -E "^overall|contacts|latched|cloud cond|Error|Traceback|File \"/home/sky/snap"; }
+  for SEED in $SEEDS; do for N in $AUGS; do
+    RUN=outputs/franka/ft2/$ARM-a$N-s$SEED
+    [ -f $RUN/evals.done ] && continue
     echo "##### train $RUN"
     [ -f $RUN/model.safetensors ] || pixi run python scripts/train.py --env.type franka --repo_id $REPO \
-      --init_from $BASE --freeze_backbone $FREEZE --episodes $N --num_iters $ITERS --eval_every 0 \
-      --run_dir $RUN $TRAIN 2>&1 | grep -vE "it/s|Warning"
-    ev "$RUN wall" --checkpoint $RUN --env.obstacle true $C
-    ev "$RUN bunny" --checkpoint $RUN --env.obstacle true --env.obstacle_mesh bunny $C
-    ev "$RUN free" --checkpoint $RUN --env.obstacle false $FREE
+      --init_from $BASE --freeze_backbone true --aug_episodes $N --orig_episodes $ORIG --seed $SEED \
+      --num_iters $ITERS --eval_every 0 --run_dir $RUN $TRAIN 2>&1 | grep -vE "it/s|Warning"
+    ev "$RUN wall" --checkpoint $RUN --seed $SEED --env.obstacle true $C
+    ev "$RUN wall-dy" --checkpoint $RUN --seed $SEED --env.obstacle true --env.obstacle_dy -0.08 $C
+    ev "$RUN wall-dx" --checkpoint $RUN --seed $SEED --env.obstacle true --env.obstacle_dx 0.1 $C
+    ev "$RUN free" --checkpoint $RUN --seed $SEED --env.obstacle false $FREE
+    touch $RUN/evals.done
   done; done
   rm -rf $SNAP
