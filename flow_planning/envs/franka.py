@@ -12,6 +12,7 @@ import newton.ik as ik
 import newton.solvers
 import newton.utils
 import numpy as np
+import trimesh
 import warp as wp
 
 from flow_planning.envs.contact import ObstacleContactSensor
@@ -64,6 +65,7 @@ class FrankaConfig(EnvConfig):
     obstacle_width: float = 0.15
     obstacle_thickness: float = 0.01
     contact_depth: float = 0.005  # penetration below this is a graze, not a failure
+    obstacle_mesh: str = ""  # "" = box wall; else a newton example asset, e.g. "bunny"
 
     # keep cube/goal at least this far from the wall plane (feasible instances);
     # 0 = unconstrained. Wall-adjacent grasps (<8cm) are physically infeasible.
@@ -71,6 +73,65 @@ class FrankaConfig(EnvConfig):
 
     goal_dim: int = 3  # goal xyz
     goal_state_start: int = 18  # cube pos block in the obs (9 joints + 3 EE + 6 rot6d)
+
+
+def camera_rays(target, res: int = 160, fov: float = 60.0):
+    eye = np.array([0.7, 0.2, 0.9], np.float32)
+    fwd = np.asarray(target, np.float32) - eye
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0.0, 0.0, 1.0])
+    right /= np.linalg.norm(right)
+    up = np.cross(right, fwd)
+    tanf = np.tan(np.radians(fov) / 2)
+    u, v = np.meshgrid(*[np.linspace(-tanf, tanf, res)] * 2)
+    dirs = fwd + u.reshape(-1, 1) * right + v.reshape(-1, 1) * up
+    return eye, dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
+
+
+def voxel_filter(pts, floor: float, voxel: float = 0.01):
+    pts = pts[pts[:, 2] > floor + 0.005]
+    _, idx = np.unique(
+        np.round(pts / voxel).astype(np.int64), axis=0, return_index=True
+    )
+    return pts[idx].astype(np.float32)
+
+
+def box_pointcloud(centers, halves, table_height: float, res: int = 160, fov=60.0):
+    centers, halves = np.asarray(centers, np.float32), np.asarray(halves, np.float32)
+    eye, dirs = camera_rays(centers[0], res, fov)
+    d = dirs[:, None, :]
+    with np.errstate(divide="ignore"):
+        t0 = (centers - halves - eye) / d
+        t1 = (centers + halves - eye) / d
+    tn = np.minimum(t0, t1).max(-1)
+    tf = np.maximum(t0, t1).min(-1)
+    tn[(tf < tn) | (tn <= 0)] = np.inf
+    t = tn.min(1)
+    return voxel_filter((eye + dirs * t[:, None])[np.isfinite(t)], table_height)
+
+
+def subsample_cloud(pts, n: int, rng) -> np.ndarray:
+    out = np.zeros((n, 3), np.float32)
+    if len(pts):
+        out[:] = pts[rng.choice(len(pts), n, replace=len(pts) < n)]
+    return out
+
+
+def load_obstacle_mesh(name: str, height: float) -> trimesh.Trimesh:
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.Open(f"{newton.__path__[0]}/examples/assets/{name}.usd")
+    prim = next(p for p in stage.Traverse() if p.IsA(UsdGeom.Mesh))
+    geom = UsdGeom.Mesh(prim)
+    v = np.array(geom.GetPointsAttr().Get(), np.float64)
+    f = np.array(geom.GetFaceVertexIndicesAttr().Get(), np.int64).reshape(-1, 3)
+    if UsdGeom.GetStageUpAxis(stage) == "Y":
+        v = v[:, [0, 2, 1]] * [1.0, -1.0, 1.0]
+    lo, hi = v.min(0), v.max(0)
+    v = (v - [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), lo[2]]) * (
+        height / (hi[2] - lo[2])
+    )
+    return trimesh.Trimesh(v, f, process=False)
 
 
 @wp.kernel(enable_backward=False)
@@ -173,6 +234,13 @@ class FrankaEnv:
         self.obstacle_center = wp.vec3(
             top[0], top[1], top[2] + 0.5 * cfg.obstacle_height
         )
+        self.obstacle_mesh = None
+        self.obstacle_half_y = cfg.obstacle_thickness
+        if cfg.obstacle and cfg.obstacle_mesh:
+            m = load_obstacle_mesh(cfg.obstacle_mesh, cfg.obstacle_height)
+            m.apply_translation([top[0], top[1], top[2]])
+            self.obstacle_mesh = m
+            self.obstacle_half_y = 0.5 * float(m.extents[1])
 
         franka = self.build_franka_with_table()
         self.robot_body_count = franka.body_count
@@ -278,7 +346,20 @@ class FrankaEnv:
             xform=wp.transform(self.table_pos, wp.quat_identity()),
             cfg=shape_cfg,
         )
-        if self.cfg.obstacle:
+        if self.obstacle_mesh is not None:
+            m = self.obstacle_mesh
+            builder.add_shape_mesh(
+                body=-1,
+                mesh=newton.Mesh(
+                    m.vertices.astype(np.float32),
+                    m.faces.astype(np.int32).flatten(),
+                    compute_inertia=False,
+                ),
+                cfg=shape_cfg,
+                label="obstacle",
+                color=[0.5, 0.5, 0.5],
+            )
+        elif self.cfg.obstacle:
             builder.add_shape_box(
                 body=-1,
                 hx=self.cfg.obstacle_width,
@@ -377,7 +458,11 @@ class FrankaEnv:
         pos = np.tile(center, (n, 1)).astype(np.float32)
         pos[:, 0] += self.rng.uniform(-self.cfg.jitter, self.cfg.jitter, n)
         pos[:, 1] += self.rng.uniform(-self.cfg.jitter, self.cfg.jitter, n)
-        m = self.cfg.sample_wall_margin
+        m = (
+            self.cfg.sample_wall_margin
+            + self.obstacle_half_y
+            - self.cfg.obstacle_thickness
+        )
         if m > 0 and self.cfg.obstacle:
             wall_y = self.obstacle_center[1]
             if center[1] > wall_y:  # cube side
@@ -585,6 +670,12 @@ class FrankaEnv:
     @property
     def obstacle_geometry(self):
         """Obstacle box [center(3), half_extents(3)] for the plan selector."""
+        if self.obstacle_mesh is not None:
+            lo, hi = self.obstacle_mesh.bounds
+            return {
+                "center": (0.5 * (lo + hi)).tolist(),
+                "half_extents": (0.5 * (hi - lo)).tolist(),
+            }
         return {
             "center": list(self.obstacle_center),
             "half_extents": [
@@ -594,37 +685,22 @@ class FrankaEnv:
             ],
         }
 
-    def scene_pointcloud(self, res: int = 160, fov: float = 60.0, voxel: float = 0.01):
+    def scene_pointcloud(self, res: int = 160, fov: float = 60.0):
         g = self.obstacle_geometry
-        centers = np.array([g["center"], list(self.table_pos)], np.float32)
-        halves = np.array(
-            [g["half_extents"], [0.4, 0.4, 0.5 * self.cfg.table_height]], np.float32
+        if self.obstacle_mesh is None:
+            table = [list(self.table_pos)], [[0.4, 0.4, 0.5 * self.cfg.table_height]]
+            return box_pointcloud(
+                [g["center"], *table[0]],
+                [g["half_extents"], *table[1]],
+                self.cfg.table_height,
+                res,
+                fov,
+            )
+        eye, dirs = camera_rays(g["center"], res, fov)
+        pts, _, _ = self.obstacle_mesh.ray.intersects_location(
+            np.tile(eye, (len(dirs), 1)), dirs, multiple_hits=False
         )
-        eye = np.array([0.7, 0.2, 0.9], np.float32)
-        fwd = centers[0] - eye
-        fwd /= np.linalg.norm(fwd)
-        right = np.cross(fwd, [0.0, 0.0, 1.0])
-        right /= np.linalg.norm(right)
-        up = np.cross(right, fwd)
-        tanf = np.tan(np.radians(fov) / 2)
-        u, v = np.meshgrid(*[np.linspace(-tanf, tanf, res)] * 2)
-        dirs = fwd + u.reshape(-1, 1) * right + v.reshape(-1, 1) * up
-        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
-        d = dirs[:, None, :]
-        with np.errstate(divide="ignore"):
-            t0 = (centers - halves - eye) / d
-            t1 = (centers + halves - eye) / d
-        tn = np.minimum(t0, t1).max(-1)
-        tf = np.maximum(t0, t1).min(-1)
-        tn[(tf < tn) | (tn <= 0)] = np.inf
-        t = tn.min(1)
-        pts = eye + dirs * t[:, None]
-        pts = pts[np.isfinite(t)]
-        pts = pts[pts[:, 2] > self.cfg.table_height + 0.005]
-        _, idx = np.unique(
-            np.round(pts / voxel).astype(np.int64), axis=0, return_index=True
-        )
-        return pts[idx].astype(np.float32)
+        return voxel_filter(pts, self.cfg.table_height)
 
     # --------------------------------------------------------------- render
     def render(self):
