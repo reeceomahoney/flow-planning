@@ -51,7 +51,6 @@ class Config:
     phi_range: tuple[float, float] = (0.15, 0.85)
     n_phi: int = 3
     n_theta: int = 4
-    yaws: list[float] = field(default_factory=lambda: [0.0])
     stop_on_collision: bool = True
     seed: int = 0
     top_k: int = 4
@@ -368,8 +367,7 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
 
 def fmt(combo):
     return " ".join(
-        f"[{pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} y{np.degrees(psi):+.0f}]"
-        for pa, ta, pt, tt, psi in combo
+        f"[{pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f}]" for pa, ta, pt, tt in combo
     )
 
 
@@ -423,7 +421,7 @@ def scene_candidates(cfg, demos, names, geo, tshift):
         combos = [tuple([ZERO] * n)]
         for k in range(n):
             for opt in (
-                seg_options(rng, cfg.phi_range, cfg.n_phi, cfg.n_theta, cfg.yaws)
+                seg_options(rng, cfg.phi_range, cfg.n_phi, cfg.n_theta)
                 if x["held"][k] is not None
                 else [ZERO]
             ):

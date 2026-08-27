@@ -51,7 +51,6 @@ class Config:
 
     phi_range: tuple[float, float] = (0.15, 0.85)
     n_theta: int = 4
-    yaw_max: float = 0.0
     focus: bool = False
     orig_copies: int = 1
     retarget: float = 0.0
@@ -179,19 +178,14 @@ def libero_demos(cfg, env, chain, base, limit):
 def sample_option(cfg, rng):
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
     phi = lambda: float(rng.uniform(*cfg.phi_range))  # noqa: E731
-    psi = (
-        np.radians(rng.uniform(-cfg.yaw_max, cfg.yaw_max))
-        if rng.random() < 0.5
-        else 0.0
-    )
     if cfg.focus:
         half_pi = np.pi / 2
         app = (phi(), [0.0, 3 * np.pi / 4, half_pi][rng.integers(3)])
         tr = (phi(), half_pi) if rng.random() < 0.5 else (0.0, 0.0)
-        return (*app, *tr, psi)
+        return (*app, *tr)
     app = (phi(), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
     tr = (phi(), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
-    return (*app, *tr, psi)
+    return (*app, *tr)
 
 
 def libero_candidates(cfg, demos, rng, per_demo):
