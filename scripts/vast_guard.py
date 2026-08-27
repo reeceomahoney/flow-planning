@@ -2,7 +2,7 @@ import sys
 
 from vastai import VastAI
 
-MAX_DPH = 0.6
+MAX_DPH = 1.0
 GPU = "RTX 5090"
 
 rows = VastAI().show_instances()
