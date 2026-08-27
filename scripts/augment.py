@@ -26,6 +26,7 @@ from flow_planning.bend import (
     held_object,
     solve_seq,
     tpad,
+    track_delta,
     transit_segments,
 )
 from flow_planning.envs import EnvConfig, FrankaConfig
@@ -51,8 +52,6 @@ class Config:
 
     phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
     n_theta: int = 4
-    alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
-    arcs: str = "additive,replace"
     focus: bool = False
     orig_copies: int = 1
     retarget: float = 0.0
@@ -71,6 +70,13 @@ class Config:
     outside_margin: float = 0.08
     arm_margin: float = 0.01
 
+    track: bool = False
+    track_tau: float = 0.25
+    track_desc: float = 0.6
+    track_h: tuple[float, float] = (0.05, 0.35)
+    track_switches: int = 2
+    track_zero: float = 0.3
+
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 ALPHAS = np.linspace(0.0, 0.98, 25)
@@ -87,11 +93,12 @@ def held_block(obs, close, opened, n_obj) -> slice:
 
 
 def write(dst, obs, act, bend, task="pick_place", wall=None):
+    bend = np.broadcast_to(np.asarray(bend, np.float32), (len(obs), np.shape(bend)[-1]))
     for f in range(len(obs)):
         frame = {
             "observation.state": obs[f],
             "action": act[f],
-            "bend": bend.astype(np.float32),
+            "bend": bend[f].copy(),
             "task": task,
         }
         if wall is not None:
@@ -162,7 +169,6 @@ def libero_demos(cfg, env, chain, base, limit):
                 ee=ee,
                 quat=quat,
                 half=half,
-                dyaw=[0.0] * len(segs),
                 dbs=[np.zeros(3)] * len(segs),
                 dps=[np.zeros(3)] * len(segs),
                 ends=[np.zeros(3)] * len(segs),
@@ -175,25 +181,20 @@ def sample_option(cfg, rng):
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
     if cfg.focus:
         half_pi = np.pi / 2
-        a = 0.0 if rng.random() < 1 / 3 else rng.choice([90.0, 270.0])
         app = [(0.75, 0.0), (0.75, 3 * np.pi / 4), (0.5, half_pi)][rng.integers(3)]
-        tr = (0.5, half_pi, 0.0) if rng.random() < 0.5 else (0.0, 0.0, 0.0)
-        dz = rng.choice([0.0, 0.15])
-        return (a, *app, *tr, dz) if dz else (a, *app, *tr)
-    a = rng.choice(cfg.alphas[1:]) if rng.random() < 0.5 else 0.0
+        tr = (0.5, half_pi) if rng.random() < 0.5 else (0.0, 0.0)
+        return (*app, *tr)
     app = (
         (rng.choice(cfg.phis), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
     )
-    if rng.random() < 0.5:
-        tr = (rng.choice(cfg.phis), rng.choice(thetas), float(rng.integers(2)))
-    else:
-        tr = (0.0, 0.0, 0.0)
-    return (a, *app, *tr)
+    tr = (
+        (rng.choice(cfg.phis), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
+    )
+    return (*app, *tr)
 
 
 def libero_candidates(cfg, demos, rng, per_demo):
     m = round(cfg.bend_margin * cfg.env.fps)
-    modes = cfg.arcs.split(",")
     cands: list[dict[str, Any]] = []
     for d, x in enumerate(demos):
         held_idx = [k for k, j in enumerate(x["held"]) if j is not None]
@@ -230,7 +231,7 @@ def libero_candidates(cfg, demos, rng, per_demo):
                 )
             if shift is None and all(o == SEG_ZERO for o in combo):
                 continue
-            c = build(xd, combo, m, modes)
+            c = build(xd, combo, m)
             if c is not None:
                 c["d"] = d
                 c["shift"] = shift
@@ -380,6 +381,22 @@ def plan_wall_bend(x, rng, cfg, margin):
                     phi = phis[k]
                 return (center, half), np.array([h, w], np.float32), phi, theta
     return None
+
+
+def sample_track(x, rng, cfg, margin):
+    s0, s1 = x["close"] + margin, x["opened"] - margin
+    tau, desc = cfg.track_tau * cfg.env.fps, cfg.track_desc * cfg.env.fps
+    lo, hi = int(s0 + 2 * tau), int(s1 - desc - 2 * tau)
+    k = int(rng.integers(cfg.track_switches + 1)) if hi > lo else 0
+    switches = sorted(rng.integers(lo, hi, k).tolist())
+    targets = []
+    for j in range(k + 1):
+        if j and rng.random() < cfg.track_zero:
+            targets.append(np.zeros(2))
+        else:
+            h, th = rng.uniform(*cfg.track_h), rng.uniform(0.0, np.pi)
+            targets.append(h * np.array([np.cos(th), np.sin(th)]))
+    return track_delta(x["obs"][:, EE], s0, s1, targets, switches, tau, desc)
 
 
 def smooth(a, alpha):
@@ -676,17 +693,20 @@ def main(cfg: Config):
                 continue
         else:
             active = pending
-            phis = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max, len(active))
-            thetas = rng.uniform(0.0, np.pi, len(active))
-            for x, phi, theta in zip(active, phis, thetas):
-                d = bend_delta(
-                    x["obs"][:, EE],
-                    x["close"] + margin,
-                    x["opened"] - margin,
-                    phi,
-                    theta,
-                )
-                x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
+            for x in active:
+                if cfg.track:
+                    d, x["label"] = sample_track(x, rng, cfg, margin)
+                else:
+                    phi = np.pi * rng.uniform(cfg.bend_min, cfg.bend_max)
+                    theta = rng.uniform(0.0, np.pi)
+                    d = bend_delta(
+                        x["obs"][:, EE],
+                        x["close"] + margin,
+                        x["opened"] - margin,
+                        phi,
+                        theta,
+                    )
+                    x["label"] = phi * np.array([np.cos(theta), np.sin(theta)])
                 x["ee_t"] = x["ee"] + d
                 x["bent"] = np.linalg.norm(d, axis=1) > 1e-6
 

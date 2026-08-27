@@ -14,6 +14,7 @@ envs:
   MUJOCO_GL: egl
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  ITERS: 75000
 workdir: .
 
 setup: |
@@ -24,17 +25,30 @@ setup: |
 
 run: |
   export PATH="$HOME/.pixi/bin:$PATH"
+  SNAP=~/snap_$SKYPILOT_TASK_ID; mkdir -p $SNAP
+  rsync -a --exclude .pixi --exclude outputs --exclude wandb ~/sky_workdir/ $SNAP/
+  ln -s ~/sky_workdir/.pixi $SNAP/.pixi; mkdir -p ~/sky_workdir/outputs; ln -s ~/sky_workdir/outputs $SNAP/outputs
+  cd $SNAP
+  grep -q track_delta scripts/augment.py || { echo "stale workdir"; exit 1; }
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
-  SUITE=safelibero_object
-  TASKS="0"
-  export TAG=aug8 COPIES=20 ITERS=40000 EPISODES=50
-  export AUG_ARGS="--focus true --orig_copies 5 --retarget 0.25 --retarget_place 0.12 --retarget_only 0.15"
-  run() { LEVELS="$1" bash scripts/pipeline_libero.sh $SUITE $T 2>&1 | grep --line-buffered -vE "it/s\]|Warning|WARNING|macro"; }
-  for T in $TASKS; do
-    echo "##### $SUITE task $T"
-    if [ "$SUITE $T" = "safelibero_goal 3" ]; then
-      run I; run II
-    else
-      run "I II"
-    fi
+  CACHE=~/.cache/huggingface/lerobot/reece-omahoney
+  q() { "$@" 2>&1 | grep --line-buffered -vE "it/s|Warning|examples/s"; }
+  grep -q '"total_episodes": 768' $CACHE/franka-src/meta/info.json 2>/dev/null || { rm -rf $CACHE/franka-src; \
+    q pixi run python scripts/record.py --env.type franka --env.world_count 256 --episodes 768 --repo_id reece-omahoney/franka-src; }
+  [ -d $CACHE/franka-track ] || q pixi run python scripts/augment.py \
+    --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka-track --copies 6 --track true
+  [ -d $CACHE/franka-transit ] || q pixi run python scripts/augment.py \
+    --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka-transit --copies 2
+  ev() { echo "##### $1"; shift; pixi run python scripts/eval.py --env.type franka --env.world_count 128 --episodes 1 \
+    "$@" 2>&1 | grep -E "^overall|contacts|latched|Error|Traceback|File \"/home"; }
+  for D in track transit; do
+    RUN=outputs/franka/track$ITERS/$D
+    echo "##### train $RUN"
+    [ -f $RUN/model.safetensors ] || q pixi run python scripts/train.py --env.type franka \
+      --repo_id reece-omahoney/franka-$D --num_iters $ITERS --run_dir $RUN \
+      --eval_every 10000 --eval_episodes 128 --env.obstacle true --eval_search 8
+    ev "$D wall hold" --repo_id reece-omahoney/franka-$D --checkpoint $RUN --env.obstacle true --cond search --n_cond 8 --hold_tol 0
+    ev "$D wall latch" --repo_id reece-omahoney/franka-$D --checkpoint $RUN --env.obstacle true --cond search --n_cond 8
+    ev "$D free" --repo_id reece-omahoney/franka-$D --checkpoint $RUN --env.obstacle false --cond zero
   done
+  rm -rf $SNAP

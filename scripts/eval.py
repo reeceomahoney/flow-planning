@@ -24,6 +24,11 @@ from flow_planning.policy import (
 from flow_planning.selector import AnalyticSelector
 from flow_planning.utils import hf_column, latest_run_dir, make_viewer
 
+np.set_printoptions(linewidth=100000)
+
+
+np.set_printoptions(linewidth=100000)
+
 
 class Cond(enum.StrEnum):
     NULL = "null"  # the learned CFG null token
@@ -55,6 +60,9 @@ class Config:
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
     gap: bool = False  # print per-episode plan vs executed min obstacle clearance
     guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
+    hold_tol: float = (
+        -1.0
+    )  # search: <0 latch the first pick; else re-search once held score > tol
 
 
 def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
@@ -185,6 +193,7 @@ def main(cfg: Config):
             assert policy.selector_fn is not None, "search needs --env.obstacle"
             cand = sample_cond(bend, cfg.n_cond, rng, device)
             policy.cond_candidates = cand
+            policy.hold_tol = None if cfg.hold_tol < 0 else cfg.hold_tol
             policy.n_samples = cfg.n_cond
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
 
@@ -225,6 +234,9 @@ def main(cfg: Config):
             exec_min = torch.full((n,), torch.inf, device=device)
             plan_min = torch.full((n,), torch.inf, device=device)
             last_plan_id = 0
+            dirty_all = torch.zeros(n, device=device)
+            dirty_pick = torch.zeros(n, device=device)
+            n_plans = 0
 
             def clear_min(q):
                 b, t = q.shape[:2]
@@ -254,6 +266,16 @@ def main(cfg: Config):
                             act_mean[:7], dtype=torch.float32, device=device
                         )
                         plan_min = torch.minimum(plan_min, clear_min(qp))
+                        if (
+                            policy.last_scores is not None
+                            and policy.latched_idx is not None
+                        ):
+                            sc = policy.last_scores
+                            dirty_all += sc.amin(1) > 0
+                            dirty_pick += (
+                                sc.gather(1, policy.latched_idx[:, None])[:, 0] > 0
+                            )
+                            n_plans += 1
                 if live and policy.last_chunk is not None:
                     chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
                     if arm:
@@ -298,8 +320,18 @@ def main(cfg: Config):
         if cfg.gap and sel is not None:
             print(
                 f"gap: plan min clearance {plan_min.cpu().numpy().round(3)} "
-                f"exec {exec_min.cpu().numpy().round(3)} fail {fail.astype(int)}"
+                f"exec {exec_min.cpu().numpy().round(3)} fail {fail.astype(int)} "
+                f"timeout {stuck.astype(int)}"
             )
+            print(
+                f"replans {n_plans}: no clean candidate "
+                f"{dirty_all.int().cpu().numpy()} "
+                f"picked dirty {dirty_pick.int().cpu().numpy()}"
+            )
+            if hasattr(env, "contact_labels"):
+                print(
+                    "timeout contacts:", Counter(env.contact_labels()[stuck].tolist())
+                )
         if hasattr(env, "contact_labels") and fail.any():
             contacts.update(env.contact_labels()[fail].tolist())
         if stages is not None:

@@ -60,6 +60,36 @@ def bend_delta(ee, s0, s1, phi, theta):
     return d
 
 
+def smoothstep(u):
+    u = np.clip(u, 0.0, 1.0)
+    return u * u * (3.0 - 2.0 * u)
+
+
+def track_delta(ee, s0, s1, targets, switches, tau, desc):
+    d = np.zeros_like(ee)
+    label = np.zeros((len(ee), 2), np.float32)
+    if s1 - s0 < 4:
+        return d, label
+    up = np.array([0.0, 0.0, 1.0])
+    chord = ee[s1 - 1] - ee[s0]
+    chord = chord / np.linalg.norm(chord)
+    vert = up - chord[2] * chord
+    vert /= np.linalg.norm(vert)
+    basis = np.stack([np.cross(chord, vert), vert])
+    bounds = [s0, *switches, s1]
+    for k, t in enumerate(targets):
+        label[bounds[k] : bounds[k + 1]] = t
+    o = v = np.zeros(3)
+    for i in range(s0, s1):
+        a = (label[i] @ basis - o) / tau**2 - 2.0 * v / tau
+        v = v + a
+        o = o + v
+        d[i] = o
+    env = smoothstep((s1 - 1 - np.arange(s0, s1)) / desc)
+    d[s0:s1] *= env[:, None]
+    return d, label
+
+
 def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
     th = torch.as_tensor(np.asarray(q), dtype=torch.float32, device=chain.device)
     m = chain.forward_kinematics(th).get_matrix()
@@ -112,8 +142,8 @@ def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
 
 
 OBJ0 = 18
-SEG_ZERO = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-LABEL_DIM = 8
+SEG_ZERO = (0.0, 0.0, 0.0, 0.0)
+LABEL_DIM = 4
 
 
 def obj_slice(k):
@@ -129,19 +159,6 @@ def held_object(obs, close, opened, n_obj):
         if err < best_err and np.linalg.norm(p[-1]) > 0.02:
             best, best_err = k, err
     return best
-
-
-def wrap(a):
-    return (a + np.pi) % (2 * np.pi) - np.pi
-
-
-def rotz(a):
-    c, s = np.cos(a), np.sin(a)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def yaw_of_rot6d(r6):
-    return float(np.arctan2(r6[1], r6[0]))
 
 
 def yaw_of_quat(q):
@@ -168,103 +185,33 @@ def shift_path(T, segs, m, dbs, dps):
     return np.stack([np.interp(t, k, v[:, j]) for j in range(3)], axis=1)
 
 
-def bulge_delta(ee, s0, s1, phi, theta, mode="additive"):
+def bulge_delta(ee, s0, s1, phi, theta):
     d = bend_delta(ee, s0, s1, phi, theta)
-    if d.any() and mode == "additive":
+    if d.any():
         d[s0:s1] += ee[s0:s1] - np.linspace(ee[s0], ee[s1 - 1], s1 - s0)
     return d
 
 
-def descend_delta(ee, s0, s1, h):
-    d = np.zeros_like(ee)
-    n = s1 - s0
-    if h < 1e-3 or n < 4:
-        return d
-    s = np.linspace(0.0, 1.0, n)
-    d[s0:s1, 2] = h * np.sin(np.pi * s**2.5)
-    return d
-
-
-def grasp_rotation(ee, quat, w0, close, opened, w1, m, centre, alpha):
-    from scipy.spatial.transform import Rotation as R
-
-    T = len(ee)
-    a1 = max(close - m, w0 + 1)
-    centre = np.array([centre[0], centre[1], 0.0])
-    oh = ee[close] - centre
-    oh[2] = 0.0
-    t = np.arange(T)
-    ramp = np.clip((t - w0) / (a1 - w0), 0.0, 1.0)
-    if w1 is not None:
-        decay = np.clip(1 - (t - opened) / max(w1 - opened, 1), 0.0, 1.0)
-        ramp = np.where(t > opened, decay, ramp)
-    new_ee = ee.copy()
-    off = rotz(alpha) @ oh - oh
-    for i in range(w0, T):
-        if i < a1:
-            new_ee[i] = centre + rotz(ramp[i] * alpha) @ (ee[i] - centre)
-        else:
-            new_ee[i] = ee[i] + ramp[i] * off
-    yaw = wrap(alpha)
-    if np.isclose(abs(yaw), np.pi):
-        yaw = -np.pi
-    rot = R.from_euler("z", (ramp * yaw)[:, None]) * R.from_quat(quat)
-    assert isinstance(rot, R)
-    return new_ee, rot.as_quat().astype(np.float32)
-
-
-def grasp_width(x, k, a_eff):
-    from scipy.spatial.transform import Rotation as R
-
-    c = x["segs"][k][0]
-    ax = R.from_quat(x["quat"][c]).as_matrix()[:2, 1]
-    ax = rotz(a_eff)[:2, :2] @ ax
-    return 2 * float(np.abs(ax) @ x["half"][k])
-
-
-def seg_options(alphas, phis, n_theta, modes, descents=(0.0,)):
+def seg_options(phis, n_theta):
     thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
     arcs = [(0.0, 0.0)] + [(p, th) for p in phis for th in thetas]
-    transit = [(0.0, 0.0, 0.0)] + [
-        (p, th, float(i)) for i, _ in enumerate(modes) for p in phis for th in thetas
-    ]
-    return [
-        (a, *ap, *tr) if dz == 0.0 else (a, *ap, *tr, dz)
-        for a in alphas
-        for ap in arcs
-        for tr in transit
-        for dz in descents
-    ]
+    return [(*ap, *tr) for ap in arcs for tr in arcs]
 
 
 def encode_label(combo, n_seg):
     out = np.zeros(LABEL_DIM * n_seg, np.float32)
-    for k, (a, pa, ta, pt, tt, md, *rest) in enumerate(combo[:n_seg]):
-        r = np.radians(a)
+    for k, (pa, ta, pt, tt) in enumerate(combo[:n_seg]):
         out[LABEL_DIM * k : LABEL_DIM * (k + 1)] = [
-            np.sin(r),
-            1 - np.cos(r),
             pa * np.cos(ta),
             pa * np.sin(ta),
             pt * np.cos(tt),
             pt * np.sin(tt),
-            md,
-            rest[0] if rest else 0.0,
         ]
     return out
 
 
-def build(x, combo, m, modes):
-    """x: demo dict (segs, held, obs, ee, quat, dyaw, half, dbs, dps, ends).
-
-    Returns None if a rotation widens the grasp beyond the demo's."""
+def build(x, combo, m):
     segs = x["segs"]
-    for k, (a, *_) in enumerate(combo):
-        if x["held"][k] is None:
-            continue
-        a_eff = wrap(np.radians(a) + x["dyaw"][k])
-        if grasp_width(x, k, a_eff) > grasp_width(x, k, x["dyaw"][k]) + 0.01:
-            return None
     ee, quat = x["ee"].copy(), x["quat"].copy()
     objs = [
         x["obs"][:, obj_slice(j)].copy() if j is not None else None for j in x["held"]
@@ -275,23 +222,12 @@ def build(x, combo, m, modes):
     expected = [
         e + d for e, d, j in zip(x["ends"], x["dps"], x["held"]) if j is not None
     ]
-    for k, ((c, o), (a, pa, ta, pt, tt, mode, *rest)) in enumerate(zip(segs, combo)):
-        dz = rest[0] if rest else 0.0
-        a_eff = wrap(np.radians(a) + x["dyaw"][k]) if x["held"][k] is not None else 0.0
-        if abs(a_eff) > 1e-3:
-            centre = x["obs"][0, obj_slice(x["held"][k])]
-            w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
-            ee, quat = grasp_rotation(ee, quat, w0, c, o, w1, m, centre, a_eff)
-        if a:
-            fam.add("rot")
+    for k, ((c, o), (pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
         if pa:
             ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
             fam.add("app")
-        if dz:
-            ee = ee + descend_delta(ee, w0 + m if k else 1, c, dz)
-            fam.add("desc")
         if pt:
-            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt, modes[int(mode)])
+            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt)
             ee = ee + d
             objs[k] = objs[k] + d
             fam.add("tra")
