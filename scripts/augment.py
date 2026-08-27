@@ -22,8 +22,7 @@ from flow_planning.bend import (
     carry_segment,
     encode_label,
     fk,
-    grasp_segments,
-    held_object,
+    held_segments,
     solve_seq,
     tpad,
     track_delta,
@@ -150,8 +149,7 @@ def libero_demos(cfg, env, chain, base, limit):
     demos: list[dict[str, Any]] = []
     for k in tqdm(keys[: limit or len(keys)], desc="demos"):
         obs, act = demo_to_episode(env, f["data"][k])
-        segs = grasp_segments(act[:, 7])
-        held = [held_object(obs, c, o, len(names)) for c, o in segs]
+        segs, held = held_segments(obs, act[:, 7], len(names))
         ee, quat = fk(chain, act[:, ARM], base)
         env.set_state(0, f["data"][k]["states"][0])
         half = [

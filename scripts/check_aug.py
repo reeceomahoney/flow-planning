@@ -17,8 +17,7 @@ from flow_planning.bend import (
     SEG_ZERO,
     build,
     fk,
-    grasp_segments,
-    held_object,
+    held_segments,
     obj_slice,
     seg_options,
     solve_seq,
@@ -227,8 +226,7 @@ def load_demos(cfg, free_env, goals):
     demos: list[dict[str, Any]] = []
     for k in keys[: cfg.n_demos]:
         obs, act = demo_to_episode(free_env, f["data"][k])
-        segs = grasp_segments(act[:, 7])
-        held = [held_object(obs, c, o, len(names)) for c, o in segs]
+        segs, held = held_segments(obs, act[:, 7], len(names))
         targets = [
             target_name(goals, names, sites, names[j]) if j is not None else None
             for j in held

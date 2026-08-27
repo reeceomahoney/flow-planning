@@ -150,6 +150,13 @@ def obj_slice(k):
     return slice(OBJ0 + 9 * k, OBJ0 + 9 * k + 3)
 
 
+def held_segments(obs, gripper, n_obj):
+    segs = grasp_segments(gripper)
+    held = [held_object(obs, c, o, n_obj) for c, o in segs]
+    keep = [(s, j) for s, j in zip(segs, held) if j is not None]
+    return [s for s, _ in keep], [j for _, j in keep]
+
+
 def held_object(obs, close, opened, n_obj):
     ee = obs[close:opened, EE] - obs[close, EE]
     best, best_err = None, 0.05
