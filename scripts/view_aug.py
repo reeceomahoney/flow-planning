@@ -100,8 +100,8 @@ def main(cfg: ViewConfig):
             if c["d"] != d or not c["ok"] or shown >= cfg.per_demo:
                 continue
             label = " ".join(
-                f"app{pa:.2f}/{ta:.1f} tr{pt:.2f}/{tt:.1f}"
-                for pa, ta, pt, tt in c["combo"]
+                f"app{pa:.2f}/{ta:.1f} tr{pt:.2f}/{tt:.1f} y{np.degrees(psi):+.0f}"
+                for pa, ta, pt, tt, psi in c["combo"]
             )
             succ = record(env, cfg, x, c, Path(f"demo{d} {label}"), writer)
             print(f"demo {d} [{label}] success={succ}")

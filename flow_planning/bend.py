@@ -142,8 +142,8 @@ def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
 
 
 OBJ0 = 18
-SEG_ZERO = (0.0, 0.0, 0.0, 0.0)
-LABEL_DIM = 4
+SEG_ZERO = (0.0, 0.0, 0.0, 0.0, 0.0)
+LABEL_DIM = 5
 
 
 def obj_slice(k):
@@ -199,24 +199,39 @@ def bulge_delta(ee, s0, s1, phi, theta):
     return d
 
 
-def seg_options(rng, phi_range, n_phi, n_theta):
+def seg_options(rng, phi_range, n_phi, n_theta, yaws=(0.0,)):
     thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
     arcs = [(0.0, 0.0)] + [
         (float(rng.uniform(*phi_range)), th) for th in thetas for _ in range(n_phi)
     ]
-    return [(*ap, *tr) for ap in arcs for tr in arcs]
+    return [(*ap, *tr, np.radians(y)) for ap in arcs for tr in arcs for y in yaws]
 
 
 def encode_label(combo, n_seg):
     out = np.zeros(LABEL_DIM * n_seg, np.float32)
-    for k, (pa, ta, pt, tt) in enumerate(combo[:n_seg]):
+    for k, (pa, ta, pt, tt, psi) in enumerate(combo[:n_seg]):
         out[LABEL_DIM * k : LABEL_DIM * (k + 1)] = [
             pa * np.cos(ta),
             pa * np.sin(ta),
             pt * np.cos(tt),
             pt * np.sin(tt),
+            psi,
         ]
     return out
+
+
+def yaw_quat(quat, w0, close, opened, w1, m, psi):
+    from scipy.spatial.transform import Rotation as R
+
+    t = np.arange(len(quat))
+    a1 = max(close - m, w0 + 1)
+    ramp = np.clip((t - w0) / (a1 - w0), 0.0, 1.0)
+    if w1 is not None:
+        decay = np.clip(1 - (t - opened) / max(w1 - opened, 1), 0.0, 1.0)
+        ramp = np.where(t > opened, decay, ramp)
+    rot = R.from_euler("z", (ramp * psi)[:, None]) * R.from_quat(quat)
+    assert isinstance(rot, R)
+    return rot.as_quat().astype(np.float32)
 
 
 def build(x, combo, m):
@@ -231,7 +246,11 @@ def build(x, combo, m):
     expected = [
         e + d for e, d, j in zip(x["ends"], x["dps"], x["held"]) if j is not None
     ]
-    for k, ((c, o), (pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
+    for k, ((c, o), (pa, ta, pt, tt, psi)) in enumerate(zip(segs, combo)):
+        if psi:
+            w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
+            quat = yaw_quat(quat, w0, c, o, w1, m, psi)
+            fam.add("yaw")
         if pa:
             ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
             fam.add("app")
