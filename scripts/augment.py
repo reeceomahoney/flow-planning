@@ -49,7 +49,7 @@ class Config:
     seed: int = 0
     env: EnvConfig = field(default_factory=FrankaConfig)  # table geometry only
 
-    phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
+    phi_range: tuple[float, float] = (0.15, 0.85)
     n_theta: int = 4
     focus: bool = False
     orig_copies: int = 1
@@ -177,17 +177,14 @@ def libero_demos(cfg, env, chain, base, limit):
 
 def sample_option(cfg, rng):
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
+    phi = lambda: float(rng.uniform(*cfg.phi_range))  # noqa: E731
     if cfg.focus:
         half_pi = np.pi / 2
-        app = [(0.75, 0.0), (0.75, 3 * np.pi / 4), (0.5, half_pi)][rng.integers(3)]
-        tr = (0.5, half_pi) if rng.random() < 0.5 else (0.0, 0.0)
+        app = (phi(), [0.0, 3 * np.pi / 4, half_pi][rng.integers(3)])
+        tr = (phi(), half_pi) if rng.random() < 0.5 else (0.0, 0.0)
         return (*app, *tr)
-    app = (
-        (rng.choice(cfg.phis), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
-    )
-    tr = (
-        (rng.choice(cfg.phis), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
-    )
+    app = (phi(), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
+    tr = (phi(), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
     return (*app, *tr)
 
 

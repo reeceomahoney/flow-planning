@@ -199,9 +199,11 @@ def bulge_delta(ee, s0, s1, phi, theta):
     return d
 
 
-def seg_options(phis, n_theta):
+def seg_options(rng, phi_range, n_phi, n_theta):
     thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
-    arcs = [(0.0, 0.0)] + [(p, th) for p in phis for th in thetas]
+    arcs = [(0.0, 0.0)] + [
+        (float(rng.uniform(*phi_range)), th) for th in thetas for _ in range(n_phi)
+    ]
     return [(*ap, *tr) for ap in arcs for tr in arcs]
 
 

@@ -48,8 +48,10 @@ class Config:
     init_start: int = 0
     n_demos: int = 3
     margin: float = 0.3
-    phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
+    phi_range: tuple[float, float] = (0.15, 0.85)
+    n_phi: int = 3
     n_theta: int = 4
+    seed: int = 0
     top_k: int = 4
     replay_max: int = 12
     ik_iters: int = 12
@@ -381,6 +383,7 @@ def scene_geometry(env, target_names):
 
 
 def scene_candidates(cfg, demos, names, geo, tshift):
+    rng = np.random.default_rng(cfg.seed)
     pos, yaws, radii, halves, tpos = geo
     m = round(cfg.margin * cfg.env.fps)
     cands = []
@@ -415,7 +418,7 @@ def scene_candidates(cfg, demos, names, geo, tshift):
         combos = [tuple([ZERO] * n)]
         for k in range(n):
             for opt in (
-                seg_options(cfg.phis, cfg.n_theta)
+                seg_options(rng, cfg.phi_range, cfg.n_phi, cfg.n_theta)
                 if x["held"][k] is not None
                 else [ZERO]
             ):
