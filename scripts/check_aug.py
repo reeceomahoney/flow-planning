@@ -52,6 +52,7 @@ class Config:
     n_phi: int = 3
     n_theta: int = 4
     yaws: list[float] = field(default_factory=lambda: [0.0])
+    stop_on_collision: bool = True
     seed: int = 0
     top_k: int = 4
     replay_max: int = 12
@@ -66,6 +67,7 @@ class Config:
 
 
 VIDEO: dict = {}
+STOP = [True]
 
 
 def target_name(goals, objects, sites, name):
@@ -168,10 +170,10 @@ def run(env, act, hold, names, expected):
         trk = max(trk, np.abs(env.obs[0]["robot0_joint_pos"] - a[:7]).max())
         for j, n in enumerate(names):
             lift[j] = max(lift[j], env.obs[0][f"{n}_pos"][2] - p0[j][2])
-        if env.collided[0]:
+        if env.collided[0] and STOP[0]:
             break
     for _ in range(hold):
-        if env.collided[0]:
+        if env.collided[0] and STOP[0]:
             break
         env.apply_action(act[-1][None])
     o = env.obs[0]
@@ -358,6 +360,7 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
         s[3] += 1
         s[4] += not col
         s[5] += suc and not col
+        s[6] += suc
         if suc and not col and best is None:
             best = c
     return best, sum(c["clear"] > 0 for c in ok), len(ok)
@@ -492,7 +495,8 @@ def main(cfg: Config):
     jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
     m = round(cfg.margin * cfg.env.fps)
 
-    stats = defaultdict(lambda: np.zeros(6, int))
+    stats = defaultdict(lambda: np.zeros(7, int))
+    STOP[0] = cfg.stop_on_collision
     scene_success = []
     for i in range(cfg.init_start, cfg.init_start + cfg.n_inits):
         free_env.episode_idx = i
@@ -513,6 +517,7 @@ def main(cfg: Config):
             _, suc, _, info = replay(free_env, i, c["act"], cfg.hold, hn, c["expected"])
             stats["free"][3] += 1
             stats["free"][5] += suc
+            stats["free"][6] += suc
             if cfg.verbose:
                 print(f"   free-scene  demo {c['d']} succ={int(suc)} {info}")
         geo = scene_geometry(env, tn)
@@ -547,7 +552,7 @@ def main(cfg: Config):
 
     print(
         f"{'family':11s} {'cands':>6s} {'ik_ok':>6s} {'geo':>6s} "
-        f"{'replay':>6s} {'nocol':>6s} {'succ':>6s}"
+        f"{'replay':>6s} {'nocol':>6s} {'succ':>6s} {'tsr':>6s}"
     )
     for fam, s in sorted(stats.items()):
         print(f"{fam:11s} " + " ".join(f"{v:6d}" for v in s))
@@ -558,7 +563,9 @@ def main(cfg: Config):
         f"RESULT {cfg.env.suite} task {cfg.env.task_id} level {cfg.env.level}: "
         f"scenes {sum(scene_success)}/{len(scene_success)} "
         f"orig {stats['none'][5]}/{stats['none'][3]} aug {aug} "
-        f"free-scene {stats['free'][5]}/{stats['free'][3]}"
+        f"free-scene {stats['free'][5]}/{stats['free'][3]} "
+        f"tsr aug {sum(s[6] for f, s in stats.items() if f not in ('none', 'free'))} "
+        f"orig {stats['none'][6]}/{stats['none'][3]}"
     )
 
 
