@@ -11,13 +11,13 @@ import draccus
 import newton.viewer
 import numpy as np
 import torch
-import wandb
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.feature_utils import dataset_to_policy_features
 from safetensors.torch import load_file
 
+import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.envs.franka import box_pointcloud, subsample_cloud
 from flow_planning.policy import (
@@ -51,6 +51,9 @@ class Config:
     out_dir: str = "outputs"
     run_dir: str = ""  # non-empty: exact output directory instead of a timestamp
     eval_every: int = 10_000
+    horizon: int = (
+        0  # >0: action-chunk length; 0 = longest episode (whole-trajectory plans)
+    )
     eval_episodes: int = 256
     eval_search: int = (
         0  # >0 with env.obstacle: selector search over this many bend candidates
@@ -192,7 +195,7 @@ def main(cfg: Config):
     # plan the full trajectory: horizon spans the longest episode; shorter
     # episodes pad their tail with the goal frame (absorbing).
     assert dataset.meta.episodes is not None
-    policy_cfg.horizon = max(dataset.meta.episodes["length"])
+    policy_cfg.horizon = cfg.horizon or max(dataset.meta.episodes["length"])
     stats = dataset.meta.stats
     assert stats is not None
 

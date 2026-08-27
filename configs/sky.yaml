@@ -9,9 +9,12 @@ envs:
   HF_TOKEN:
   WANDB_API_KEY:
   CUDA_VISIBLE_DEVICES: 1
+  MUJOCO_GL: egl
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
-  ITERS: 75000
+  SMOKE: 0
+  ITERS: 40000
+  TAG: chunk
 workdir: .
 
 setup: |
@@ -25,25 +28,22 @@ run: |
   rsync -a --exclude .pixi --exclude outputs --exclude wandb ~/sky_workdir/ $SNAP/
   ln -s ~/sky_workdir/.pixi $SNAP/.pixi; mkdir -p ~/sky_workdir/outputs; ln -s ~/sky_workdir/outputs $SNAP/outputs
   cd $SNAP
-  grep -q track_delta scripts/augment.py || { echo "stale workdir"; exit 1; }
+  grep -q task_onehot flow_planning/envs/libero.py || { echo "stale workdir"; exit 1; }
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
   CACHE=~/.cache/huggingface/lerobot/reece-omahoney
-  q() { "$@" 2>&1 | grep --line-buffered -vE "it/s|Warning|examples/s"; }
-  grep -q '"total_episodes": 768' $CACHE/franka-src/meta/info.json 2>/dev/null || { rm -rf $CACHE/franka-src; \
-    q pixi run python scripts/record.py --env.type franka --env.world_count 256 --episodes 768 --repo_id reece-omahoney/franka-src; }
-  [ -d $CACHE/franka-track ] || q pixi run python scripts/augment.py \
-    --src_repo reece-omahoney/franka-src --dst_repo reece-omahoney/franka-track --copies 6 --track true
-  rm -rf $CACHE/franka-transit-ref
-  ev() { echo "##### $1"; shift; pixi run python scripts/eval.py --env.type franka --env.world_count 128 --episodes 1 \
-    "$@" 2>&1 | grep -E "^overall|contacts|latched|Error|Traceback|File \"/home"; }
-  for D in track; do
-    RUN=outputs/franka/track$ITERS/$D
-    echo "##### train $RUN"
-    [ -f $RUN/model.safetensors ] || q pixi run python scripts/train.py --env.type franka \
-      --repo_id reece-omahoney/franka-$D --num_iters $ITERS --run_dir $RUN \
-      --eval_every 10000 --eval_episodes 128 --env.obstacle true --eval_search 8
-    ev "$D wall hold" --repo_id reece-omahoney/franka-$D --checkpoint $RUN --env.obstacle true --cond search --n_cond 8 --hold_tol 0
-    ev "$D wall latch" --repo_id reece-omahoney/franka-$D --checkpoint $RUN --env.obstacle true --cond search --n_cond 8
-    ev "$D free" --repo_id reece-omahoney/franka-$D --checkpoint $RUN --env.obstacle false --cond zero
-  done
+  ENV="--env.type libero --env.suite safelibero_spatial --env.task_onehot 4 --env.n_action_steps 10"
+  q() { "$@" 2>&1 | grep --line-buffered -vE "it/s|Warning|examples/s|EGL|egl_|OpenGL|glCheck|binding_utils|raise self|^\s*$"; }
+  if [ "$SMOKE" = 1 ]; then REPO=spatial_smoke; AUG="--limit 2 --copies 1 --orig_copies 1"; ITERS=50; EPS=1; RUN=outputs/libero/smoke; rm -rf $CACHE/$REPO $RUN
+  else REPO=spatial_$TAG; AUG="--copies 6 --orig_copies 5"; EPS=10; RUN=outputs/libero/spatial_$TAG; fi
+  [ -d $CACHE/$REPO ] || q pixi run python scripts/augment.py $ENV --env.level I --task_ids "[0,1,2,3]" \
+    --dst_repo reece-omahoney/$REPO --bend_margin 0.4 --focus true --retarget 0.25 --retarget_place 0.12 --retarget_only 0.15 $AUG
+  echo "##### train $RUN"
+  [ -f $RUN/model.safetensors ] || q pixi run python scripts/train.py $ENV --repo_id reece-omahoney/$REPO \
+    --horizon 50 --num_iters $ITERS --eval_every 0 --run_dir $RUN
+  ev() { echo "##### $1"; shift; pixi run python scripts/eval.py $ENV --env.world_count 5 --episodes $EPS \
+    --repo_id reece-omahoney/$REPO --checkpoint $RUN "$@" 2>&1 | grep -E "^overall|resampling|Error|Traceback|File \"/home"; }
+  for T in 0 1 2 3; do for L in I II; do
+    ev "task $T level $L search-resample" --env.task_id $T --env.level $L --env.obstacle true --cond search --n_cond 8 --resample true
+    ev "task $T level $L zero" --env.task_id $T --env.level $L --env.obstacle true --cond zero
+  done; done
   rm -rf $SNAP

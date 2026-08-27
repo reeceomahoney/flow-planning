@@ -52,6 +52,7 @@ class Config:
     phi_range: tuple[float, float] = (0.15, 0.85)
     n_theta: int = 4
     focus: bool = False
+    task_ids: list[int] = field(default_factory=list)
     orig_copies: int = 1
     retarget: float = 0.0
     retarget_place: float = 0.0
@@ -283,67 +284,83 @@ def augment_libero(cfg):
 
     assert isinstance(cfg.env, LiberoConfig)
     rng = np.random.default_rng(cfg.seed)
-    env = LiberoEnv(replace(cfg.env, world_count=1, obstacle=False))
-    base = np.asarray(env.robot_base_pos, np.float32)
     chain, _, _ = build_franka_chain("cpu")
     chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
-    fcol = FrankaCollision(DEV, base, 0.0)
-    demos = libero_demos(cfg, env, chain, base, cfg.limit)
-    n_seg = max(sum(j is not None for j in x["held"]) for x in demos)
-    print(f"{len(demos)} demos, {n_seg} grasp segments, label dim {LABEL_DIM * n_seg}")
+    dst = None
+    for task_id in cfg.task_ids or [cfg.env.task_id]:
+        env = LiberoEnv(
+            replace(cfg.env, task_id=task_id, world_count=1, obstacle=False)
+        )
+        base = np.asarray(env.robot_base_pos, np.float32)
+        fcol = FrankaCollision(DEV, base, 0.0)
+        demos = libero_demos(cfg, env, chain, base, cfg.limit)
+        n_seg = max(sum(j is not None for j in x["held"]) for x in demos)
+        print(
+            f"task {task_id}: {len(demos)} demos, {n_seg} grasp segments, "
+            f"label dim {LABEL_DIM * n_seg}"
+        )
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": demos[0]["obs"].shape[1:],
+                "names": None,
+            },
+            "action": {"dtype": "float32", "shape": (8,), "names": None},
+            "bend": {"dtype": "float32", "shape": (LABEL_DIM * n_seg,), "names": None},
+        }
+        if dst is None:
+            dst = LeRobotDataset.create(
+                repo_id=cfg.dst_repo,
+                fps=cfg.env.fps,
+                features=features,
+                use_videos=False,
+            )
+            shapes = features
+        assert features == shapes, (task_id, features, shapes)
+        for x in demos:
+            for _ in range(cfg.orig_copies):
+                write(
+                    dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language
+                )
 
-    features = {
-        "observation.state": {
-            "dtype": "float32",
-            "shape": demos[0]["obs"].shape[1:],
-            "names": None,
-        },
-        "action": {"dtype": "float32", "shape": (8,), "names": None},
-        "bend": {"dtype": "float32", "shape": (LABEL_DIM * n_seg,), "names": None},
-    }
-    dst = LeRobotDataset.create(
-        repo_id=cfg.dst_repo, fps=cfg.env.fps, features=features, use_videos=False
-    )
-    for x in demos:
-        for _ in range(cfg.orig_copies):
-            write(dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language)
-
-    cands = libero_candidates(cfg, demos, rng, 4 * cfg.copies)
-    print(f"{len(cands)} candidates")
-    libero_solve(cfg, cands, demos, chain, base, fcol)
-    written = rej_replay = 0
-    why: dict[str, int] = {}
-    labels = []
-    per_demo = np.zeros(len(demos), int)
-    for c in tqdm(cands, desc="replay"):
-        if not c["ok"]:
-            why[c["why"]] = why.get(c["why"], 0) + 1
-            continue
-        if per_demo[c["d"]] >= cfg.copies:
-            continue
-        x = demos[c["d"]]
-        shift = c.get("shift")
-        if shift is not None:
-            seg, delta, dplace = shift
-            held_name = env.objects[x["held"][seg]]
-            shift = [(held_name, delta)]
-            if dplace is not None:
-                shift += [(n, dplace) for n in env.objects if n != held_name]
-        succ, obs = replay_libero(env, x["state0"], c["act"], cfg.hold, shift)
-        if not succ:
-            rej_replay += 1
-            continue
-        label = encode_label(held_combo(c["combo"], x["held"]), n_seg)
-        write(dst, obs.astype(np.float32), c["act"], label, env.language)
-        labels.append(label)
-        written += 1
-        per_demo[c["d"]] += 1
-    print(f"wrote {written}/{len(cands)} copies; rejected {why}, {rej_replay} replay")
-    if labels:
-        lab = np.stack(labels)
-        print("label nonzero fraction per dim:", (np.abs(lab) > 0).mean(0).round(2))
-        rows, counts = np.unique(lab.round(3), axis=0, return_counts=True)
-        print(f"{len(rows)} unique labels, episodes per label:", np.sort(counts)[::-1])
+        cands = libero_candidates(cfg, demos, rng, 4 * cfg.copies)
+        print(f"{len(cands)} candidates")
+        libero_solve(cfg, cands, demos, chain, base, fcol)
+        written = rej_replay = 0
+        why: dict[str, int] = {}
+        labels = []
+        per_demo = np.zeros(len(demos), int)
+        for c in tqdm(cands, desc="replay"):
+            if not c["ok"]:
+                why[c["why"]] = why.get(c["why"], 0) + 1
+                continue
+            if per_demo[c["d"]] >= cfg.copies:
+                continue
+            x = demos[c["d"]]
+            shift = c.get("shift")
+            if shift is not None:
+                seg, delta, dplace = shift
+                held_name = env.objects[x["held"][seg]]
+                shift = [(held_name, delta)]
+                if dplace is not None:
+                    shift += [(n, dplace) for n in env.objects if n != held_name]
+            succ, obs = replay_libero(env, x["state0"], c["act"], cfg.hold, shift)
+            if not succ:
+                rej_replay += 1
+                continue
+            label = encode_label(held_combo(c["combo"], x["held"]), n_seg)
+            write(dst, obs.astype(np.float32), c["act"], label, env.language)
+            labels.append(label)
+            written += 1
+            per_demo[c["d"]] += 1
+        print(
+            f"wrote {written}/{len(cands)} copies; rejected {why}, {rej_replay} replay"
+        )
+        if labels:
+            lab = np.stack(labels)
+            print("label nonzero fraction per dim:", (np.abs(lab) > 0).mean(0).round(2))
+        del env
+    assert dst is not None
     dst.finalize()
 
 

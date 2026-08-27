@@ -340,8 +340,11 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         cond, k, searching = None, 1, False
         if self.config.cond_dim and self.cond_candidates is not None:
             searching = True
-            k = self.cond_candidates.shape[0]
-            cond = self.cond_candidates.repeat(n_worlds, 1)
+            cands = self.cond_candidates
+            if callable(cands):
+                cands = cands()
+            k = cands.shape[0]
+            cond = cands.repeat(n_worlds, 1)
         else:
             k = max(self.n_samples, 1)
             if self.config.cond_dim and self.cond is not None:

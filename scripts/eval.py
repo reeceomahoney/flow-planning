@@ -64,6 +64,7 @@ class Config:
     hold_tol: float = (
         -1.0
     )  # search: <0 latch first pick; else re-search once score > tol
+    resample: bool = False  # search: fresh candidates + re-selection every replan
 
 
 def sample_cond(bend: np.ndarray, k: int, rng, device, scale=1.0) -> torch.Tensor:
@@ -197,6 +198,12 @@ def main(cfg: Config):
             policy.hold_tol = None if cfg.hold_tol < 0 else cfg.hold_tol
             policy.n_samples = cfg.n_cond
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
+            if cfg.resample:
+                policy.cond_candidates = lambda: sample_cond(
+                    bend, cfg.n_cond, rng, device, cfg.cond_scale
+                )
+                policy.hold_tol = -1.0
+                print(f"resampling {cfg.n_cond} candidates at every replan")
 
     arm = hasattr(env, "ee_state_index")  # franka: planned path needs EE FK
     if arm:
@@ -226,7 +233,7 @@ def main(cfg: Config):
             sel.set_boxes(env.obstacle_boxes())
         if cfg.cond is Cond.RANDOM and bend is not None:
             policy.cond = sample_cond(bend, n, rng, device)
-        if cfg.cond is Cond.SEARCH and bend is not None:
+        if cfg.cond is Cond.SEARCH and bend is not None and not cfg.resample:
             policy.cond_candidates = sample_cond(
                 bend, cfg.n_cond, rng, device, cfg.cond_scale
             )

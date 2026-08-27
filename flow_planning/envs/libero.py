@@ -74,6 +74,7 @@ class LiberoConfig(EnvConfig):
     collision_displacement: float = 0.001
     render: bool = False
     render_size: int = 256
+    task_onehot: int = 0
 
 
 def task_name(cfg: LiberoConfig) -> str:
@@ -387,6 +388,8 @@ class LiberoEnv:
             for k, n in enumerate(self.objects):
                 parts += [o[f"{n}_pos"], r6[k + 1]]
             parts.append(e.sim.data.qpos[self.fixture_qpos])
+            if self.cfg.task_onehot:
+                parts.append(np.eye(self.cfg.task_onehot)[self.cfg.task_id])
             rows.append(np.concatenate(parts))
         return np.stack(rows).astype(np.float32)
 
