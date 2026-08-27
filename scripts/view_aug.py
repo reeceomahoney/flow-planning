@@ -16,13 +16,7 @@ from flow_planning.envs.libero import LiberoConfig, LiberoEnv
 from flow_planning.kinematics import EE_FRAME, build_franka_chain
 from flow_planning.selector import FrankaCollision
 
-GREY, GREEN, RED, YELLOW, CYAN = (
-    (160, 160, 160),
-    (0, 220, 0),
-    (0, 0, 255),
-    (0, 230, 230),
-    (255, 200, 0),
-)
+GREY, GREEN, RED = (160, 160, 160), (0, 220, 0), (0, 0, 255)
 
 
 @dataclass
@@ -37,7 +31,7 @@ class ViewConfig(Config):
 def project(sim, pts, size):
     mat = get_camera_transform_matrix(sim, "agentview", size, size)
     px = project_points_from_world_to_camera(np.asarray(pts), mat, size, size)
-    return size - 1 - px[..., ::-1]
+    return np.stack([size - 1 - px[..., 1], px[..., 0]], -1)
 
 
 def draw(frame, pts, colour, r=2):
@@ -52,18 +46,11 @@ def record(env, cfg, x, c, path, writer):
     sim = env.envs[0].sim
     orig = project(sim, x["ee"], cfg.size)
     plan = project(sim, c["ee_t"], cfg.size)
-    segs = x["segs"]
-    m = round(cfg.bend_margin * cfg.env.fps)
-    trace = []
     for t, a in enumerate(c["act"]):
         env.apply_action(a[None])
-        trace.append(env.obs[0]["robot0_eef_pos"])
-        f = np.ascontiguousarray(env.get_frame())
+        f = np.ascontiguousarray(env.obs[0]["agentview_image"][::-1, ::-1])
         draw(f, orig, GREY, 1)
-        for k, (s0, s1) in enumerate(segs):
-            draw(f, plan[max(s0 - m, 0) : min(s1 + m, len(plan))], YELLOW, 2)
         draw(f, plan, GREEN, 1)
-        draw(f, project(sim, np.stack(trace), cfg.size), CYAN, 2)
         draw(f, plan[t : t + 1], RED, 5)
         cv2.putText(f, path.stem, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         writer.write(f[..., ::-1])
@@ -113,8 +100,8 @@ def main(cfg: ViewConfig):
             if c["d"] != d or not c["ok"] or shown >= cfg.per_demo:
                 continue
             label = " ".join(
-                f"a{a:.0f} app{pa:.2f}/{ta:.1f} tr{pt:.2f}/{tt:.1f}{'ar'[int(md)]}"
-                for a, pa, ta, pt, tt, md in c["combo"]
+                f"app{pa:.2f}/{ta:.1f} tr{pt:.2f}/{tt:.1f}"
+                for pa, ta, pt, tt in c["combo"]
             )
             succ = record(env, cfg, x, c, Path(f"demo{d} {label}"), writer)
             print(f"demo {d} [{label}] success={succ}")

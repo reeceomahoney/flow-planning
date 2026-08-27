@@ -247,6 +247,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.cloud = None  # scene point cloud (1, N, 3) for cloud_points models
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.latched_idx = None
+        self.hold_tol = None  # search: re-pick when the held plan scores above this
+        self.last_scores = None
+        self.last_scores = None  # (n_worlds, K) selector scores of the last search
         self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
         self.guidance_scale = 1.0  # CFG on the bend/posture latent; 1 = off
         self.reset()
@@ -370,8 +373,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         )
         if sel is not None and k > 1:  # lowest-scoring candidate per world
             score = sel(x).view(n_worlds, k)
+            self.last_scores = score.clone()
             if searching and self.latched_idx is not None:  # keep the held pick
                 keep = F.one_hot(self.latched_idx, k).bool()
+                if self.hold_tol is not None:
+                    dirty = score.gather(1, self.latched_idx[:, None]) > self.hold_tol
+                    keep = keep | dirty
                 score = score.masked_fill(~keep, torch.inf)
             pick = score.argmin(dim=1)
             rows = torch.arange(len(pick), device=x.device)

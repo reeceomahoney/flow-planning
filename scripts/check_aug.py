@@ -3,6 +3,7 @@ from dataclasses import dataclass, field, replace
 from itertools import product
 from typing import Any
 
+import cv2
 import draccus
 import h5py
 import numpy as np
@@ -22,9 +23,7 @@ from flow_planning.bend import (
     seg_options,
     solve_seq,
     tpad,
-    wrap,
     yaw_of_quat,
-    yaw_of_rot6d,
 )
 from flow_planning.envs import EnvConfig
 from flow_planning.envs.libero import (
@@ -51,17 +50,19 @@ class Config:
     margin: float = 0.3
     phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
     n_theta: int = 4
-    alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
     top_k: int = 4
     replay_max: int = 12
     ik_iters: int = 12
     ik_damping: float = 0.05
     hold: int = 20
     verbose: bool = True
-    arcs: str = "additive,replace"
     vel_frac: float = 0.8
     ik_tol: float = 0.01
-    descents: list[float] = field(default_factory=lambda: [0.0])
+    video: str = ""
+    size: int = 512
+
+
+VIDEO: dict = {}
 
 
 def target_name(goals, objects, sites, name):
@@ -137,12 +138,30 @@ def phase_report(prof, segs, m):
     return " | ".join(out)
 
 
+def frame(env, t, done=None):
+    from view_aug import draw, project
+
+    f = np.ascontiguousarray(env.obs[0]["agentview_image"][::-1, ::-1])
+    plan = project(env.envs[0].sim, VIDEO["plan"], VIDEO["size"])
+    draw(f, plan, (0, 220, 0), 1)
+    draw(f, plan[t : t + 1], (0, 0, 255), 5)
+    cv2.putText(f, VIDEO["label"], (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    if done:
+        cv2.putText(
+            f, done, (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
+        )
+    VIDEO["writer"].write(f[..., ::-1])
+
+
 def run(env, act, hold, names, expected):
+    rec = bool(VIDEO) and env.cfg.render
     p0 = [env.obs[0][f"{n}_pos"].copy() for n in names]
     lift = [0.0] * len(names)
     trk = 0.0
-    for a in act:
+    for t, a in enumerate(act):
         env.apply_action(a[None])
+        if rec:
+            frame(env, t)
         trk = max(trk, np.abs(env.obs[0]["robot0_joint_pos"] - a[:7]).max())
         for j, n in enumerate(names):
             lift[j] = max(lift[j], env.obs[0][f"{n}_pos"][2] - p0[j][2])
@@ -155,6 +174,13 @@ def run(env, act, hold, names, expected):
     o = env.obs[0]
     moved = [np.linalg.norm(o[f"{n}_pos"][:2] - p[:2]) for n, p in zip(names, p0)]
     dist = [np.linalg.norm(o[f"{n}_pos"][:2] - e[:2]) for n, e in zip(names, expected)]
+    if rec:
+        for _ in range(env.cfg.fps):
+            frame(
+                env,
+                len(act) - 1,
+                f"collided={int(env.collided[0])} success={int(env.succ[0])}",
+            )
     info = (
         "lift "
         + "/".join(f"{v:.3f}" for v in lift)
@@ -166,7 +192,9 @@ def run(env, act, hold, names, expected):
     return bool(env.collided[0]), bool(env.succ[0]), env.contact[0], info
 
 
-def replay(env, init_idx, act, hold, names, expected):
+def replay(env, init_idx, act, hold, names, expected, plan=None, label=""):
+    if VIDEO:
+        VIDEO["plan"], VIDEO["label"] = plan, label
     env.episode_idx = init_idx
     env.reset()
     return run(env, act, hold, names, expected)
@@ -294,7 +322,7 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     aug = [c for c in ok if c["fam"] != "none"]
     groups = defaultdict(list)
     for c in aug:
-        groups[tuple(a for a, *_ in c["combo"])].append(c)
+        groups[tuple(o[:2] for o in c["combo"])].append(c)
     picked = []
     while len(picked) < cfg.replay_max // 2 and any(groups.values()):
         for g in list(groups):
@@ -307,7 +335,16 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     for c in to_replay:
         x = demos[c["d"]]
         hn = held_names(names, x)
-        col, suc, label, info = replay(env, i, c["act"], cfg.hold, hn, c["expected"])
+        col, suc, label, info = replay(
+            env,
+            i,
+            c["act"],
+            cfg.hold,
+            hn,
+            c["expected"],
+            c["ee_t"],
+            f"scene{i} {c['fam']} {fmt(c['combo'])}",
+        )
         if cfg.verbose and (c["fam"] == "none" or not col):
             hit = label.split("/")[1] if col else ""
             print(
@@ -326,9 +363,7 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
 
 def fmt(combo):
     return " ".join(
-        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f} {'ar'[int(md)]}"
-        + (f" z{rest[0]:.2f}]" if rest else "]")
-        for a, pa, ta, pt, tt, md, *rest in combo
+        f"[{pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f}]" for pa, ta, pt, tt in combo
     )
 
 
@@ -351,21 +386,18 @@ def scene_candidates(cfg, demos, names, geo, tshift):
     m = round(cfg.margin * cfg.env.fps)
     cands = []
     for d, x in enumerate(demos):
-        dbs, dps, dyaw, diag, ends = [], [], [], [], []
+        dbs, dps, diag, ends = [], [], [], []
         for (c, op), j, tg in zip(x["segs"], x["held"], x["targets"]):
             if j is None:
                 dbs.append(np.zeros(3))
                 dps.append(np.zeros(3))
-                dyaw.append(0.0)
                 ends.append(np.zeros(3))
                 continue
             sl = obj_slice(j)
             db = pos[names[j]] - x["obs"][0, sl]
             dbs.append(db)
-            r6 = x["obs"][0, sl.stop : sl.stop + 6]
-            dyaw.append(wrap(yaws[names[j]] - yaw_of_rot6d(r6)))
             ends.append(x["obs"][-1, sl])
-            diag.append(f"{names[j]} d={db.round(3)} dyaw={np.degrees(dyaw[-1]):.0f}")
+            diag.append(f"{names[j]} d={db.round(3)}")
             if tg is None:
                 dps.append(np.zeros(3))
             elif tg in names:
@@ -378,27 +410,20 @@ def scene_candidates(cfg, demos, names, geo, tshift):
         x["half"] = [
             halves[names[j]] if j is not None else np.ones(2) for j in x["held"]
         ]
-        x["dyaw"] = dyaw
         if d == 0:
             print("   retarget " + " | ".join(diag))
         n = len(x["segs"])
         combos = [tuple([ZERO] * n)]
         for k in range(n):
             for opt in (
-                seg_options(
-                    cfg.alphas,
-                    cfg.phis,
-                    cfg.n_theta,
-                    cfg.arcs.split(","),
-                    cfg.descents,
-                )
+                seg_options(cfg.phis, cfg.n_theta)
                 if x["held"][k] is not None
                 else [ZERO]
             ):
                 if opt != ZERO:
                     combos.append(tuple(opt if j == k else ZERO for j in range(n)))
         for combo in combos:
-            c = build(x, combo, m, cfg.arcs.split(","))
+            c = build(x, combo, m)
             if c is not None:
                 c["d"], c["radii"] = d, x["radii"]
                 cands.append(c)
@@ -422,7 +447,7 @@ def compose_candidates(cfg, cands, demos):
         for combo in product(*tops):
             if sum(o != ZERO for o in combo) < 2:
                 continue
-            c = build(x, combo, m, cfg.arcs.split(","))
+            c = build(x, combo, m)
             if c is not None:
                 c["d"], c["radii"] = d, x["radii"]
                 out.append(c)
@@ -432,7 +457,25 @@ def compose_candidates(cfg, cands, demos):
 @draccus.wrap()
 def main(cfg: Config):
     assert isinstance(cfg.env, LiberoConfig)
-    env = LiberoEnv(replace(cfg.env, world_count=1, obstacle=True))
+    env = LiberoEnv(
+        replace(
+            cfg.env,
+            world_count=1,
+            obstacle=True,
+            render=bool(cfg.video),
+            render_size=cfg.size,
+        )
+    )
+    if cfg.video:
+        VIDEO.update(
+            writer=cv2.VideoWriter(
+                cfg.video,
+                cv2.VideoWriter.fourcc(*"mp4v"),
+                cfg.env.fps,
+                (cfg.size, cfg.size),
+            ),
+            size=cfg.size,
+        )
     free_env = LiberoEnv(replace(cfg.env, world_count=1, obstacle=False))
     assert env.objects == free_env.objects, (env.objects, free_env.objects)
     names = env.objects
@@ -505,6 +548,8 @@ def main(cfg: Config):
     for fam, s in sorted(stats.items()):
         print(f"{fam:11s} " + " ".join(f"{v:6d}" for v in s))
     aug = sum(s[5] for f, s in stats.items() if f not in ("none", "free"))
+    if cfg.video:
+        VIDEO["writer"].release()
     print(
         f"RESULT {cfg.env.suite} task {cfg.env.task_id} level {cfg.env.level}: "
         f"scenes {sum(scene_success)}/{len(scene_success)} "
