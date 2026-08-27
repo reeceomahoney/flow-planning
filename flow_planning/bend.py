@@ -217,8 +217,7 @@ def encode_label(combo, n_seg):
     return out
 
 
-def build(x, combo, m, m_post=None):
-    m_post = m if m_post is None else m_post
+def build(x, combo, m):
     segs = x["segs"]
     ee, quat = x["ee"].copy(), x["quat"].copy()
     objs = [
@@ -232,10 +231,10 @@ def build(x, combo, m, m_post=None):
     ]
     for k, ((c, o), (pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
         if pa:
-            ee = ee + bulge_delta(ee, w0 + m_post if k else 1, c - m, pa * np.pi, ta)
+            ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
             fam.add("app")
         if pt:
-            d = bulge_delta(ee, c + m_post, o - m, pt * np.pi, tt)
+            d = bulge_delta(ee, c + m, o - m, pt * np.pi, tt)
             ee = ee + d
             objs[k] = objs[k] + d
             fam.add("tra")

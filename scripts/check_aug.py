@@ -48,7 +48,6 @@ class Config:
     init_start: int = 0
     n_demos: int = 3
     margin: float = 0.3
-    margin_post: float = -1.0
     phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
     n_theta: int = 4
     top_k: int = 4
@@ -384,8 +383,6 @@ def scene_geometry(env, target_names):
 def scene_candidates(cfg, demos, names, geo, tshift):
     pos, yaws, radii, halves, tpos = geo
     m = round(cfg.margin * cfg.env.fps)
-    mp = cfg.margin_post if cfg.margin_post >= 0 else cfg.margin
-    mp = round(mp * cfg.env.fps)
     cands = []
     for d, x in enumerate(demos):
         dbs, dps, diag, ends = [], [], [], []
@@ -425,7 +422,7 @@ def scene_candidates(cfg, demos, names, geo, tshift):
                 if opt != ZERO:
                     combos.append(tuple(opt if j == k else ZERO for j in range(n)))
         for combo in combos:
-            c = build(x, combo, m, mp)
+            c = build(x, combo, m)
             if c is not None:
                 c["d"], c["radii"] = d, x["radii"]
                 cands.append(c)
@@ -434,8 +431,6 @@ def scene_candidates(cfg, demos, names, geo, tshift):
 
 def compose_candidates(cfg, cands, demos):
     m = round(cfg.margin * cfg.env.fps)
-    mp = cfg.margin_post if cfg.margin_post >= 0 else cfg.margin
-    mp = round(mp * cfg.env.fps)
     out = []
     for d, x in enumerate(demos):
         n = len(x["segs"])
@@ -451,7 +446,7 @@ def compose_candidates(cfg, cands, demos):
         for combo in product(*tops):
             if sum(o != ZERO for o in combo) < 2:
                 continue
-            c = build(x, combo, m, mp)
+            c = build(x, combo, m)
             if c is not None:
                 c["d"], c["radii"] = d, x["radii"]
                 out.append(c)

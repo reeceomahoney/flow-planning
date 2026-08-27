@@ -43,7 +43,6 @@ class Config:
     bend_min: float = 0.15  # half-angle, units of pi
     bend_max: float = 1.0
     bend_margin: float = 1.5
-    bend_margin_post: float = -1.0
     limit: int = 0
     ik_iters: int = 8  # per frame, warm-started
     ik_damping: float = 0.05
@@ -194,10 +193,6 @@ def sample_option(cfg, rng):
 
 def libero_candidates(cfg, demos, rng, per_demo):
     m = round(cfg.bend_margin * cfg.env.fps)
-    mp = round(
-        (cfg.bend_margin if cfg.bend_margin_post < 0 else cfg.bend_margin_post)
-        * cfg.env.fps
-    )
     cands: list[dict[str, Any]] = []
     for d, x in enumerate(demos):
         held_idx = [k for k, j in enumerate(x["held"]) if j is not None]
@@ -234,7 +229,7 @@ def libero_candidates(cfg, demos, rng, per_demo):
                 )
             if shift is None and all(o == SEG_ZERO for o in combo):
                 continue
-            c = build(xd, combo, m, mp)
+            c = build(xd, combo, m)
             if c is not None:
                 c["d"] = d
                 c["shift"] = shift
