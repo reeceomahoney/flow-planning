@@ -66,6 +66,8 @@ class FrankaConfig(EnvConfig):
     obstacle_thickness: float = 0.01
     contact_depth: float = 0.005  # penetration below this is a graze, not a failure
     obstacle_mesh: str = ""  # "" = box wall; else a newton example asset, e.g. "bunny"
+    obstacle_dx: float = 0.0  # test-time shift of the obstacle from the table centre
+    obstacle_dy: float = 0.0
 
     # keep cube/goal at least this far from the wall plane (feasible instances);
     # 0 = unconstrained. Wall-adjacent grasps (<8cm) are physically infeasible.
@@ -232,13 +234,17 @@ class FrankaEnv:
         self.goal_center = np.array([top[0], top[1] - 0.15, cube_z], np.float32)
         # obstacle sits on the table midway between cube and goal, running along x
         self.obstacle_center = wp.vec3(
-            top[0], top[1], top[2] + 0.5 * cfg.obstacle_height
+            top[0] + cfg.obstacle_dx,
+            top[1] + cfg.obstacle_dy,
+            top[2] + 0.5 * cfg.obstacle_height,
         )
         self.obstacle_mesh = None
         self.obstacle_half_y = cfg.obstacle_thickness
         if cfg.obstacle and cfg.obstacle_mesh:
             m = load_obstacle_mesh(cfg.obstacle_mesh, cfg.obstacle_height)
-            m.apply_translation([top[0], top[1], top[2]])
+            m.apply_translation(
+                [self.obstacle_center[0], self.obstacle_center[1], top[2]]
+            )
             self.obstacle_mesh = m
             self.obstacle_half_y = 0.5 * float(m.extents[1])
 

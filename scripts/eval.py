@@ -55,9 +55,10 @@ class Config:
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
     gap: bool = False  # print per-episode plan vs executed min obstacle clearance
     guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
+    cond_scale: float = 1.0  # search: stretch the sampled bend magnitude range by this
 
 
-def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
+def sample_cond(bend: np.ndarray, k: int, rng, device, scale=1.0) -> torch.Tensor:
     if bend.shape[1] >= LABEL_DIM:
         rows, counts = np.unique(
             bend[np.abs(bend).sum(1) > 0], axis=0, return_counts=True
@@ -70,7 +71,7 @@ def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
     nz = r > 0
     assert nz.any(), "dataset has no bent episodes; every bend label is zero"
     ang = np.arctan2(arc[nz, 1], arc[nz, 0])
-    phi = rng.uniform(r[nz].min(), r.max(), k)
+    phi = rng.uniform(r[nz].min(), r.max() * scale, k)
     theta = rng.uniform(ang.min(), ang.max(), k)
     cols = [phi * np.cos(theta), phi * np.sin(theta)]
     cols += [rng.choice(np.unique(bend[:, j]), k) for j in range(2, bend.shape[1])]
@@ -183,7 +184,7 @@ def main(cfg: Config):
                 print(f"oracle cond best-of-{cfg.n_cond} over noise")
         elif cfg.cond is Cond.SEARCH:  # candidates scored + latched via selector
             assert policy.selector_fn is not None, "search needs --env.obstacle"
-            cand = sample_cond(bend, cfg.n_cond, rng, device)
+            cand = sample_cond(bend, cfg.n_cond, rng, device, cfg.cond_scale)
             policy.cond_candidates = cand
             policy.n_samples = cfg.n_cond
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
@@ -217,7 +218,9 @@ def main(cfg: Config):
         if cfg.cond is Cond.RANDOM and bend is not None:
             policy.cond = sample_cond(bend, n, rng, device)
         if cfg.cond is Cond.SEARCH and bend is not None:
-            policy.cond_candidates = sample_cond(bend, cfg.n_cond, rng, device)
+            policy.cond_candidates = sample_cond(
+                bend, cfg.n_cond, rng, device, cfg.cond_scale
+            )
         succ = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
         frame = 0

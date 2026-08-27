@@ -42,6 +42,8 @@ class Config:
     init_from: str = ""  # checkpoint dir to fine-tune from (new cond pathway zero-init)
     freeze_backbone: bool = False  # train only the conditioning pathway + AdaLN
     episodes: int = 0  # >0: random subset of this many episodes
+    aug_episodes: int = 0  # >0: subset of this many augmented (nonzero bend) episodes
+    orig_episodes: int = 0  # with aug_episodes: how many unaugmented episodes to add
     seed: int = 0
     warmup_iters: int = 500
     ema_decay: float = 0.999
@@ -145,10 +147,22 @@ def main(cfg: Config):
     wandb.init(project=cfg.wandb_project, mode=mode, config=draccus.encode(cfg))
 
     rng = np.random.default_rng(cfg.seed)
+    torch.manual_seed(cfg.seed)
     subset = None
     if cfg.episodes > 0:
         n_total = LeRobotDataset(cfg.repo_id).meta.total_episodes
         subset = sorted(rng.choice(n_total, cfg.episodes, replace=False).tolist())
+    elif cfg.aug_episodes > 0:
+        full = LeRobotDataset(cfg.repo_id).hf_dataset
+        ep_all = hf_column(full, "episode_index")
+        first = np.unique(ep_all, return_index=True)[1]
+        aug = np.abs(hf_column(full, "bend")[first]).sum(1) > 0
+        ids = ep_all[first]
+        subset = sorted(
+            rng.choice(ids[aug], cfg.aug_episodes, replace=False).tolist()
+            + rng.choice(ids[~aug], cfg.orig_episodes, replace=False).tolist()
+        )
+        print(f"subset: {cfg.aug_episodes} augmented + {cfg.orig_episodes} original")
     dataset = LeRobotDataset(cfg.repo_id, episodes=subset)
     features = dataset_to_policy_features(dataset.features)
     output_features = {
