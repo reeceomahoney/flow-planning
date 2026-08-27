@@ -45,6 +45,7 @@ ZERO = SEG_ZERO
 class Config:
     env: EnvConfig = field(default_factory=LiberoConfig)
     n_inits: int = 10
+    init_start: int = 0
     n_demos: int = 3
     margin: float = 0.3
     phis: list[float] = field(default_factory=lambda: [0.25, 0.5, 0.75])
@@ -488,7 +489,7 @@ def main(cfg: Config):
 
     stats = defaultdict(lambda: np.zeros(6, int))
     scene_success = []
-    for i in range(cfg.n_inits):
+    for i in range(cfg.init_start, cfg.init_start + cfg.n_inits):
         free_env.episode_idx = i
         free_env.reset()
         geo_free = scene_geometry(free_env, tn)
