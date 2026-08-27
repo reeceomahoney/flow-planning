@@ -464,7 +464,7 @@ class LiberoEnv:
         n = self.cfg.render_size
         mat = get_camera_transform_matrix(self.envs[0].sim, "agentview", n, n)
         px = project_points_from_world_to_camera(np.asarray(pts), mat, n, n)
-        return n - 1 - px[..., ::-1]
+        return np.stack([n - 1 - px[..., 1], px[..., 0]], -1)
 
     def get_frame(self):
         import cv2
