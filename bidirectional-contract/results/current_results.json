@@ -1,0 +1,77 @@
+{
+  "scene": {
+    "suite": "safelibero_spatial",
+    "task_id": 2,
+    "level": "I",
+    "initialization": 0,
+    "obstacle": "moka_pot_obstacle_1",
+    "seed_protocol": "policy seed = episode index"
+  },
+  "results": [
+    {
+      "method": "nominal state-only flow action chunker",
+      "checkpoint": "20k nominal",
+      "episodes": 50,
+      "task_successes": 40,
+      "collisions": 50,
+      "safe_successes": 0,
+      "source": "slop/goal/outputs/spatial_task2_h50_s10/moka_benchmark_base_50/summary.json"
+    },
+    {
+      "method": "AEGIS",
+      "setting": "released barrier boundary (0 cm margin)",
+      "checkpoint": "20k nominal",
+      "episodes": 50,
+      "task_successes": 50,
+      "collisions": 26,
+      "safe_successes": 24,
+      "source": "slop/goal/outputs/spatial_task2_h50_s10/moka_benchmark_aegis_50/summary.json"
+    },
+    {
+      "method": "AEGIS",
+      "setting": "best tested margin (2 cm)",
+      "checkpoint": "20k nominal",
+      "episodes": 25,
+      "task_successes": 24,
+      "collisions": 0,
+      "safe_successes": 24,
+      "source": "slop/goal/outputs/spatial_task2_h50_s10/moka_margin_02_25/summary.json"
+    },
+    {
+      "method": "bidirectional contract (untuned)",
+      "checkpoint": "10k recovery fine-tune from 50k nominal",
+      "episodes": 50,
+      "task_successes": 34,
+      "collisions": 0,
+      "safe_successes": 34,
+      "episodes_with_infeasible_hold": 20,
+      "timed_out_in_infeasible_hold": 16,
+      "successful_after_infeasible_hold": 4,
+      "mean_completion_frame": 132.8235294117647,
+      "failed_seeds": [4, 5, 9, 10, 11, 18, 19, 20, 25, 26, 27, 29, 32, 35, 38, 46],
+      "successful_seeds_with_infeasible_cycle": [7, 13, 17, 44],
+      "source": "bidirectional-contract/results/reproduction/ours_untuned_50/summary.json and episodes.csv"
+    }
+  ],
+  "sanity_checks": [
+    {
+      "method": "50k nominal parent, no obstacle",
+      "episodes": 50,
+      "task_successes": 50
+    },
+    {
+      "method": "selected 10k recovery checkpoint, no obstacle",
+      "episodes": 50,
+      "task_successes": 50,
+      "mean_completion_frame": 145.18
+    },
+    {
+      "method": "bidirectional contract, Level II init 0 seed 0",
+      "episodes": 1,
+      "task_successes": 0,
+      "collisions": 0,
+      "episodes_with_explicit_infeasible_hold": 1
+    }
+  ],
+  "warning": "The base, released AEGIS, and bidirectional-contract rows use 50 matched policy seeds in one scene. AEGIS at 2 cm uses 25 seeds. The bidirectional-contract controller is untuned and uses a recovery-fine-tuned task checkpoint rather than the nominal baseline checkpoint."
+}

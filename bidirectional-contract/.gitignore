@@ -1,0 +1,4 @@
+artifacts/
+results/reproduction/
+__pycache__/
+bidirectional_contract/__pycache__/
