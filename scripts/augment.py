@@ -298,7 +298,8 @@ def augment_libero(cfg):
         if cfg.n_seg:
             kept = [x for x in demos if len(x["segs"]) <= cfg.n_seg]
             print(
-                f"task {task_id}: dropped {len(demos) - len(kept)} demos with >{cfg.n_seg} grasps"
+                f"task {task_id}: dropped {len(demos) - len(kept)} demos "
+                f"with >{cfg.n_seg} grasps"
             )
             demos = kept
         n_seg = cfg.n_seg or max(sum(j is not None for j in x["held"]) for x in demos)
