@@ -36,7 +36,7 @@ run: |
   if [ "$SMOKE" = 1 ]; then REPO=spatial_smoke; AUG="--limit 2 --copies 1 --orig_copies 1"; ITERS=50; EPS=1; RUN=outputs/libero/smoke; rm -rf $CACHE/$REPO $RUN
   else REPO=spatial_$TAG; AUG="--copies 6 --orig_copies 5"; EPS=10; RUN=outputs/libero/spatial_$TAG; fi
   [ -d $CACHE/$REPO ] || q pixi run python scripts/augment.py $ENV --env.level I --task_ids "[0,1,2,3]" \
-    --dst_repo reece-omahoney/$REPO --bend_margin 0.4 --focus true --retarget 0.25 --retarget_place 0.12 --retarget_only 0.15 $AUG
+    --dst_repo reece-omahoney/$REPO --n_seg 1 --bend_margin 0.4 --focus true --retarget 0.25 --retarget_place 0.12 --retarget_only 0.15 $AUG
   echo "##### train $RUN"
   [ -f $RUN/model.safetensors ] || q pixi run python scripts/train.py $ENV --repo_id reece-omahoney/$REPO \
     --horizon 50 --num_iters $ITERS --eval_every 0 --run_dir $RUN

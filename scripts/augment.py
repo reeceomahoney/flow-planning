@@ -53,6 +53,7 @@ class Config:
     n_theta: int = 4
     focus: bool = False
     task_ids: list[int] = field(default_factory=list)
+    n_seg: int = 0
     orig_copies: int = 1
     retarget: float = 0.0
     retarget_place: float = 0.0
@@ -294,7 +295,13 @@ def augment_libero(cfg):
         base = np.asarray(env.robot_base_pos, np.float32)
         fcol = FrankaCollision(DEV, base, 0.0)
         demos = libero_demos(cfg, env, chain, base, cfg.limit)
-        n_seg = max(sum(j is not None for j in x["held"]) for x in demos)
+        if cfg.n_seg:
+            kept = [x for x in demos if len(x["segs"]) <= cfg.n_seg]
+            print(
+                f"task {task_id}: dropped {len(demos) - len(kept)} demos with >{cfg.n_seg} grasps"
+            )
+            demos = kept
+        n_seg = cfg.n_seg or max(sum(j is not None for j in x["held"]) for x in demos)
         print(
             f"task {task_id}: {len(demos)} demos, {n_seg} grasp segments, "
             f"label dim {LABEL_DIM * n_seg}"
