@@ -8,6 +8,7 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from scipy.signal import lfilter, lfilter_zi
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 from tqdm import tqdm
 
 from flow_planning.bend import (
@@ -23,6 +24,7 @@ from flow_planning.bend import (
     encode_label,
     fk,
     held_segments,
+    obj_slice,
     solve_seq,
     tpad,
     track_delta,
@@ -32,7 +34,7 @@ from flow_planning.envs import EnvConfig, FrankaConfig
 from flow_planning.envs.env import PiperConfig
 from flow_planning.kinematics import EE_FRAME, build_franka_chain, build_piper_chain
 from flow_planning.selector import FrankaCollision, box_sdf
-from flow_planning.utils import hf_column, quat_to_rot6d
+from flow_planning.utils import hf_column, quat_to_rot6d, rot6d_to_quat
 
 
 @dataclass
@@ -76,6 +78,9 @@ class Config:
     outside_margin: float = 0.08
     arm_margin: float = 0.01
 
+    recover: int = 0
+    recover_approach: int = 0
+    recover_noise: tuple[float, float] = (0.02, 0.15)
     track: bool = False
     track_tau: float = 0.25
     track_desc: float = 0.6
@@ -291,6 +296,120 @@ def libero_solve(cfg, cands, demos, chain, base, fcol):
                 c["ok"], c["why"] = False, "self"
 
 
+def recover_phase(cfg, x, chain, base, fcol, rng, lo, hi, e, span, j, count):
+    obs, act = x["obs"], x["act"]
+    fps = cfg.env.fps
+    q_obs = obs[:, ARM]
+    pos, quat = fk(chain, q_obs, base)
+    speed = np.linalg.norm(np.diff(pos[span[0] : span[1]], axis=0), axis=1).mean() * fps
+    z_min = pos[span[0] : span[1], 2].min() - 0.02
+    jerk_limit = 0.6 * (50 / fps) ** 2
+    out, why = [], {}
+    tries = 0
+    while len(out) < count and tries < 10 * count:
+        tries += 1
+        f = int(rng.integers(lo, hi))
+        d = rng.normal(size=3)
+        d *= rng.uniform(*cfg.recover_noise) / np.linalg.norm(d)
+        p0 = pos[f] + d
+        if p0[2] < z_min:
+            why["low"] = why.get("low", 0) + 1
+            continue
+        n = max(3, int(round(np.linalg.norm(pos[e] - p0) / speed * fps)))
+        u = np.arange(n) / n
+        p_t = p0 + (pos[e] - p0) * u[:, None]
+        r_f = R.from_quat(quat[f])
+        key = R.from_quat(np.stack([quat[f], quat[e]]))
+        slerp = Slerp([0.0, 1.0], key)
+        q_t = slerp(u).as_quat()
+        ref = q_obs[f] + (q_obs[e] - q_obs[f]) * u[:, None]
+        pad = 10
+        q_lin = solve_seq(
+            chain,
+            np.concatenate([np.repeat(p_t[:1], pad, 0), p_t])[:, None],
+            np.concatenate([np.repeat(q_t[:1], pad, 0), q_t])[:, None],
+            np.concatenate([np.repeat(ref[:1], pad, 0), ref])[:, None],
+            cfg.ik_iters,
+            cfg.ik_damping,
+            base,
+        )[pad:, 0]
+        fpos, fquat = fk(chain, q_lin, base)
+        rot_err = R.from_quat(fquat) * R.from_quat(q_t).inv()
+        assert isinstance(rot_err, R)
+        q_all = np.concatenate([q_lin, q_obs[e : e + 3]])
+        if np.linalg.norm(fpos - p_t, axis=1).max() > cfg.ik_tol:
+            why["ik"] = why.get("ik", 0) + 1
+            continue
+        if rot_err.magnitude().max() > np.radians(15):
+            why["rot"] = why.get("rot", 0) + 1
+            continue
+        if np.abs(np.diff(q_all, n=2, axis=0)).max() > jerk_limit:
+            why["jerk"] = why.get("jerk", 0) + 1
+            continue
+        if np.abs(np.diff(q_all, axis=0)).max() > cfg.vel_frac * cfg.env.delta_max:
+            why["vel"] = why.get("vel", 0) + 1
+            continue
+        body, _ = fcol.body_penetration(
+            torch.as_tensor(q_lin, dtype=torch.float32, device=DEV), None
+        )
+        if float(body.max()) > 0.0:
+            why["self"] = why.get("self", 0) + 1
+            continue
+        r_t = R.from_quat(fquat)
+        assert isinstance(r_t, R)
+        off_ee = r_f.inv().apply(obs[f, EE] - pos[f])
+        rel_ee = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, ROT]))
+        assert isinstance(rel_ee, R)
+        seg = np.repeat(obs[e : e + 1], n, 0)
+        seg[:, ARM] = q_lin
+        seg[:, 7:9] = obs[f, 7:9]
+        seg[:, EE] = fpos + r_t.apply(np.repeat(off_ee[None], n, 0))
+        rot_ee_t = r_t * rel_ee
+        assert isinstance(rot_ee_t, R)
+        seg[:, ROT] = quat_to_rot6d(rot_ee_t.as_quat())
+        if j is not None:
+            off_obj = r_f.inv().apply(obs[f, obj_slice(j)] - pos[f])
+            rot_obj = slice(obj_slice(j).stop, obj_slice(j).stop + 6)
+            rel_obj = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, rot_obj]))
+            assert isinstance(rel_obj, R)
+            seg[:, obj_slice(j)] = fpos + r_t.apply(np.repeat(off_obj[None], n, 0))
+            rot_obj_t = r_t * rel_obj
+            assert isinstance(rot_obj_t, R)
+            seg[:, rot_obj] = quat_to_rot6d(rot_obj_t.as_quat())
+        a = np.repeat(act[f : f + 1], n, 0)
+        a[:, ARM] = np.concatenate([q_lin[1:], q_obs[e : e + 1]])
+        out.append(
+            (
+                np.concatenate([seg, obs[e:]]).astype(np.float32),
+                np.concatenate([a, act[e:]]).astype(np.float32),
+                n,
+                float(np.linalg.norm(d)),
+            )
+        )
+    return out, why
+
+
+def recover_segments(cfg, x, chain, base, fcol, rng, n_obj):
+    if not x["segs"]:
+        return [], {"noseg": 1}
+    (c, o), j = x["segs"][0], x["held"][0]
+    m = int(round(cfg.bend_margin * cfg.env.fps))
+    out, why = [], {}
+    phases = []
+    if cfg.recover and o - m - (c + m) >= 2 and j is not None:
+        phases.append((c + m, o - m, o - m, (c, o), j, cfg.recover))
+    if cfg.recover_approach and c - m >= 2:
+        phases.append((0, c - m, c - m, (0, c), None, cfg.recover_approach))
+    for lo, hi, e, span, held, count in phases:
+        segs, w = recover_phase(
+            cfg, x, chain, base, fcol, rng, lo, hi, e, span, held, count
+        )
+        out += segs
+        for k, v in w.items():
+            why[k] = why.get(k, 0) + v
+    return out, why
+
+
 def augment_libero(cfg):
     from flow_planning.envs.libero import LiberoConfig, LiberoEnv
 
@@ -341,6 +460,30 @@ def augment_libero(cfg):
                 write(
                     dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language
                 )
+        if cfg.recover or cfg.recover_approach:
+            n_rec, lens, mags = 0, [], []
+            why_all: dict[str, int] = {}
+            for x in tqdm(demos, desc="recover"):
+                segs, why = recover_segments(
+                    cfg, x, chain, base, fcol, rng, len(env.objects)
+                )
+                for k, v in why.items():
+                    why_all[k] = why_all.get(k, 0) + v
+                for o, a, n, mag in segs:
+                    write(dst, o, a, np.zeros(LABEL_DIM * n_seg), env.language)
+                    n_rec += 1
+                    lens.append(n)
+                    mags.append(mag)
+            print(
+                f"task {task_id}: {n_rec} recovery segments "
+                f"({n_rec / max(len(demos), 1):.1f}/demo), rejected {why_all}, "
+                f"linear frames p50 {np.median(lens) if lens else 0:.0f} "
+                f"max {max(lens) if lens else 0}, |noise| mean "
+                f"{np.mean(mags) if mags else 0:.3f}"
+            )
+        if cfg.copies == 0:
+            del env
+            continue
 
         tcfg = cfg
         if cfg.alpha_tasks and task_id not in cfg.alpha_tasks:
