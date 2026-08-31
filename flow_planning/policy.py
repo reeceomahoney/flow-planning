@@ -250,6 +250,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.hold_tol = None  # search: re-pick when the held plan scores above this
         self.last_scores = None  # (n_worlds, K) selector scores of the last search
         self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
+        self.ensemble = 1  # >1: average this many overlapping chunks per step
+        self.ensemble_m = 0.0  # chunk weight exp(-m * age); m>0 favours newer
         self.guidance_scale = 1.0  # CFG on the bend/posture latent; 1 = off
         self.chunk_fn = None  # optional post-hoc projection of the normalized chunk
         self.reset()
@@ -263,6 +265,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def reset(self):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.last_chunk = None
+        self.chunks: list = []
+        self.frame = 0
         self.latched_cond = None  # per-world bend picked at the first replan
         self.latched_idx = None
 
@@ -401,10 +405,26 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Return one action per call from the planned chunk, replanning when the
         queue empties (receding horizon)."""
+        k = self.config.n_action_steps
+        if self.ensemble > 1:
+            if self.frame % k == 0:
+                self.last_chunk = self.predict_action_chunk(batch)
+                self.chunks = [(self.frame, self.last_chunk)] + self.chunks
+                self.chunks = self.chunks[: self.ensemble]
+            acts, ws = [], []
+            for age, (start, chunk) in enumerate(self.chunks):
+                i = self.frame - start
+                if i < chunk.shape[1]:
+                    acts.append(chunk[:, i])
+                    ws.append(math.exp(-self.ensemble_m * age))
+            w = torch.tensor(ws, device=acts[0].device, dtype=acts[0].dtype)
+            self.frame += 1
+            return (torch.stack(acts) * w[:, None, None]).sum(0) / w.sum()
         if len(self._action_queue) == 0:
             self.last_chunk = self.predict_action_chunk(batch)  # full horizon
             actions = self.last_chunk[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
+        self.frame += 1
         return self._action_queue.popleft()
 
 

@@ -67,6 +67,8 @@ class Config:
     )  # search: <0 latch first pick; else re-search once score > tol
     resample: bool = False  # search: fresh candidates + re-selection every replan
     cbf: bool = False  # AEGIS-style EE-ellipsoid safety filter on executed actions
+    ensemble: int = 1  # >1: temporal ensembling over this many overlapping chunks
+    ensemble_m: float = 0.0  # chunk weight exp(-m * age), m>0 favours newer chunks
     cbf_alpha: float = 10.0
     cbf_geoms: bool = False  # one ellipsoid per obstacle geom instead of one MVEE
     cbf_margin: float = 0.0  # barrier acts on h - margin
@@ -112,6 +114,7 @@ def main(cfg: Config):
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
     policy.guidance_scale = cfg.guidance_scale
+    policy.ensemble, policy.ensemble_m = cfg.ensemble, cfg.ensemble_m
     policy.to(device)
 
     dataset = LeRobotDataset(cfg.repo_id)
