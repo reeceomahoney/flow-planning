@@ -246,12 +246,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.cloud = None  # scene point cloud (1, N, 3) for cloud_points models
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.latched_idx = None
-        self.hold_tol = None  # search: re-pick when the held plan scores above this
-        self.last_scores = None  # (n_worlds, K) selector scores of the last search
         self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
         self.ensemble = 1  # >1: average this many overlapping chunks per step
         self.ensemble_m = 0.0  # chunk weight exp(-m * age); m>0 favours newer
-        self.guidance_scale = 1.0  # CFG on the bend/posture latent; 1 = off
         self.chunk_fn = None  # optional post-hoc projection of the normalized chunk
         self.reset()
 
@@ -319,13 +316,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             x = x.clone()
             x[:, 0, :sd] = state
             x[:, -1, gs : gs + gd] = goal
-            if cond is not None and self.guidance_scale != 1.0:
-                vc = self.model(x, t, cond)
-                vu = self.model(x, t, None)
-                v = vu + self.guidance_scale * (vc - vu)
-            else:
-                v = self.model(x, t, cond, None, cloud)
-            x = x + dt * v
+            x = x + dt * self.model(x, t, cond, None, cloud)
         return x
 
     @torch.no_grad()
@@ -340,12 +331,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         n_worlds = obs.shape[0]
         # bend conditioning: fixed command, latched pick, or a candidate search
         # where the selector keeps the plan with the lowest collision score
-        cond, k, searching = None, 1, False
+        cond, k, searching, resample = None, 1, False, False
         if self.config.cond_dim and self.cond_candidates is not None:
             searching = True
             cands = self.cond_candidates
             if callable(cands):
-                cands = cands()
+                cands, resample = cands(), True
             k = cands.shape[0]
             cond = cands.repeat(n_worlds, 1)
         else:
@@ -379,12 +370,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         )
         if sel is not None and k > 1:  # lowest-scoring candidate per world
             score = sel(x).view(n_worlds, k)
-            self.last_scores = score.clone()
-            if searching and self.latched_idx is not None:  # keep the held pick
+            if searching and not resample and self.latched_idx is not None:
                 keep = F.one_hot(self.latched_idx, k).bool()
-                if self.hold_tol is not None:
-                    dirty = score.gather(1, self.latched_idx[:, None]) > self.hold_tol
-                    keep = keep | dirty
                 score = score.masked_fill(~keep, torch.inf)
             pick = score.argmin(dim=1)
             rows = torch.arange(len(pick), device=x.device)

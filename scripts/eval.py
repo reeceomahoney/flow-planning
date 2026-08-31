@@ -60,12 +60,6 @@ class Config:
     n_cond: int = 8  # search: uniform candidates drawn at startup
     fixed: str = ""  # cond=fixed: comma-separated label values
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
-    gap: bool = False  # print per-episode plan vs executed min obstacle clearance
-    guidance_scale: float = 1.0  # CFG strength on the bend/posture latent
-    cond_scale: float = 1.0  # search: stretch the sampled bend magnitude range by this
-    hold_tol: float = (
-        -1.0
-    )  # search: <0 latch first pick; else re-search once score > tol
     resample: bool = False  # search: fresh candidates + re-selection every replan
     cbf: bool = False  # AEGIS-style EE-ellipsoid safety filter on executed actions
     ensemble: int = 1  # >1: temporal ensembling over this many overlapping chunks
@@ -81,7 +75,7 @@ class Config:
     cbf_offset: str = ""  # hand ellipsoid centre offset in the TCP frame "x,y,z"
 
 
-def sample_cond(bend: np.ndarray, k: int, rng, device, scale=1.0) -> torch.Tensor:
+def sample_cond(bend: np.ndarray, k: int, rng, device) -> torch.Tensor:
     if bend.shape[1] >= LABEL_DIM:
         rows, counts = np.unique(
             bend[np.abs(bend).sum(1) > 0], axis=0, return_counts=True
@@ -94,7 +88,7 @@ def sample_cond(bend: np.ndarray, k: int, rng, device, scale=1.0) -> torch.Tenso
     nz = r > 0
     assert nz.any(), "dataset has no bent episodes; every bend label is zero"
     ang = np.arctan2(arc[nz, 1], arc[nz, 0])
-    phi = rng.uniform(r[nz].min(), r.max() * scale, k)
+    phi = rng.uniform(r[nz].min(), r.max(), k)
     theta = rng.uniform(ang.min(), ang.max(), k)
     cols = [phi * np.cos(theta), phi * np.sin(theta)]
     cols += [rng.choice(np.unique(bend[:, j]), k) for j in range(2, bend.shape[1])]
@@ -114,7 +108,6 @@ def main(cfg: Config):
         policy.config.n_action_steps = cfg.n_action_steps
     if cfg.num_inference_steps > 0:
         policy.config.num_inference_steps = cfg.num_inference_steps
-    policy.guidance_scale = cfg.guidance_scale
     policy.ensemble, policy.ensemble_m = cfg.ensemble, cfg.ensemble_m
     policy.to(device)
 
@@ -198,16 +191,14 @@ def main(cfg: Config):
                 print(f"oracle cond best-of-{cfg.n_cond} over noise")
         elif cfg.cond is Cond.SEARCH:  # candidates scored + latched via selector
             assert policy.selector_fn is not None, "search needs --env.obstacle"
-            cand = sample_cond(bend, cfg.n_cond, rng, device, cfg.cond_scale)
+            cand = sample_cond(bend, cfg.n_cond, rng, device)
             policy.cond_candidates = cand
-            policy.hold_tol = None if cfg.hold_tol < 0 else cfg.hold_tol
             policy.n_samples = cfg.n_cond
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
             if cfg.resample:
                 policy.cond_candidates = lambda: sample_cond(
-                    bend, cfg.n_cond, rng, device, cfg.cond_scale
+                    bend, cfg.n_cond, rng, device
                 )
-                policy.hold_tol = -1.0
                 print(f"resampling {cfg.n_cond} candidates at every replan")
 
     cbf = None
@@ -287,26 +278,10 @@ def main(cfg: Config):
         if cfg.cond is Cond.RANDOM and bend is not None:
             policy.cond = sample_cond(bend, n, rng, device)
         if cfg.cond is Cond.SEARCH and bend is not None and not cfg.resample:
-            policy.cond_candidates = sample_cond(
-                bend, cfg.n_cond, rng, device, cfg.cond_scale
-            )
+            policy.cond_candidates = sample_cond(bend, cfg.n_cond, rng, device)
         succ = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
         frame = 0
-        if cfg.gap and sel is not None:
-            exec_min = torch.full((n,), torch.inf, device=device)
-            plan_min = torch.full((n,), torch.inf, device=device)
-            last_plan_id = 0
-            dirty_all = torch.zeros(n, device=device)
-            dirty_pick = torch.zeros(n, device=device)
-            n_plans = 0
-
-            def clear_min(q):
-                b, t = q.shape[:2]
-                pts = sel.fc.arm_points(q.reshape(-1, 7).float()).reshape(b, t, -1, 3)
-                d = sel.dist(pts + sel.fc.base_pos, sel.box) - sel.rad
-                return d.amin(dim=(1, 2))
-
         pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
         while frame < frames and viewer.is_running():
             if viewer.should_step():
@@ -335,36 +310,12 @@ def main(cfg: Config):
                     h_min = np.minimum(h_min, h.cpu().numpy())
                     cbf_active += ((dq - nom).abs().amax(1) > 1e-6).cpu().numpy()
                 env.apply_action(phys)
-                if cfg.gap and sel is not None:
-                    exec_min = torch.minimum(
-                        exec_min, clear_min(obs[:, None, :7].to(device))
-                    )
-                    if (
-                        policy.last_chunk is not None
-                        and id(policy.last_chunk) != last_plan_id
-                    ):
-                        last_plan_id = id(policy.last_chunk)
-                        qp = policy.last_chunk[..., :7] * torch.as_tensor(
-                            act_std[:7], dtype=torch.float32, device=device
-                        ) + torch.as_tensor(
-                            act_mean[:7], dtype=torch.float32, device=device
-                        )
-                        plan_min = torch.minimum(plan_min, clear_min(qp))
-                        if (
-                            policy.last_scores is not None
-                            and policy.latched_idx is not None
-                        ):
-                            sc = policy.last_scores
-                            dirty_all += sc.amin(1) > 0
-                            dirty_pick += (
-                                sc.gather(1, policy.latched_idx[:, None])[:, 0] > 0
-                            )
-                            n_plans += 1
                 if live and arm and policy.last_chunk is not None:
                     chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
                     q = torch.from_numpy(chunk[:, :7]).float().to(device)
-                    path = ee_positions(chain, q).cpu().numpy() + base_pos
-                    env.set_predicted_path(path)
+                    env.set_predicted_path(
+                        ee_positions(chain, q).cpu().numpy() + base_pos
+                    )
                 frame += 1
                 pbar.update(1)
                 succ |= env.success()
@@ -418,21 +369,6 @@ def main(cfg: Config):
                 f"cbf: min h {h_min.round(3)} active frac "
                 f"{(cbf_active / max(frame, 1)).round(2)} fail {fail.astype(int)}"
             )
-        if cfg.gap and sel is not None:
-            print(
-                f"gap: plan min clearance {plan_min.cpu().numpy().round(3)} "
-                f"exec {exec_min.cpu().numpy().round(3)} fail {fail.astype(int)} "
-                f"timeout {stuck.astype(int)}"
-            )
-            print(
-                f"replans {n_plans}: no clean candidate "
-                f"{dirty_all.int().cpu().numpy()} "
-                f"picked dirty {dirty_pick.int().cpu().numpy()}"
-            )
-            if hasattr(env, "contact_labels"):
-                print(
-                    "timeout contacts:", Counter(env.contact_labels()[stuck].tolist())
-                )
         if hasattr(env, "contact_labels") and fail.any():
             contacts.update(env.contact_labels()[fail].tolist())
         if stages is not None:

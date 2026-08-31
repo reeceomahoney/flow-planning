@@ -15,7 +15,6 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.feature_utils import dataset_to_policy_features
-from safetensors.torch import load_file
 
 import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
@@ -39,12 +38,7 @@ class Config:
     n_layers: int = 8
     cond_dim: int = -1  # -1: take it from the dataset's bend feature
     cloud_points: int = 0  # >0: condition on a scene point cloud of this many points
-    init_from: str = ""  # checkpoint dir to fine-tune from (new cond pathway zero-init)
-    freeze_backbone: bool = False  # train only the conditioning pathway + AdaLN
-    episodes: int = 0  # >0: random subset of this many episodes
-    aug_episodes: int = 0  # >0: subset of this many augmented (nonzero bend) episodes
     balance_tasks: bool = False  # sample windows uniformly per task_index
-    orig_episodes: int = 0  # with aug_episodes: how many unaugmented episodes to add
     seed: int = 0
     warmup_iters: int = 500
     ema_decay: float = 0.999
@@ -155,22 +149,7 @@ def main(cfg: Config):
 
     rng = np.random.default_rng(cfg.seed)
     torch.manual_seed(cfg.seed)
-    subset = None
-    if cfg.episodes > 0:
-        n_total = LeRobotDataset(cfg.repo_id).meta.total_episodes
-        subset = sorted(rng.choice(n_total, cfg.episodes, replace=False).tolist())
-    elif cfg.aug_episodes > 0:
-        full = LeRobotDataset(cfg.repo_id).hf_dataset
-        ep_all = hf_column(full, "episode_index")
-        first = np.unique(ep_all, return_index=True)[1]
-        aug = np.abs(hf_column(full, "bend")[first]).sum(1) > 0
-        ids = ep_all[first]
-        subset = sorted(
-            rng.choice(ids[aug], cfg.aug_episodes, replace=False).tolist()
-            + rng.choice(ids[~aug], cfg.orig_episodes, replace=False).tolist()
-        )
-        print(f"subset: {cfg.aug_episodes} augmented + {cfg.orig_episodes} original")
-    dataset = LeRobotDataset(cfg.repo_id, episodes=subset)
+    dataset = LeRobotDataset(cfg.repo_id)
     features = dataset_to_policy_features(dataset.features)
     output_features = {
         k: v for k, v in features.items() if v.type is FeatureType.ACTION
@@ -201,20 +180,6 @@ def main(cfg: Config):
     assert stats is not None
 
     policy = FlowMatchingPolicy(policy_cfg, dataset_stats=stats).to(device)
-    if cfg.init_from:
-        base = load_file(str(Path(cfg.init_from) / "model.safetensors"), device=device)
-        missing, unexpected = policy.load_state_dict(base, strict=False)
-        assert not unexpected, unexpected
-        print(f"init from {cfg.init_from}: new params {sorted(missing)}")
-        if hasattr(policy.model, "cond_mlp"):
-            for param in policy.model.cond_mlp[-1].parameters():
-                param.data.zero_()
-    if cfg.freeze_backbone:
-        keep = ("cond_mlp", "cloud_enc", "cloud_out", "null_cond", ".mod.")
-        for name, param in policy.named_parameters():
-            param.requires_grad = any(k in name for k in keep)
-        n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        print(f"backbone frozen: {n_train / 1e6:.2f}M trainable")
     policy.model = cast(FlowTransformer, torch.compile(policy.model))
 
     use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
@@ -250,7 +215,6 @@ def main(cfg: Config):
         policy.cond_candidates = sample_cond(
             hf_column(dataset.hf_dataset, "bend"), cfg.eval_search, rng, device
         )
-        policy.hold_tol = 0.0
         print(f"eval: wall search over {cfg.eval_search} candidates", flush=True)
 
     # frames live once in host RAM; full-horizon windows are gathered per batch
