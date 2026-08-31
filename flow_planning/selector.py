@@ -2,9 +2,6 @@
 and the lowest-cost one is executed. Selection needs no gradients, so exact
 geometry beats a learned proxy."""
 
-import os
-import tempfile
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -167,15 +164,9 @@ class AnalyticSelector:
         cube_index: int | None = 18,
         n_arm: int = 7,
         pointcloud=None,
-        mesh=None,
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.device = device
-        self.mesh_sdf = None
-        if mesh is not None:
-            path = os.path.join(tempfile.gettempdir(), "obstacle_mesh.obj")
-            mesh.export(path)
-            self.mesh_sdf = LinkSDF(path, mesh.bounds, device, pad=0.2)
         self.fc = FrankaCollision(device, base_pos, cube_size)
         self.box = torch.as_tensor(box, **f32).view(-1, 6)[:, None]
         self.cloud = None if pointcloud is None else torch.as_tensor(pointcloud, **f32)
@@ -216,8 +207,6 @@ class AnalyticSelector:
         return torch.cat(out)
 
     def dist(self, points: Tensor, box: Tensor) -> Tensor:
-        if self.mesh_sdf is not None:
-            return self.mesh_sdf(points)
         if self.cloud is None:
             if box.dim() == 2:
                 box = box[:, None]

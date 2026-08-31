@@ -157,7 +157,6 @@ def main(cfg: Config):
             cube_size=env.cube_size,
             cube_index=getattr(env, "cube_index", 18),
             pointcloud=cloud,
-            mesh=None if cloud is not None else getattr(env, "obstacle_mesh", None),
         )
         joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
         sel.fc.calibrate_self(torch.as_tensor(joints, device=device))
