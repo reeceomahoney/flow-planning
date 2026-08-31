@@ -43,6 +43,7 @@ class Config:
     freeze_backbone: bool = False  # train only the conditioning pathway + AdaLN
     episodes: int = 0  # >0: random subset of this many episodes
     aug_episodes: int = 0  # >0: subset of this many augmented (nonzero bend) episodes
+    balance_tasks: bool = False  # sample windows uniformly per task_index
     orig_episodes: int = 0  # with aug_episodes: how many unaugmented episodes to add
     seed: int = 0
     warmup_iters: int = 500
@@ -283,6 +284,12 @@ def main(cfg: Config):
     ep_end = last[ep]
     n_samples = obs_all.shape[0]
     steps = torch.arange(policy_cfg.horizon)
+    weights = None
+    if cfg.balance_tasks:
+        ti = torch.as_tensor(hf_column(hf, "task_index"), dtype=torch.long)
+        counts = torch.bincount(ti).float()
+        weights = 1.0 / counts[ti]
+        print(f"task-balanced sampling over {len(counts)} tasks", flush=True)
     mb = (obs_all.nbytes + act_all.nbytes) / 1e6
     print(f"Loaded {n_samples} frames ({mb:.0f} MB) in RAM", flush=True)
 
@@ -305,7 +312,10 @@ def main(cfg: Config):
     policy.train()
     last_log_time = time.perf_counter()
     for it in range(cfg.num_iters):
-        idx = torch.randint(0, n_samples, (cfg.batch_size,))
+        if weights is not None:
+            idx = torch.multinomial(weights, cfg.batch_size, replacement=True)
+        else:
+            idx = torch.randint(0, n_samples, (cfg.batch_size,))
         rows = torch.minimum(idx[:, None] + steps, ep_end[idx][:, None])
         batch = preprocessor({OBS_STATE: obs_all[rows], ACTION: act_all[rows]})
         if bend_all is not None:
