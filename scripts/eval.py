@@ -52,6 +52,7 @@ class Config:
     episode_seconds: float = 0.0  # 0 = train.py's 1.5 * env.episode_frames
     viewer: str = "none"  # "none", "rerun", or "opengl"
     video: str = ""  # non-empty: render headless to this mp4
+    video_failures: bool = False  # video: keep only episodes that collide or time out
     seed: int = 0
     n_action_steps: int = 0  # >0 overrides the checkpoint replan interval
     num_inference_steps: int = 0  # >0 overrides the checkpoint ODE step count
@@ -262,6 +263,7 @@ def main(cfg: Config):
         else getattr(env, "max_frames", int(1.5 * env.episode_frames))
     )
     writer = None
+    clip: list = []
     ei = getattr(env, "ee_state_index", 0)
     total_succ = total_fail = total_task = total = 0
     stages = getattr(env, "STAGES", None)  # franka pick-place stage ladder
@@ -387,6 +389,17 @@ def main(cfg: Config):
                 env.render()
             if cfg.video:
                 f = env.get_frame() if own_frames else viewer.get_frame().numpy()
+                f = np.ascontiguousarray(f)
+                tag = f"ep {ep} t {frame}"
+                if cbf is not None:
+                    tag += f" h {h_min[0]:+.3f}"
+                if env.failure()[0]:
+                    tag += f" COLLIDED {env.contact_labels()[0]}"
+                elif succ[0]:
+                    tag += " success"
+                cv2.putText(
+                    f, tag, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1
+                )
                 if writer is None:
                     writer = cv2.VideoWriter(
                         cfg.video,
@@ -394,11 +407,15 @@ def main(cfg: Config):
                         cfg.env.fps,
                         (f.shape[1], f.shape[0]),
                     )
-                writer.write(f[..., ::-1])
+                clip.append(f[..., ::-1])
         pbar.close()
         if not viewer.is_running():
             break
         fail = env.failure()
+        if writer is not None and (not cfg.video_failures or not succ[0] or fail[0]):
+            for f in clip:
+                writer.write(f)
+        clip = []
         total_task += int(succ.sum())
         succ &= ~fail
         stuck = ~succ & ~fail
