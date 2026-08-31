@@ -14,6 +14,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from tqdm import tqdm
 
 from flow_planning.bend import LABEL_DIM
+from flow_planning.cbf import EllipsoidCBF
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.envs.franka import subsample_cloud
 from flow_planning.kinematics import build_franka_chain, ee_positions
@@ -21,7 +22,7 @@ from flow_planning.policy import (
     FlowMatchingPolicy,
     make_flow_matching_pre_post_processors,
 )
-from flow_planning.selector import AnalyticSelector
+from flow_planning.selector import AnalyticSelector, FrankaCollision
 from flow_planning.utils import hf_column, latest_run_dir, make_viewer
 
 np.set_printoptions(linewidth=100000)
@@ -65,6 +66,16 @@ class Config:
         -1.0
     )  # search: <0 latch first pick; else re-search once score > tol
     resample: bool = False  # search: fresh candidates + re-selection every replan
+    cbf: bool = False  # AEGIS-style EE-ellipsoid safety filter on executed actions
+    cbf_alpha: float = 10.0
+    cbf_geoms: bool = False  # one ellipsoid per obstacle geom instead of one MVEE
+    cbf_margin: float = 0.0  # barrier acts on h - margin
+    cbf_init: int = 0  # >0: filter-only steps at reset until h >= margin
+    cbf_hold: float = 0.0  # >0: held-object sphere radius joins the barrier
+    cbf_chunk: bool = False  # project the whole predicted chunk through the barrier
+    cbf_axes: str = ""  # hand ellipsoid semi-axes "x,y,z" (default paper values)
+    cbf_arm: str = ""  # comma-separated fr3 link indices to add to the barrier
+    cbf_offset: str = ""  # hand ellipsoid centre offset in the TCP frame "x,y,z"
 
 
 def sample_cond(bend: np.ndarray, k: int, rng, device, scale=1.0) -> torch.Tensor:
@@ -205,6 +216,37 @@ def main(cfg: Config):
                 policy.hold_tol = -1.0
                 print(f"resampling {cfg.n_cond} candidates at every replan")
 
+    cbf = None
+    if cfg.cbf:
+        assert cfg.env.obstacle and hasattr(env, "obstacle_points")
+        kw: dict = {}
+        if cfg.cbf_axes:
+            kw["axes"] = [float(v) for v in cfg.cbf_axes.split(",")]
+        if cfg.cbf_offset:
+            kw["offset"] = [float(v) for v in cfg.cbf_offset.split(",")]
+        cbf = EllipsoidCBF(
+            device, env.robot_base_pos, alpha=cfg.cbf_alpha, dt=1 / cfg.env.fps, **kw
+        )
+        cbf.margin = cfg.cbf_margin
+        if cfg.cbf_arm:
+            assert cfg.cbf_geoms, "arm barrier needs --cbf_geoms"
+            cbf.arm_links = tuple(int(v) for v in cfg.cbf_arm.split(","))
+            cbf.fc = FrankaCollision(device, env.robot_base_pos, 0.0)
+        print(f"cbf filter on, alpha {cfg.cbf_alpha} margin {cfg.cbf_margin}")
+        if cfg.cbf_chunk:
+            am = torch.as_tensor(act_mean[:7], dtype=torch.float32, device=device)
+            asd = torch.as_tensor(act_std[:7], dtype=torch.float32, device=device)
+
+            def project(acts):
+                assert cbf is not None
+                q0 = last_obs[:, :7].to(device)
+                tgt = acts[..., :7] * asd + am
+                acts = acts.clone()
+                acts[..., :7] = (cbf.project_chunk(q0, tgt) - am) / asd
+                return acts
+
+            policy.chunk_fn = project
+
     arm = hasattr(env, "ee_state_index")  # franka: planned path needs EE FK
     if arm:
         chain = build_franka_chain(device)[0]
@@ -217,6 +259,7 @@ def main(cfg: Config):
         else getattr(env, "max_frames", int(1.5 * env.episode_frames))
     )
     writer = None
+    ei = getattr(env, "ee_state_index", 0)
     total_succ = total_fail = total_task = total = 0
     stages = getattr(env, "STAGES", None)  # franka pick-place stage ladder
     nz = len(stages) if stages else 0
@@ -231,6 +274,21 @@ def main(cfg: Config):
         env.reset()
         if sel is not None and hasattr(env, "obstacle_boxes"):
             sel.set_boxes(env.obstacle_boxes())
+        if cbf is not None:
+            if cfg.cbf_geoms:
+                cbf.set_boxes(env.obstacle_own_boxes())
+            else:
+                cbf.set_obstacles(env.obstacle_points())
+            h_min = np.full(n, np.inf)
+            cbf_active = np.zeros(n)
+            for _ in range(cfg.cbf_init):
+                obs0 = torch.from_numpy(env.get_obs())
+                q0 = obs0[:, :7].to(device)
+                if bool((cbf.value(q0) >= cfg.cbf_margin).all()):
+                    break
+                dq0, _ = cbf.filter(q0, torch.zeros_like(q0))
+                a0 = np.concatenate([(q0 + dq0).cpu().numpy(), obs0[:, 7:8].numpy()], 1)
+                env.apply_action(a0.astype(np.float32))
         if cfg.cond is Cond.RANDOM and bend is not None:
             policy.cond = sample_cond(bend, n, rng, device)
         if cfg.cond is Cond.SEARCH and bend is not None and not cfg.resample:
@@ -258,8 +316,29 @@ def main(cfg: Config):
         while frame < frames and viewer.is_running():
             if viewer.should_step():
                 obs = torch.from_numpy(env.get_obs())
+                last_obs = obs
                 action = policy.select_action(preprocessor({OBS_STATE: obs}))
                 phys = postprocessor(action).numpy().astype(np.float32)
+                if cbf is not None:
+                    q = obs[:, :7].to(device)
+                    nom = torch.as_tensor(phys[:, :7], device=device) - q
+                    attach = None
+                    if cfg.cbf_hold > 0:
+                        held = torch.as_tensor(obs[:, 18:21], device=device)
+                        near = (held - obs[:, ei : ei + 3].to(device)).norm(
+                            dim=1
+                        ) < 0.12
+                        closed = torch.as_tensor(phys[:, 7] < 0.02, device=device)
+                        off = cbf.attach_offset(q, held)
+                        far = torch.full_like(off, 1e3)
+                        attach = (
+                            torch.where((near & closed)[:, None], off, far),
+                            cfg.cbf_hold,
+                        )
+                    dq, h = cbf.filter(q, nom, attach)
+                    phys[:, :7] = (q + dq).cpu().numpy()
+                    h_min = np.minimum(h_min, h.cpu().numpy())
+                    cbf_active += ((dq - nom).abs().amax(1) > 1e-6).cpu().numpy()
                 env.apply_action(phys)
                 if cfg.gap and sel is not None:
                     exec_min = torch.minimum(
@@ -327,6 +406,11 @@ def main(cfg: Config):
             f"batch {ep}: success {succ.mean():.3f} "
             f"failure {fail.mean():.3f} timeout {stuck.mean():.3f}"
         )
+        if cbf is not None:
+            print(
+                f"cbf: min h {h_min.round(3)} active frac "
+                f"{(cbf_active / max(frame, 1)).round(2)} fail {fail.astype(int)}"
+            )
         if cfg.gap and sel is not None:
             print(
                 f"gap: plan min clearance {plan_min.cpu().numpy().round(3)} "

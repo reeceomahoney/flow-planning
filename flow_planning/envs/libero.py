@@ -453,6 +453,23 @@ class LiberoEnv:
             out[i, : len(b)] = b
         return out
 
+    def obstacle_own_boxes(self):
+        return [
+            geom_boxes(e, self.obstacle[i]) if self.obstacle[i] is not None else None
+            for i, e in enumerate(self.envs)
+        ]
+
+    def obstacle_points(self):
+        signs = np.array(np.meshgrid(*[[-1, 1]] * 3)).reshape(3, -1).T
+        out = []
+        for i, e in enumerate(self.envs):
+            if self.obstacle[i] is None:
+                out.append(None)
+                continue
+            b = geom_boxes(e, self.obstacle[i])
+            out.append((b[:, None, :3] + signs[None] * b[:, None, 3:]).reshape(-1, 3))
+        return out
+
     @property
     def obstacle_geometry(self):
         box = union_box(self.obstacle_boxes()[0])

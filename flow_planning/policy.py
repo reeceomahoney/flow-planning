@@ -248,10 +248,10 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.cond_candidates = None  # (K, cond_dim): search + latch via selector_fn
         self.latched_idx = None
         self.hold_tol = None  # search: re-pick when the held plan scores above this
-        self.last_scores = None
         self.last_scores = None  # (n_worlds, K) selector scores of the last search
         self.n_samples = 1  # >1 with no candidates: best-of-N over noise alone
         self.guidance_scale = 1.0  # CFG on the bend/posture latent; 1 = off
+        self.chunk_fn = None  # optional post-hoc projection of the normalized chunk
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -391,6 +391,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 self.latched_idx = pick
                 self.latched_cond = cond.view(-1, k, cond.shape[-1])[rows, pick]
         acts = x[..., sd:]  # normalized action dims
+        if self.chunk_fn is not None:
+            acts = self.chunk_fn(acts)
         if self.action_clip is not None:
             acts = acts.clamp(self.action_clip[0], self.action_clip[1])
         return acts
