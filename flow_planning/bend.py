@@ -142,8 +142,8 @@ def tpad(a, tm):  # (T, ...) -> (tm, ...) repeating the last frame
 
 
 OBJ0 = 18
-SEG_ZERO = (0.0, 0.0, 0.0, 0.0)
-LABEL_DIM = 4
+SEG_ZERO = (0.0, 0.0, 0.0, 0.0, 0.0)
+LABEL_DIM = 6
 
 
 def obj_slice(k):
@@ -199,18 +199,76 @@ def bulge_delta(ee, s0, s1, phi, theta):
     return d
 
 
-def seg_options(rng, phi_range, n_phi, n_theta):
+def wrap(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def rotz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def hand_yaw(alpha, q7):
+    y = ((alpha + np.pi / 2) % np.pi) - np.pi / 2
+    opts = [y, y - np.pi, y + np.pi]
+    return min(opts, key=lambda v: abs(q7 - v))
+
+
+def grasp_rotation(
+    ee, quat, w0, close, opened, w1, m, centre, alpha, yaw=None, lead=None
+):
+    from scipy.spatial.transform import Rotation as R
+
+    T = len(ee)
+    a1 = max(close - m, w0 + 1)
+    if lead is not None:
+        w0 = max(w0, a1 - lead)
+    centre = np.array([centre[0], centre[1], 0.0])
+    oh = ee[close] - centre
+    oh[2] = 0.0
+    t = np.arange(T)
+    ramp = np.clip((t - w0) / (a1 - w0), 0.0, 1.0)
+    if w1 is not None:
+        decay = np.clip(1 - (t - opened) / max(w1 - opened, 1), 0.0, 1.0)
+        ramp = np.where(t > opened, decay, ramp)
+    new_ee = ee.copy()
+    off = rotz(alpha) @ oh - oh
+    for i in range(w0, T):
+        if i < a1:
+            new_ee[i] = centre + rotz(ramp[i] * alpha) @ (ee[i] - centre)
+        else:
+            new_ee[i] = ee[i] + ramp[i] * off
+    if yaw is None:
+        yaw = wrap(alpha)
+    rot = R.from_euler("z", (ramp * yaw)[:, None]) * R.from_quat(quat)
+    assert isinstance(rot, R)
+    return new_ee, rot.as_quat().astype(np.float32)
+
+
+def grasp_width(x, k, a):
+    from scipy.spatial.transform import Rotation as R
+
+    c = x["segs"][k][0]
+    ax = R.from_quat(x["quat"][c]).as_matrix()[:2, 1]
+    ax = rotz(a)[:2, :2] @ ax
+    return 2 * float(np.abs(ax) @ x["half"][k])
+
+
+def seg_options(rng, phi_range, n_phi, n_theta, alphas=(0.0,)):
     thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
     arcs = [(0.0, 0.0)] + [
         (float(rng.uniform(*phi_range)), th) for th in thetas for _ in range(n_phi)
     ]
-    return [(*ap, *tr) for ap in arcs for tr in arcs]
+    return [(a, *ap, *tr) for a in alphas for ap in arcs for tr in arcs]
 
 
 def encode_label(combo, n_seg):
     out = np.zeros(LABEL_DIM * n_seg, np.float32)
-    for k, (pa, ta, pt, tt) in enumerate(combo[:n_seg]):
+    for k, (a, pa, ta, pt, tt) in enumerate(combo[:n_seg]):
+        r = np.radians(a)
         out[LABEL_DIM * k : LABEL_DIM * (k + 1)] = [
+            np.sin(r),
+            1 - np.cos(r),
             pa * np.cos(ta),
             pa * np.sin(ta),
             pt * np.cos(tt),
@@ -231,7 +289,18 @@ def build(x, combo, m):
     expected = [
         e + d for e, d, j in zip(x["ends"], x["dps"], x["held"]) if j is not None
     ]
-    for k, ((c, o), (pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
+    for k, ((c, o), (a, pa, ta, pt, tt)) in enumerate(zip(segs, combo)):
+        j = x["held"][k]
+        if a and j is not None:
+            ra = np.radians(a)
+            if grasp_width(x, k, ra) > grasp_width(x, k, 0.0) + 0.01:
+                return None
+            w1 = segs[k + 1][0] - m if k + 1 < len(segs) else None
+            yaw = hand_yaw(ra, float(x["act"][c, 6]))
+            ee, quat = grasp_rotation(
+                ee, quat, w0, c, o, w1, m, x["obs"][0, obj_slice(j)], ra, yaw, 3 * m
+            )
+            fam.add("rot")
         if pa:
             ee = ee + bulge_delta(ee, w0 + m if k else 1, c - m, pa * np.pi, ta)
             fam.add("app")

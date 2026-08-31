@@ -101,7 +101,7 @@ def main(cfg: ViewConfig):
                 continue
             label = " ".join(
                 f"app{pa:.2f}/{ta:.1f} tr{pt:.2f}/{tt:.1f}"
-                for pa, ta, pt, tt in c["combo"]
+                for _a, pa, ta, pt, tt, *_ in c["combo"]
             )
             succ = record(env, cfg, x, c, Path(f"demo{d} {label}"), writer)
             print(f"demo {d} [{label}] success={succ}")

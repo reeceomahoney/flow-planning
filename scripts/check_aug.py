@@ -50,6 +50,7 @@ class Config:
     margin: float = 0.3
     phi_range: tuple[float, float] = (0.15, 0.85)
     n_phi: int = 3
+    alphas: list[float] = field(default_factory=lambda: [0.0])
     n_theta: int = 4
     stop_on_collision: bool = True
     seed: int = 0
@@ -325,7 +326,7 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
     aug = [c for c in ok if c["fam"] != "none"]
     groups = defaultdict(list)
     for c in aug:
-        groups[tuple(o[:2] for o in c["combo"])].append(c)
+        groups[tuple(o[:3] for o in c["combo"])].append(c)
     picked = []
     while len(picked) < cfg.replay_max // 2 and any(groups.values()):
         for g in list(groups):
@@ -367,7 +368,8 @@ def replay_round(cfg, env, i, cands, demos, names, stats, m, replay_none):
 
 def fmt(combo):
     return " ".join(
-        f"[{pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f}]" for pa, ta, pt, tt in combo
+        f"[{a:.0f} {pa:.2f} {ta:.2f} {pt:.2f} {tt:.2f}]"
+        for a, pa, ta, pt, tt, *_ in combo
     )
 
 
@@ -421,7 +423,7 @@ def scene_candidates(cfg, demos, names, geo, tshift):
         combos = [tuple([ZERO] * n)]
         for k in range(n):
             for opt in (
-                seg_options(rng, cfg.phi_range, cfg.n_phi, cfg.n_theta)
+                seg_options(rng, cfg.phi_range, cfg.n_phi, cfg.n_theta, cfg.alphas)
                 if x["held"][k] is not None
                 else [ZERO]
             ):

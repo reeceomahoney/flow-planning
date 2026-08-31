@@ -50,6 +50,9 @@ class Config:
     env: EnvConfig = field(default_factory=FrankaConfig)  # table geometry only
 
     phi_range: tuple[float, float] = (0.15, 0.85)
+    alphas: list[float] = field(default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
+    alpha_prob: float = 0.0
+    alpha_tasks: list[int] = field(default_factory=list)
     n_theta: int = 4
     focus: bool = False
     task_ids: list[int] = field(default_factory=list)
@@ -60,6 +63,8 @@ class Config:
     retarget_only: float = 0.3
     ik_tol: float = 0.01
     vel_frac: float = 0.8
+    ik_tol_aug: float = 0.05
+    vel_frac_aug: float = 1.5
     hold: int = 20
 
     demogen: bool = False
@@ -180,14 +185,17 @@ def libero_demos(cfg, env, chain, base, limit):
 def sample_option(cfg, rng):
     thetas = np.linspace(0.0, np.pi, cfg.n_theta, endpoint=False)
     phi = lambda: float(rng.uniform(*cfg.phi_range))  # noqa: E731
+    a = 0.0
+    if len(cfg.alphas) > 1 and rng.random() < cfg.alpha_prob:
+        a = float(rng.choice(cfg.alphas[1:]))
     if cfg.focus:
         half_pi = np.pi / 2
         app = (phi(), [0.0, 3 * np.pi / 4, half_pi][rng.integers(3)])
         tr = (phi(), half_pi) if rng.random() < 0.5 else (0.0, 0.0)
-        return (*app, *tr)
+        return (a, *app, *tr)
     app = (phi(), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
     tr = (phi(), rng.choice(thetas)) if rng.random() < 0.5 else (0.0, 0.0)
-    return (*app, *tr)
+    return (a, *app, *tr)
 
 
 def libero_candidates(cfg, demos, rng, per_demo):
@@ -266,11 +274,14 @@ def libero_solve(cfg, cands, demos, chain, base, fcol):
         act[:, ARM] = q
         c["act"] = act.astype(np.float32)
         c["ok"], c["why"] = True, ""
-        if err > cfg.ik_tol or rot_err.magnitude().max() > np.radians(15):
+        loose = any(o[0] for o in c["combo"])
+        tol = cfg.ik_tol_aug if loose else cfg.ik_tol
+        vf = cfg.vel_frac_aug if loose else cfg.vel_frac
+        if err > tol or rot_err.magnitude().max() > np.radians(15):
             c["ok"], c["why"] = False, "ik"
         elif np.abs(np.diff(q, n=2, axis=0)).max() > jerk_limit:
             c["ok"], c["why"] = False, "jerk"
-        elif np.abs(np.diff(q, axis=0)).max() > cfg.vel_frac * cfg.env.delta_max:
+        elif np.abs(np.diff(q, axis=0)).max() > vf * cfg.env.delta_max:
             c["ok"], c["why"] = False, "vel"
         else:
             body, _ = fcol.body_penetration(
@@ -331,7 +342,10 @@ def augment_libero(cfg):
                     dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language
                 )
 
-        cands = libero_candidates(cfg, demos, rng, 4 * cfg.copies)
+        tcfg = cfg
+        if cfg.alpha_tasks and task_id not in cfg.alpha_tasks:
+            tcfg = replace(cfg, alpha_prob=0.0)
+        cands = libero_candidates(tcfg, demos, rng, 4 * cfg.copies)
         print(f"{len(cands)} candidates")
         libero_solve(cfg, cands, demos, chain, base, fcol)
         written = rej_replay = 0
