@@ -38,12 +38,9 @@ def world_offset(viewer, first=False):
 def make_env(cfg: EnvConfig, viewer):
     from flow_planning.envs.franka import FrankaConfig, FrankaEnv
     from flow_planning.envs.libero import LiberoConfig, LiberoEnv
-    from flow_planning.envs.particle import ParticleConfig, ParticleEnv
 
     if isinstance(cfg, FrankaConfig):
         return FrankaEnv(cfg, viewer)
-    if isinstance(cfg, ParticleConfig):
-        return ParticleEnv(cfg, viewer)
     if isinstance(cfg, LiberoConfig):
         return LiberoEnv(cfg, viewer)
     raise ValueError(f"Unknown env config: {type(cfg).__name__}")

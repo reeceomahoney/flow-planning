@@ -138,15 +138,6 @@ def main(cfg: Config):
 
     env = make_env(cfg.env, viewer)
     env.rng = np.random.default_rng(cfg.seed)  # same instances as train.py's evaluate
-    arena = getattr(cfg.env, "arena_size", None)
-    if arena is not None:  # particle: clamp actions to the arena
-        low = torch.as_tensor(
-            (-arena - act_mean) / act_std, dtype=torch.float32, device=device
-        )
-        high = torch.as_tensor(
-            (arena - act_mean) / act_std, dtype=torch.float32, device=device
-        )
-        policy.action_clip = (low, high)
 
     rng = np.random.default_rng(cfg.seed)
     searching = cfg.cond is Cond.SEARCH
@@ -370,13 +361,10 @@ def main(cfg: Config):
                                 sc.gather(1, policy.latched_idx[:, None])[:, 0] > 0
                             )
                             n_plans += 1
-                if live and policy.last_chunk is not None:
+                if live and arm and policy.last_chunk is not None:
                     chunk = policy.last_chunk[0].cpu().numpy() * act_std + act_mean
-                    if arm:
-                        q = torch.from_numpy(chunk[:, :7]).float().to(device)
-                        path = ee_positions(chain, q).cpu().numpy() + base_pos
-                    else:
-                        path = chunk[:, :2]  # particle: action is the xy target
+                    q = torch.from_numpy(chunk[:, :7]).float().to(device)
+                    path = ee_positions(chain, q).cpu().numpy() + base_pos
                     env.set_predicted_path(path)
                 frame += 1
                 pbar.update(1)

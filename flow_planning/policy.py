@@ -241,7 +241,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.traj_dim = self.state_dim + act_dim
 
         self.model = FlowTransformer(self.traj_dim, config)
-        self.action_clip = None  # optional (low, high) normalized action bounds
         self.selector_fn = None  # optional plan scorer for candidate selection
         self.cond = None  # commanded bend params (1, cond_dim), None = null token
         self.cloud = None  # scene point cloud (1, N, 3) for cloud_points models
@@ -397,8 +396,6 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         acts = x[..., sd:]  # normalized action dims
         if self.chunk_fn is not None:
             acts = self.chunk_fn(acts)
-        if self.action_clip is not None:
-            acts = acts.clamp(self.action_clip[0], self.action_clip[1])
         return acts
 
     @torch.no_grad()

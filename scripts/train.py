@@ -100,7 +100,7 @@ def evaluate(policy, env, preprocessor, postprocessor, n_episodes, step):
     stage_sum = 0  # avg furthest pick-place stage reached, as a dense reward
     total = 0
 
-    has_stage = hasattr(env, "stage")  # franka pick-place ladder; particle has none
+    has_stage = hasattr(env, "stage")  # franka pick-place ladder
     for _ in range(math.ceil(n_episodes / n)):
         env.reset()
         policy.reset()

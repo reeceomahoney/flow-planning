@@ -81,7 +81,6 @@ select = ["E", "F", "I"]
 [[tool.ty.overrides]]
 include = [
   "flow_planning/envs/contact.py",
-  "flow_planning/envs/particle.py",
   "flow_planning/envs/franka.py",
   "flow_planning/envs/libero.py",
 ]
