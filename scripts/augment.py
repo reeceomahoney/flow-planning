@@ -84,6 +84,7 @@ class Config:
     filter: bool = False
     postures: int = 0
     posture_range: tuple[float, float] = (0.3, 1.0)
+    posture_prob: float = 0.0
     posture_gain: float = 0.2
     posture_min: float = 0.15
     track: bool = False
@@ -368,18 +369,51 @@ def kinematic_obs(x, c, chain, base, movable):
     return out.astype(np.float32)
 
 
-def libero_solve(cfg, cands, demos, chain, base, fcol):
+def libero_solve(cfg, cands, demos, chain, base, fcol, rng=None):
     """IK + feasibility gate; sets c["act"] / c["ok"] / c["why"] in place."""
     tm = max(len(x["act"]) for x in demos)
+    ee_all = np.stack([tpad(c["ee_t"], tm) for c in cands], axis=1)
+    quat_all = np.stack([tpad(c["quat"], tm) for c in cands], axis=1)
     q_all = solve_seq(
         chain,
-        np.stack([tpad(c["ee_t"], tm) for c in cands], axis=1),
-        np.stack([tpad(c["quat"], tm) for c in cands], axis=1),
+        ee_all,
+        quat_all,
         np.stack([demos[c["d"]]["act"][0, ARM] for c in cands]),
         cfg.ik_iters,
         cfg.ik_damping,
         base,
     )
+    if rng is not None and cfg.posture_prob > 0:
+        m = round(cfg.bend_margin * cfg.env.fps)
+        idx, tgts, ws = [], [], []
+        for i, c in enumerate(cands):
+            x = demos[c["d"]]
+            c["psi"] = 0.0
+            if not x["segs"] or rng.random() >= cfg.posture_prob:
+                continue
+            psi = float(rng.choice([-1.0, 1.0])) * float(
+                rng.uniform(*cfg.posture_range)
+            )
+            c["psi"] = psi
+            tgt = q_all[:, i].copy()
+            tgt[:, 2] += psi
+            T = len(x["act"])
+            w = np.clip(np.arange(tm) / max(x["segs"][0][0] - m, 2), 0.0, 1.0)
+            w[T:] = w[T - 1]
+            idx.append(i)
+            tgts.append(tgt)
+            ws.append(w * cfg.posture_gain)
+        if idx:
+            q_all[:, idx] = solve_seq(
+                chain,
+                ee_all[:, idx],
+                quat_all[:, idx],
+                q_all[:, idx],
+                cfg.ik_iters,
+                cfg.ik_damping,
+                base,
+                ns=(np.stack(tgts, axis=1), np.stack(ws, axis=1)),
+            )
     jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
     for i, c in enumerate(cands):
         x = demos[c["d"]]
@@ -549,7 +583,7 @@ def augment_libero(cfg):
             )
             demos = kept
         n_seg = cfg.n_seg or max(sum(j is not None for j in x["held"]) for x in demos)
-        ldim = LABEL_DIM * n_seg + (1 if cfg.postures else 0)
+        ldim = LABEL_DIM * n_seg + (1 if (cfg.postures or cfg.posture_prob) else 0)
         print(
             f"task {task_id}: {len(demos)} demos, {n_seg} grasp segments, "
             f"label dim {LABEL_DIM * n_seg}"
@@ -623,7 +657,7 @@ def augment_libero(cfg):
             tcfg = replace(cfg, alpha_prob=0.0)
         cands = libero_candidates(tcfg, demos, rng, 4 * cfg.copies)
         print(f"{len(cands)} candidates")
-        libero_solve(cfg, cands, demos, chain, base, fcol)
+        libero_solve(cfg, cands, demos, chain, base, fcol, rng)
         written = 0
         why: dict[str, int] = {}
         labels = []
@@ -652,6 +686,8 @@ def augment_libero(cfg):
             label[: LABEL_DIM * n_seg] = encode_label(
                 held_combo(c["combo"], x["held"]), n_seg
             )
+            if ldim > LABEL_DIM * n_seg:
+                label[-1] = c.get("psi", 0.0)
             write(dst, obs, c["act"], label, env.language)
             labels.append(label)
             written += 1
