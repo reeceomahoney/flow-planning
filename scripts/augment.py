@@ -81,6 +81,7 @@ class Config:
     recover: int = 0
     recover_approach: int = 0
     recover_noise: tuple[float, float] = (0.02, 0.15)
+    recover_arc: bool = False
     filter: bool = False
     postures: int = 0
     posture_range: tuple[float, float] = (0.3, 1.0)
@@ -444,117 +445,156 @@ def libero_solve(cfg, cands, demos, chain, base, fcol, rng=None):
                 c["ok"], c["why"] = False, "self"
 
 
-def recover_phase(cfg, x, chain, base, fcol, rng, lo, hi, e, span, j, count):
-    obs, act = x["obs"], x["act"]
+def recover_candidates(cfg, x, pos, quat, rng, lo, hi, e, span, j, count, slot):
     fps = cfg.env.fps
-    q_obs = obs[:, ARM]
-    pos, quat = fk(chain, q_obs, base)
+    q_obs = x["obs"][:, ARM]
     speed = np.linalg.norm(np.diff(pos[span[0] : span[1]], axis=0), axis=1).mean() * fps
     z_min = pos[span[0] : span[1], 2].min() - 0.02
-    jerk_limit = 0.6 * (50 / fps) ** 2
-    out, why = [], {}
-    tries = 0
-    while len(out) < count and tries < 10 * count:
+    out, why, tries = [], {}, 0
+    while len(out) < 3 * count and tries < 10 * count:
         tries += 1
         f = int(rng.integers(lo, hi))
         d = rng.normal(size=3)
         d *= rng.uniform(*cfg.recover_noise) / np.linalg.norm(d)
+        if cfg.recover_arc:
+            d[2] = abs(d[2])
         p0 = pos[f] + d
         if p0[2] < z_min:
             why["low"] = why.get("low", 0) + 1
             continue
         n = max(3, int(round(np.linalg.norm(pos[e] - p0) / speed * fps)))
+        lab = np.zeros(LABEL_DIM, np.float32)
+        if cfg.recover_arc:
+            pa = float(rng.uniform(*cfg.phi_range))
+            ta = float(
+                rng.choice(
+                    [0.0, 3 * np.pi / 4, np.pi / 2] if slot == 0 else [np.pi / 2]
+                )
+            )
+            n = max(4, int(round(n * pa * np.pi / np.sin(pa * np.pi))))
+            lab[2 + 2 * slot : 4 + 2 * slot] = [pa * np.cos(ta), pa * np.sin(ta)]
         u = np.arange(n) / n
         p_t = p0 + (pos[e] - p0) * u[:, None]
-        r_f = R.from_quat(quat[f])
+        if cfg.recover_arc:
+            p_t = p_t + bend_delta(p_t, 0, n, pa * np.pi, ta)
         key = R.from_quat(np.stack([quat[f], quat[e]]))
-        slerp = Slerp([0.0, 1.0], key)
-        q_t = slerp(u).as_quat()
+        q_t = Slerp([0.0, 1.0], key)(u).as_quat()
         ref = q_obs[f] + (q_obs[e] - q_obs[f]) * u[:, None]
-        pad = 10
-        q_lin = solve_seq(
-            chain,
-            np.concatenate([np.repeat(p_t[:1], pad, 0), p_t])[:, None],
-            np.concatenate([np.repeat(q_t[:1], pad, 0), q_t])[:, None],
-            np.concatenate([np.repeat(ref[:1], pad, 0), ref])[:, None],
-            cfg.ik_iters,
-            cfg.ik_damping,
-            base,
-        )[pad:, 0]
-        fpos, fquat = fk(chain, q_lin, base)
-        rot_err = R.from_quat(fquat) * R.from_quat(q_t).inv()
-        assert isinstance(rot_err, R)
-        q_all = np.concatenate([q_lin, q_obs[e : e + 3]])
-        if np.linalg.norm(fpos - p_t, axis=1).max() > cfg.ik_tol:
-            why["ik"] = why.get("ik", 0) + 1
-            continue
-        if rot_err.magnitude().max() > np.radians(15):
-            why["rot"] = why.get("rot", 0) + 1
-            continue
-        if np.abs(np.diff(q_all, n=2, axis=0)).max() > jerk_limit:
-            why["jerk"] = why.get("jerk", 0) + 1
-            continue
-        if np.abs(np.diff(q_all, axis=0)).max() > cfg.vel_frac * cfg.env.delta_max:
-            why["vel"] = why.get("vel", 0) + 1
-            continue
-        body, _ = fcol.body_penetration(
-            torch.as_tensor(q_lin, dtype=torch.float32, device=DEV), None
-        )
-        if float(body.max()) > 0.0:
-            why["self"] = why.get("self", 0) + 1
-            continue
-        r_t = R.from_quat(fquat)
-        assert isinstance(r_t, R)
-        off_ee = r_f.inv().apply(obs[f, EE] - pos[f])
-        rel_ee = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, ROT]))
-        assert isinstance(rel_ee, R)
-        seg = np.repeat(obs[e : e + 1], n, 0)
-        seg[:, ARM] = q_lin
-        seg[:, 7:9] = obs[f, 7:9]
-        seg[:, EE] = fpos + r_t.apply(np.repeat(off_ee[None], n, 0))
-        rot_ee_t = r_t * rel_ee
-        assert isinstance(rot_ee_t, R)
-        seg[:, ROT] = quat_to_rot6d(rot_ee_t.as_quat())
-        if j is not None:
-            off_obj = r_f.inv().apply(obs[f, obj_slice(j)] - pos[f])
-            rot_obj = slice(obj_slice(j).stop, obj_slice(j).stop + 6)
-            rel_obj = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, rot_obj]))
-            assert isinstance(rel_obj, R)
-            seg[:, obj_slice(j)] = fpos + r_t.apply(np.repeat(off_obj[None], n, 0))
-            rot_obj_t = r_t * rel_obj
-            assert isinstance(rot_obj_t, R)
-            seg[:, rot_obj] = quat_to_rot6d(rot_obj_t.as_quat())
-        a = np.repeat(act[f : f + 1], n, 0)
-        a[:, ARM] = np.concatenate([q_lin[1:], q_obs[e : e + 1]])
         out.append(
-            (
-                np.concatenate([seg, obs[e:]]).astype(np.float32),
-                np.concatenate([a, act[e:]]).astype(np.float32),
-                n,
-                float(np.linalg.norm(d)),
-            )
+            dict(f=f, d=d, e=e, j=j, slot=slot, n=n, p_t=p_t, q_t=q_t, ref=ref, lab=lab)
         )
     return out, why
 
 
-def recover_segments(cfg, x, chain, base, fcol, rng, n_obj):
-    if not x["segs"]:
-        return [], {"noseg": 1}
-    (c, o), j = x["segs"][0], x["held"][0]
+def recover_finish(cfg, x, pos, quat, c, q_lin, chain, base, fcol):
+    obs, act = x["obs"], x["act"]
+    q_obs = obs[:, ARM]
+    f, e, j, n = c["f"], c["e"], c["j"], c["n"]
+    jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
+    fpos, fquat = fk(chain, q_lin, base)
+    rot_err = R.from_quat(fquat) * R.from_quat(c["q_t"]).inv()
+    assert isinstance(rot_err, R)
+    q_all = np.concatenate([q_lin, q_obs[e : e + 3]])
+    if np.linalg.norm(fpos - c["p_t"], axis=1).max() > cfg.ik_tol:
+        return None, "ik"
+    if rot_err.magnitude().max() > np.radians(15):
+        return None, "rot"
+    if np.abs(np.diff(q_all, n=2, axis=0)).max() > jerk_limit:
+        return None, "jerk"
+    if np.abs(np.diff(q_all, axis=0)).max() > cfg.vel_frac * cfg.env.delta_max:
+        return None, "vel"
+    body, _ = fcol.body_penetration(
+        torch.as_tensor(q_lin, dtype=torch.float32, device=DEV), None
+    )
+    if float(body.max()) > 0.0:
+        return None, "self"
+    r_f = R.from_quat(quat[f])
+    r_t = R.from_quat(fquat)
+    assert isinstance(r_t, R)
+    off_ee = r_f.inv().apply(obs[f, EE] - pos[f])
+    rel_ee = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, ROT]))
+    assert isinstance(rel_ee, R)
+    seg = np.repeat(obs[e : e + 1], n, 0)
+    seg[:, ARM] = q_lin
+    seg[:, 7:9] = obs[f, 7:9]
+    seg[:, EE] = fpos + r_t.apply(np.repeat(off_ee[None], n, 0))
+    rot_ee_t = r_t * rel_ee
+    assert isinstance(rot_ee_t, R)
+    seg[:, ROT] = quat_to_rot6d(rot_ee_t.as_quat())
+    if j is not None:
+        off_obj = r_f.inv().apply(obs[f, obj_slice(j)] - pos[f])
+        rot_obj = slice(obj_slice(j).stop, obj_slice(j).stop + 6)
+        rel_obj = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, rot_obj]))
+        assert isinstance(rel_obj, R)
+        seg[:, obj_slice(j)] = fpos + r_t.apply(np.repeat(off_obj[None], n, 0))
+        rot_obj_t = r_t * rel_obj
+        assert isinstance(rot_obj_t, R)
+        seg[:, rot_obj] = quat_to_rot6d(rot_obj_t.as_quat())
+    a = np.repeat(act[f : f + 1], n, 0)
+    a[:, ARM] = np.concatenate([q_lin[1:], q_obs[e : e + 1]])
+    return (
+        np.concatenate([seg, obs[e:]]).astype(np.float32),
+        np.concatenate([a, act[e:]]).astype(np.float32),
+        n,
+        float(np.linalg.norm(c["d"])),
+        c["lab"],
+    ), ""
+
+
+def recover_all(cfg, demos, chain, base, fcol, rng):
     m = int(round(cfg.bend_margin * cfg.env.fps))
-    out, why = [], {}
-    phases = []
-    if cfg.recover and o - m - (c + m) >= 2 and j is not None:
-        phases.append((c + m, o - m, o - m, (c, o), j, cfg.recover))
-    if cfg.recover_approach and c - m >= 2:
-        phases.append((0, c - m, c - m, (0, c), None, cfg.recover_approach))
-    for lo, hi, e, span, held, count in phases:
-        segs, w = recover_phase(
-            cfg, x, chain, base, fcol, rng, lo, hi, e, span, held, count
+    fks, cands, why = {}, [], {}
+    for di, x in enumerate(demos):
+        if not x["segs"]:
+            why["noseg"] = why.get("noseg", 0) + 1
+            continue
+        (c, o), j = x["segs"][0], x["held"][0]
+        pos, quat = fk(chain, x["obs"][:, ARM], base)
+        fks[di] = (pos, quat)
+        phases = []
+        if cfg.recover and o - m - (c + m) >= 2 and j is not None:
+            phases.append((c + m, o - m, o - m, (c, o), j, cfg.recover, 1))
+        if cfg.recover_approach and c - m >= 2:
+            phases.append((0, c - m, c - m, (0, c), None, cfg.recover_approach, 0))
+        for lo, hi, e, span, held, count, slot in phases:
+            cs, w = recover_candidates(
+                cfg, x, pos, quat, rng, lo, hi, e, span, held, count, slot
+            )
+            for k, v in w.items():
+                why[k] = why.get(k, 0) + v
+            for cc in cs:
+                cc["d_idx"], cc["count"] = di, count
+            cands += cs
+    out: dict[int, list] = {}
+    if not cands:
+        return out, why
+    pad = 10
+    tm = max(c["n"] for c in cands) + pad
+    front = lambda a: np.concatenate([np.repeat(a[:1], pad, 0), a])  # noqa: E731
+    for s0 in range(0, len(cands), 1024):
+        chunk = cands[s0 : s0 + 1024]
+        q_all = solve_seq(
+            chain,
+            np.stack([tpad(front(c["p_t"]), tm) for c in chunk], axis=1),
+            np.stack([tpad(front(c["q_t"]), tm) for c in chunk], axis=1),
+            np.stack([tpad(front(c["ref"]), tm) for c in chunk], axis=1),
+            cfg.ik_iters,
+            cfg.ik_damping,
+            base,
         )
-        out += segs
-        for k, v in w.items():
-            why[k] = why.get(k, 0) + v
+        for i, c in enumerate(chunk):
+            done = sum(1 for o in out.get(c["d_idx"], []) if o[-1] == c["slot"])
+            if done >= c["count"]:
+                continue
+            x = demos[c["d_idx"]]
+            pos, quat = fks[c["d_idx"]]
+            res, k = recover_finish(
+                cfg, x, pos, quat, c, q_all[pad : pad + c["n"], i], chain, base, fcol
+            )
+            if res is None:
+                why[k] = why.get(k, 0) + 1
+                continue
+            out.setdefault(c["d_idx"], []).append(res + (c["slot"],))
     return out, why
 
 
@@ -583,7 +623,9 @@ def augment_libero(cfg):
             )
             demos = kept
         n_seg = cfg.n_seg or max(sum(j is not None for j in x["held"]) for x in demos)
-        ldim = LABEL_DIM * n_seg + (1 if (cfg.postures or cfg.posture_prob) else 0)
+        rec = 1 if cfg.recover_arc and (cfg.recover or cfg.recover_approach) else 0
+        pos = 1 if (cfg.postures or cfg.posture_prob) else 0
+        ldim = LABEL_DIM * n_seg + rec + pos
         print(
             f"task {task_id}: {len(demos)} demos, {n_seg} grasp segments, "
             f"label dim {LABEL_DIM * n_seg}"
@@ -611,15 +653,14 @@ def augment_libero(cfg):
                 write(dst, x["obs"], x["act"], np.zeros(ldim), env.language)
         if cfg.recover or cfg.recover_approach:
             n_rec, lens, mags = 0, [], []
-            why_all: dict[str, int] = {}
-            for x in tqdm(demos, desc="recover"):
-                segs, why = recover_segments(
-                    cfg, x, chain, base, fcol, rng, len(env.objects)
-                )
-                for k, v in why.items():
-                    why_all[k] = why_all.get(k, 0) + v
-                for o, a, n, mag in segs:
-                    write(dst, o, a, np.zeros(ldim), env.language)
+            by_demo, why_all = recover_all(cfg, demos, chain, base, fcol, rng)
+            for segs in by_demo.values():
+                for o, a, n, mag, lab, _ in segs:
+                    label = np.zeros(ldim, np.float32)
+                    if rec:
+                        label[:LABEL_DIM] = lab
+                        label[LABEL_DIM * n_seg] = 1.0
+                    write(dst, o, a, label, env.language)
                     n_rec += 1
                     lens.append(n)
                     mags.append(mag)
@@ -686,7 +727,7 @@ def augment_libero(cfg):
             label[: LABEL_DIM * n_seg] = encode_label(
                 held_combo(c["combo"], x["held"]), n_seg
             )
-            if ldim > LABEL_DIM * n_seg:
+            if pos:
                 label[-1] = c.get("psi", 0.0)
             write(dst, obs, c["act"], label, env.language)
             labels.append(label)
