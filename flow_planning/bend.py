@@ -98,7 +98,7 @@ def fk(chain, q, base):  # (T, 7) joints -> world EE pos, quat xyzw
     return pos, quat
 
 
-def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base, limits=None):
+def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base, limits=None, ns=None):
     """(T, B, 3/4) world targets + (B, 7) initial joints -> (T, B, 7).
 
     Damped least squares, batched over copies and SEQUENTIAL over frames: each
@@ -117,6 +117,10 @@ def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base, limits=None):
     traj = seed.dim() == 3  # (T, B, n): carry the delta from a reference path
     th = seed[0] if traj else seed
     out = torch.empty(p.shape[:2] + (th.shape[-1],), device=chain.device)
+    if ns is not None:
+        ns_t, ns_w = ns
+        ns_t = torch.as_tensor(ns_t, dtype=torch.float32, device=chain.device)
+        ns_w = torch.as_tensor(ns_w, dtype=torch.float32, device=chain.device)
     for t in range(len(p)):
         if traj and t > 0:
             th = seed[t] + (th - seed[t - 1])
@@ -132,6 +136,16 @@ def solve_seq(chain, ee_t, quat_t, seed0, iters, damping, base, limits=None):
             )
             jt = jac.transpose(1, 2)
             th = th + (jt @ torch.linalg.solve(jac @ jt + eye, err[..., None]))[..., 0]
+            if ns is not None and float(ns_w[t].max()) > 0:
+                w = ns_w[t]
+                dq = (w[..., None] if w.dim() else w) * (ns_t[t] - th)
+                dq = (
+                    dq
+                    - (jt @ torch.linalg.solve(jac @ jt + eye, (jac @ dq[..., None])))[
+                        ..., 0
+                    ]
+                )
+                th = th + dq
             th = th.clamp(lo, hi)
         out[t] = th
     return out.cpu().numpy()

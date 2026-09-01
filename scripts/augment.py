@@ -81,6 +81,11 @@ class Config:
     recover: int = 0
     recover_approach: int = 0
     recover_noise: tuple[float, float] = (0.02, 0.15)
+    filter: bool = False
+    postures: int = 0
+    posture_range: tuple[float, float] = (0.3, 1.0)
+    posture_gain: float = 0.2
+    posture_min: float = 0.15
     track: bool = False
     track_tau: float = 0.25
     track_desc: float = 0.6
@@ -254,6 +259,115 @@ def held_combo(combo, held):
     return [o for o, j in zip(combo, held) if j is not None]
 
 
+def posture_copies(cfg, demos, chain, base, fcol, rng, movable):
+    m = round(cfg.bend_margin * cfg.env.fps)
+    idx, psis, ws, tgts, seeds, ees, quats = [], [], [], [], [], [], []
+    tm = max(len(x["act"]) for x in demos)
+    for d, x in enumerate(demos):
+        if not x["segs"]:
+            continue
+        T = len(x["act"])
+        ramp_end = max(x["segs"][0][0] - m, 2)
+        w = np.clip(np.arange(T) / ramp_end, 0.0, 1.0) * cfg.posture_gain
+        for _ in range(3 * cfg.postures):
+            psi = float(rng.choice([-1.0, 1.0])) * float(
+                rng.uniform(*cfg.posture_range)
+            )
+            tgt = x["act"][:, ARM].copy()
+            tgt[:, 2] += psi
+            idx.append(d)
+            psis.append(psi)
+            ws.append(np.pad(w, (0, tm - T), mode="edge"))
+            tgts.append(tpad(tgt, tm))
+            seeds.append(tpad(x["act"][:, ARM], tm))
+            ees.append(tpad(x["ee"], tm))
+            quats.append(tpad(x["quat"], tm))
+    if not idx:
+        return {}, {"noseg": len(demos)}
+    q_all = solve_seq(
+        chain,
+        np.stack(ees, axis=1),
+        np.stack(quats, axis=1),
+        np.stack(seeds, axis=1),
+        cfg.ik_iters,
+        cfg.ik_damping,
+        base,
+        ns=(np.stack(tgts, axis=1), np.stack(ws, axis=1)),
+    )
+    jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
+    out: dict[int, list] = {}
+    why: dict[str, int] = {}
+    for i, (d, psi) in enumerate(zip(idx, psis)):
+        if len(out.get(d, [])) >= cfg.postures:
+            continue
+        x = demos[d]
+        T = len(x["act"])
+        act = x["act"]
+        q = q_all[:T, i]
+        pos, quat = fk(chain, q, base)
+        err = np.linalg.norm(pos - x["ee"], axis=1).max()
+        rot_err = R.from_quat(quat) * R.from_quat(x["quat"]).inv()
+        assert isinstance(rot_err, R)
+        if err > cfg.ik_tol or rot_err.magnitude().max() > np.radians(15):
+            why["ik"] = why.get("ik", 0) + 1
+            continue
+        if np.abs(q - act[:, ARM]).max() < cfg.posture_min:
+            why["dup"] = why.get("dup", 0) + 1
+            continue
+        if np.abs(np.diff(q, n=2, axis=0)).max() > jerk_limit:
+            why["jerk"] = why.get("jerk", 0) + 1
+            continue
+        if np.abs(np.diff(q, axis=0)).max() > cfg.vel_frac * cfg.env.delta_max:
+            why["vel"] = why.get("vel", 0) + 1
+            continue
+        body, _ = fcol.body_penetration(
+            torch.as_tensor(q, dtype=torch.float32, device=DEV), None
+        )
+        if float(body.max()) > 0.0:
+            why["self"] = why.get("self", 0) + 1
+            continue
+        a = act.copy()
+        a[:, ARM] = q
+        c = {
+            "act": a.astype(np.float32),
+            "objs": [
+                x["obs"][:, obj_slice(j)].copy() if j is not None else None
+                for j in x["held"]
+            ],
+            "shift": None,
+        }
+        o = kinematic_obs(x, c, chain, base, movable)
+        out.setdefault(d, []).append(
+            (o, c["act"], float(psi), float(np.abs(q - act[:, ARM]).max()))
+        )
+    return out, why
+
+
+def kinematic_obs(x, c, chain, base, movable):
+    obs, act = x["obs"], c["act"]
+    q_obs = np.concatenate([obs[:1, ARM], act[:-1, ARM]])
+    pos0, quat0 = fk(chain, obs[:, ARM], base)
+    pos, quat = fk(chain, q_obs, base)
+    r0, r = R.from_quat(quat0), R.from_quat(quat)
+    out = obs.copy()
+    out[:, ARM] = q_obs
+    out[:, EE] = pos + r.apply(r0.inv().apply(obs[:, EE] - pos0))
+    rel = r0.inv() * R.from_quat(rot6d_to_quat(obs[:, ROT]))
+    assert isinstance(rel, R)
+    rot = r * rel
+    assert isinstance(rot, R)
+    out[:, ROT] = quat_to_rot6d(rot.as_quat())
+    shift = c.get("shift")
+    if shift is not None and shift[2] is not None:
+        for k, mv in enumerate(movable):
+            if mv and k not in x["held"]:
+                out[:, obj_slice(k)] += shift[2]
+    for k, j in enumerate(x["held"]):
+        if j is not None:
+            out[:, obj_slice(j)] = c["objs"][k]
+    return out.astype(np.float32)
+
+
 def libero_solve(cfg, cands, demos, chain, base, fcol):
     """IK + feasibility gate; sets c["act"] / c["ok"] / c["why"] in place."""
     tm = max(len(x["act"]) for x in demos)
@@ -425,6 +539,8 @@ def augment_libero(cfg):
         base = np.asarray(env.robot_base_pos, np.float32)
         fcol = FrankaCollision(DEV, base, 0.0)
         demos = libero_demos(cfg, env, chain, base, cfg.limit)
+        mj = env.envs[0].sim.model._model
+        movable = [mj.body(f"{n}_main").jntadr[0] >= 0 for n in env.objects]
         if cfg.n_seg:
             kept = [x for x in demos if len(x["segs"]) <= cfg.n_seg]
             print(
@@ -433,6 +549,7 @@ def augment_libero(cfg):
             )
             demos = kept
         n_seg = cfg.n_seg or max(sum(j is not None for j in x["held"]) for x in demos)
+        ldim = LABEL_DIM * n_seg + (1 if cfg.postures else 0)
         print(
             f"task {task_id}: {len(demos)} demos, {n_seg} grasp segments, "
             f"label dim {LABEL_DIM * n_seg}"
@@ -444,7 +561,7 @@ def augment_libero(cfg):
                 "names": None,
             },
             "action": {"dtype": "float32", "shape": (8,), "names": None},
-            "bend": {"dtype": "float32", "shape": (LABEL_DIM * n_seg,), "names": None},
+            "bend": {"dtype": "float32", "shape": (ldim,), "names": None},
         }
         if dst is None:
             dst = LeRobotDataset.create(
@@ -457,9 +574,7 @@ def augment_libero(cfg):
         assert features == shapes, (task_id, features, shapes)
         for x in demos:
             for _ in range(cfg.orig_copies):
-                write(
-                    dst, x["obs"], x["act"], np.zeros(LABEL_DIM * n_seg), env.language
-                )
+                write(dst, x["obs"], x["act"], np.zeros(ldim), env.language)
         if cfg.recover or cfg.recover_approach:
             n_rec, lens, mags = 0, [], []
             why_all: dict[str, int] = {}
@@ -470,7 +585,7 @@ def augment_libero(cfg):
                 for k, v in why.items():
                     why_all[k] = why_all.get(k, 0) + v
                 for o, a, n, mag in segs:
-                    write(dst, o, a, np.zeros(LABEL_DIM * n_seg), env.language)
+                    write(dst, o, a, np.zeros(ldim), env.language)
                     n_rec += 1
                     lens.append(n)
                     mags.append(mag)
@@ -480,6 +595,24 @@ def augment_libero(cfg):
                 f"linear frames p50 {np.median(lens) if lens else 0:.0f} "
                 f"max {max(lens) if lens else 0}, |noise| mean "
                 f"{np.mean(mags) if mags else 0:.3f}"
+            )
+        if cfg.postures:
+            n_pos = 0
+            mags = []
+            by_demo, why_pos = posture_copies(
+                cfg, demos, chain, base, fcol, rng, movable
+            )
+            for segs_p in by_demo.values():
+                for o, a, psi, mag in segs_p:
+                    label = np.zeros(ldim, np.float32)
+                    label[-1] = psi
+                    write(dst, o, a, label, env.language)
+                    n_pos += 1
+                    mags.append(mag)
+            print(
+                f"task {task_id}: {n_pos} posture copies "
+                f"({n_pos / max(len(demos), 1):.1f}/demo), rejected {why_pos}, "
+                f"|dq| max mean {np.mean(mags) if mags else 0:.2f}"
             )
         if cfg.copies == 0:
             del env
@@ -491,36 +624,39 @@ def augment_libero(cfg):
         cands = libero_candidates(tcfg, demos, rng, 4 * cfg.copies)
         print(f"{len(cands)} candidates")
         libero_solve(cfg, cands, demos, chain, base, fcol)
-        written = rej_replay = 0
+        written = 0
         why: dict[str, int] = {}
         labels = []
         per_demo = np.zeros(len(demos), int)
-        for c in tqdm(cands, desc="replay"):
+        for c in tqdm(cands, desc="copies"):
             if not c["ok"]:
                 why[c["why"]] = why.get(c["why"], 0) + 1
                 continue
             if per_demo[c["d"]] >= cfg.copies:
                 continue
             x = demos[c["d"]]
-            shift = c.get("shift")
-            if shift is not None:
-                seg, delta, dplace = shift
-                held_name = env.objects[x["held"][seg]]
-                shift = [(held_name, delta)]
-                if dplace is not None:
-                    shift += [(n, dplace) for n in env.objects if n != held_name]
-            succ, obs = replay_libero(env, x["state0"], c["act"], cfg.hold, shift)
-            if not succ:
-                rej_replay += 1
-                continue
-            label = encode_label(held_combo(c["combo"], x["held"]), n_seg)
-            write(dst, obs.astype(np.float32), c["act"], label, env.language)
+            if cfg.filter:
+                shift = c.get("shift")
+                if shift is not None:
+                    seg, delta, dplace = shift
+                    held_name = env.objects[x["held"][seg]]
+                    shift = [(held_name, delta)]
+                    if dplace is not None:
+                        shift += [(n, dplace) for n in env.objects if n != held_name]
+                succ, _ = replay_libero(env, x["state0"], c["act"], cfg.hold, shift)
+                if not succ:
+                    why["replay"] = why.get("replay", 0) + 1
+                    continue
+            obs = kinematic_obs(x, c, chain, base, movable)
+            label = np.zeros(ldim, np.float32)
+            label[: LABEL_DIM * n_seg] = encode_label(
+                held_combo(c["combo"], x["held"]), n_seg
+            )
+            write(dst, obs, c["act"], label, env.language)
             labels.append(label)
             written += 1
             per_demo[c["d"]] += 1
-        print(
-            f"wrote {written}/{len(cands)} copies; rejected {why}, {rej_replay} replay"
-        )
+        print(f"wrote {written}/{len(cands)} copies; rejected {why}")
         if labels:
             lab = np.stack(labels)
             print("label nonzero fraction per dim:", (np.abs(lab) > 0).mean(0).round(2))
