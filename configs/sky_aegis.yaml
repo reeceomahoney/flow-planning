@@ -1,0 +1,67 @@
+name: flow-planning
+
+resources:
+  infra: ssh/ori
+  accelerators: RTX4090:1
+  cpus: 8
+
+envs:
+  HF_TOKEN:
+  WANDB_API_KEY:
+  CUDA_VISIBLE_DEVICES: 1
+  MUJOCO_GL: egl
+  HF_DATASETS_DISABLE_PROGRESS_BARS: 1
+  CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  SUITE: safelibero_spatial
+  NAME: spatial_base
+  TASKS: "[0,1,2,3]"
+  ONEHOT: 4
+  ITERS: 40000
+  SEEDS: "0 1 2"
+  CELLS: "0_I 0_II 1_I 1_II 2_I 2_II 3_I 3_II"
+  FREE: "0 1 2 3"
+  PAR: 3
+workdir: .
+setup: |
+  curl -fsSL https://pixi.sh/install.sh | sh
+  export PATH="$HOME/.pixi/bin:$PATH"
+  cd ~/sky_workdir && pixi install
+
+run: |
+  export PATH="$HOME/.pixi/bin:$PATH"
+  SNAP=$(mktemp -d ~/snap.XXXXXX)
+  rsync -a --exclude .pixi --exclude outputs --exclude wandb ~/sky_workdir/ $SNAP/
+  ln -s ~/sky_workdir/.pixi $SNAP/.pixi; mkdir -p ~/sky_workdir/outputs; ln -s ~/sky_workdir/outputs $SNAP/outputs
+  cd $SNAP
+  grep -q "deviation" scripts/eval.py || { echo "stale workdir"; exit 1; }
+  export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
+  CACHE=~/.cache/huggingface/lerobot/reece-omahoney
+  ENV="--env.type libero --env.suite $SUITE --env.task_onehot $ONEHOT --env.n_action_steps 10 --env.world_count 10"
+  q() { "$@" 2>&1 | grep --line-buffered -vE "it/s|Warning|examples/s|EGL|egl_|OpenGL|glCheck|binding_utils|raise self|^\s*$"; }
+  echo "##### augment $NAME: originals only"
+  [ -d $CACHE/$NAME ] || q pixi run python scripts/augment.py $ENV --env.level I --task_ids "$TASKS" --dst_repo reece-omahoney/$NAME \
+    --n_seg 4 --bend_margin 0.4 --copies 0 --orig_copies 1 --ik_iters 32 --ik_tol 0.01 --vel_frac 0.8
+  arm_args() { case $1 in
+    aegis) echo "--env.obstacle true --cond zero --cbf true";;
+    free) echo "--env.obstacle false --cond zero";;
+  esac; }
+  run() { # ARM CELL
+    OUT=outputs/eval_${NAME}_s$SEED; mkdir -p $OUT; f=$OUT/$1_$2.log
+    grep -q "^overall" $f 2>/dev/null && { echo "skip $f"; return; }
+    t=${2%_*}; l=${2#*_}
+    OMP_NUM_THREADS=2 pixi run python scripts/eval.py $ENV --env.task_id $t --env.level $l \
+      --repo_id reece-omahoney/$NAME --checkpoint $RUN --episodes 5 $(arm_args $1) > $f 2>&1
+    echo "done $f $(grep -aE '^overall' $f | tr '\n' ' ')"
+  }
+  export -f run arm_args; export ENV NAME
+  for SEED in $SEEDS; do
+    RUN=outputs/libero/${NAME}_s$SEED; export SEED RUN
+    echo "##### train $RUN"
+    [ -f $RUN/model.safetensors ] || q pixi run python scripts/train.py $ENV --repo_id reece-omahoney/$NAME \
+      --horizon 50 --num_iters $ITERS --eval_every 0 --balance_tasks true --seed $SEED --run_dir $RUN
+    { for C in $CELLS; do echo "aegis $C"; done; for T in $FREE; do echo "free ${T}_I"; done; } \
+      | xargs -P $PAR -L 1 bash -c 'run "$@"' _
+    echo "##### TABLE $NAME s$SEED"
+    for f in outputs/eval_${NAME}_s$SEED/*.log; do echo "$(basename $f .log) $(grep -aE '^overall' $f | tr '\n' ' ')"; done
+  done
+  rm -rf $SNAP

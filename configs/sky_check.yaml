@@ -12,7 +12,8 @@ envs:
   MUJOCO_GL: egl
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
-  LEVEL: I
+  SUITES: "safelibero_object safelibero_goal safelibero_long"
+  LEVELS: "I II"
   TASKS: "0 1 2 3"
   N_INITS: 20
 workdir: .
@@ -30,14 +31,13 @@ run: |
   grep -q "def solve_windows" scripts/check_grasp.py || { echo "stale workdir"; exit 1; }
   export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
   export OMP_NUM_THREADS=4
-  ENV="--env.type libero --env.suite safelibero_spatial --env.world_count 10"
   q() { "$@" 2>&1 | grep --line-buffered -vE "it/s|Warning|examples/s|EGL|egl_|OpenGL|glCheck|binding_utils|raise self|^\s*$"; }
   mkdir -p outputs/check_grasp
-  echo "##### smoke"
-  q pixi run python scripts/check_grasp.py $ENV --env.task_id 2 --env.level $LEVEL --n_demos 2 --n_inits 10 --out outputs/check_grasp/smoke
-  for T in $TASKS; do
-    echo "##### task $T level $LEVEL"
-    q pixi run python scripts/check_grasp.py $ENV --env.task_id $T --env.level $LEVEL --n_inits $N_INITS 2>&1 | tee outputs/check_grasp/${T}_${LEVEL}.log | grep -E "^task|^inits|RESULT|Error|Traceback|File \"/home"
-  done
-  grep -h RESULT outputs/check_grasp/*_${LEVEL}.log
+  for S in $SUITES; do for T in $TASKS; do for L in $LEVELS; do
+    f=outputs/check_grasp/${S}_${T}_${L}.log
+    grep -q RESULT $f 2>/dev/null && { echo "skip $f"; continue; }
+    echo "##### $S task $T level $L"
+    q pixi run python scripts/check_grasp.py --env.type libero --env.suite $S --env.world_count 10 --env.task_id $T --env.level $L --n_inits $N_INITS 2>&1 | tee $f | grep -E "^task|RESULT|Error|Traceback|File \"/home"
+  done; done; done
+  grep -h RESULT outputs/check_grasp/safelibero_*.log
   rm -rf $SNAP
