@@ -250,6 +250,10 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         self.ensemble = 1  # >1: average this many overlapping chunks per step
         self.ensemble_m = 0.0  # chunk weight exp(-m * age); m>0 favours newer
         self.chunk_fn = None  # optional post-hoc projection of the normalized chunk
+        self.deviation = 0.0  # >0: weight on action distance from candidate 0
+        self.replans = 0
+        self.dirty = 0
+        self.last_dirty = None
         self.reset()
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -370,6 +374,12 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         )
         if sel is not None and k > 1:  # lowest-scoring candidate per world
             score = sel(x).view(n_worlds, k)
+            if self.deviation > 0:
+                xa = x[..., sd:].reshape(n_worlds, k, -1)
+                score = score + self.deviation * (xa - xa[:, :1]).norm(dim=2)
+            self.replans += n_worlds
+            self.last_dirty = score.amin(dim=1) > 0
+            self.dirty += int(self.last_dirty.sum())
             if searching and not resample and self.latched_idx is not None:
                 keep = F.one_hot(self.latched_idx, k).bool()
                 score = score.masked_fill(~keep, torch.inf)

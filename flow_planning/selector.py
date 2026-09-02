@@ -164,6 +164,7 @@ class AnalyticSelector:
         cube_index: int | None = 18,
         n_arm: int = 7,
         pointcloud=None,
+        hold: float = 0.0,
     ):
         f32 = {"dtype": torch.float32, "device": device}
         self.device = device
@@ -183,6 +184,9 @@ class AnalyticSelector:
             self.cs = torch.as_tensor(obs_stats["std"], **f32)[ci : ci + 3]
         self.joint_start, self.n_arm, self.cube_index = joint_start, n_arm, ci
         self.rad = self.fc.radius
+        self.hold = hold
+        self.gm = torch.as_tensor(joint_stats["mean"], **f32)[n_arm]
+        self.gs = torch.as_tensor(joint_stats["std"], **f32)[n_arm]
 
     def set_boxes(self, boxes):
         boxes = np.asarray(boxes, dtype=np.float32)
@@ -253,7 +257,11 @@ class AnalyticSelector:
             d = self.dist(pts + self.fc.base_pos, box)
             worst.append((d - self.rad).amin(dim=2))  # (b, t), mesh not centreline
         cube = self.cube(traj)
-        if cube is not None:
+        if cube is not None and self.hold > 0:
+            grip = traj[..., self.joint_start + self.n_arm] * self.gs + self.gm
+            d = self.dist(cube.float(), box) - self.hold
+            worst.append(torch.where(grip < 0.02, d, torch.ones_like(d)))
+        elif cube is not None:
             worst.append(self.dist(cube.float(), box) - self.fc.cube_half)
         return torch.stack(worst).amin(dim=0)
 
@@ -261,7 +269,7 @@ class AnalyticSelector:
         """(b,) self- and arm-vs-held-cube penetration summed over strided frames."""
         q = self.joints(traj)[0][:, ::SELF_STRIDE]
         b, t = q.shape[:2]
-        cube = self.cube(traj)
+        cube = self.cube(traj) if self.fc.cube_half > 0 else None
         if cube is not None:
             cube = (cube[:, ::SELF_STRIDE].float() - self.fc.base_pos).reshape(-1, 3)
         pen, _ = self.fc.body_penetration(q.reshape(-1, self.n_arm).float(), cube)

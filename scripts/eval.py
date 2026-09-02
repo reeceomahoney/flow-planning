@@ -60,6 +60,8 @@ class Config:
     n_cond: int = 8  # search: uniform candidates drawn at startup
     fixed: str = ""  # cond=fixed: comma-separated label values
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
+    hold: float = 0.0  # selector: held-object sphere radius after the plan grips
+    deviation: float = 0.0  # search: penalise action distance from the zero-label plan
     resample: bool = False  # search: fresh candidates + re-selection every replan
     cbf: bool = False  # AEGIS-style EE-ellipsoid safety filter on executed actions
     ensemble: int = 1  # >1: temporal ensembling over this many overlapping chunks
@@ -148,8 +150,9 @@ def main(cfg: Config):
             joint_start=policy.state_dim,
             device=device,
             cube_size=env.cube_size,
-            cube_index=getattr(env, "cube_index", 18),
+            cube_index=18 if cfg.hold > 0 else getattr(env, "cube_index", 18),
             pointcloud=cloud,
+            hold=cfg.hold,
         )
         joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
         sel.fc.calibrate_self(torch.as_tensor(joints, device=device))
@@ -191,14 +194,20 @@ def main(cfg: Config):
                 print(f"oracle cond best-of-{cfg.n_cond} over noise")
         elif cfg.cond is Cond.SEARCH:  # candidates scored + latched via selector
             assert policy.selector_fn is not None, "search needs --env.obstacle"
-            cand = sample_cond(bend, cfg.n_cond, rng, device)
+
+            def sample():
+                c = sample_cond(bend, cfg.n_cond, rng, device)
+                if cfg.deviation > 0:
+                    c = torch.cat([torch.zeros_like(c[:1]), c])
+                return c
+
+            policy.deviation = cfg.deviation
+            cand = sample()
             policy.cond_candidates = cand
             policy.n_samples = cfg.n_cond
             print(f"search candidates ({len(cand)}):\n{cand.cpu().numpy().round(2)}")
             if cfg.resample:
-                policy.cond_candidates = lambda: sample_cond(
-                    bend, cfg.n_cond, rng, device
-                )
+                policy.cond_candidates = sample
                 print(f"resampling {cfg.n_cond} candidates at every replan")
 
     cbf = None
@@ -247,6 +256,7 @@ def main(cfg: Config):
     clip: list = []
     ei = getattr(env, "ee_state_index", 0)
     total_succ = total_fail = total_task = total = 0
+    fail_dirty = fail_clean = 0
     stages = getattr(env, "STAGES", None)  # franka pick-place stage ladder
     nz = len(stages) if stages else 0
     stage_hist = np.zeros(nz, int)
@@ -280,6 +290,7 @@ def main(cfg: Config):
         if cfg.cond is Cond.SEARCH and bend is not None and not cfg.resample:
             policy.cond_candidates = sample_cond(bend, cfg.n_cond, rng, device)
         succ = np.zeros(n, dtype=bool)
+        seen_fail = np.zeros(n, dtype=bool)
         max_stage = np.zeros(n, int)
         frame = 0
         pbar = tqdm(total=frames, desc=f"batch {ep}", leave=False)
@@ -319,6 +330,13 @@ def main(cfg: Config):
                 frame += 1
                 pbar.update(1)
                 succ |= env.success()
+                if policy.last_dirty is not None:
+                    newly = env.failure() & ~seen_fail
+                    if newly.any():
+                        ld = policy.last_dirty.cpu().numpy()
+                        fail_dirty += int(ld[newly].sum())
+                        fail_clean += int((~ld[newly]).sum())
+                    seen_fail |= env.failure()
                 if stages is not None:
                     max_stage = np.maximum(max_stage, env.stage())
                 if not cfg.video and succ.all():
@@ -412,6 +430,11 @@ def main(cfg: Config):
     if searching and lc is not None:
         lc = lc.cpu().numpy()
         print(f"latched cond mean {lc.mean(0).round(3)} std {lc.std(0).round(3)}")
+    if policy.replans:
+        print(
+            f"dirty picks {policy.dirty}/{policy.replans} replans; collisions under "
+            f"dirty pick {fail_dirty} / clean pick {fail_clean}"
+        )
     if writer is not None:
         writer.release()
         print(f"Saved video to {cfg.video}")
