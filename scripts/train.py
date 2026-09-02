@@ -19,6 +19,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 import wandb
 from flow_planning.envs import EnvConfig, FrankaConfig, make_env
 from flow_planning.envs.franka import box_pointcloud, subsample_cloud
+from flow_planning.envs.libero import box_surface_cloud
 from flow_planning.policy import (
     FlowMatchingConfig,
     FlowMatchingPolicy,
@@ -236,10 +237,12 @@ def main(cfg: Config):
             w = walls[f]
             if np.abs(w).sum() == 0:
                 continue
-            pts = box_pointcloud([w[:3], table[0]], [w[3:], table[1]], th)
-            clouds[ep[f]] = torch.from_numpy(
-                subsample_cloud(pts, policy_cfg.cloud_points, rng)
-            )
+            if cfg.env.type == "libero":
+                pts = box_surface_cloud(w, policy_cfg.cloud_points, rng)
+            else:
+                pts = box_pointcloud([w[:3], table[0]], [w[3:], table[1]], th)
+                pts = subsample_cloud(pts, policy_cfg.cloud_points, rng)
+            clouds[ep[f]] = torch.from_numpy(pts)
             n_walls += 1
         clouds = clouds.to(device)
         print(f"clouds: {n_walls}/{len(first)} episodes have a wall", flush=True)

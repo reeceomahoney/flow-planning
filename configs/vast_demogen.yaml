@@ -1,0 +1,74 @@
+name: flow-planning
+
+resources:
+  infra: vast
+  accelerators: RTX5090:1
+  cpus: 16+
+  memory: 32+
+  disk_size: 60
+  image_id: docker:nvidia/cuda:13.0.3-runtime-ubuntu22.04
+
+envs:
+  HF_TOKEN:
+  WANDB_API_KEY:
+  MUJOCO_GL: egl
+  HF_DATASETS_DISABLE_PROGRESS_BARS: 1
+  CMAKE_POLICY_VERSION_MINIMUM: 3.5
+  NAME: spatial_demogen
+  AUG: "--copies 8 --orig_copies 5"
+  POINTS: 256
+  ITERS: 40000
+  SEEDS: "0 1 2"
+  CELLS: "1_I 1_II 2_I 2_II 3_I 3_II"
+  PAR: 3
+workdir: .
+
+setup: |
+  DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | cut -d. -f1)
+  [ "$DRV" -ge 580 ] || { echo "driver $DRV too old"; exit 1; }
+  apt-get update -qq && apt-get install -y -qq curl git build-essential linux-libc-dev libegl1 libgl1 libglib2.0-0 > /dev/null
+  curl -fsSL https://pixi.sh/install.sh | sh
+  export PATH="$HOME/.pixi/bin:$PATH"
+  cd ~/sky_workdir && pixi install
+
+run: |
+  export PATH="$HOME/.pixi/bin:$PATH"
+  SNAP=$(mktemp -d ~/snap.XXXXXX)
+  rsync -a --exclude .pixi --exclude outputs --exclude wandb ~/sky_workdir/ $SNAP/
+  ln -s ~/sky_workdir/.pixi $SNAP/.pixi; mkdir -p ~/sky_workdir/outputs; ln -s ~/sky_workdir/outputs $SNAP/outputs
+  cd $SNAP
+  grep -q "def demogen_plan" scripts/augment.py || { echo "stale workdir"; exit 1; }
+  export LD_LIBRARY_PATH="$PWD/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
+  CACHE=~/.cache/huggingface/lerobot/reece-omahoney
+  ENV="--env.type libero --env.suite safelibero_spatial --env.task_onehot 4 --env.n_action_steps 10 --env.world_count 10"
+  q() { "$@" 2>&1 | grep --line-buffered -vE "it/s|Warning|examples/s|EGL|egl_|OpenGL|glCheck|binding_utils|raise self|^\s*$"; }
+  echo "##### augment $NAME: demogen $AUG"
+  [ -d $CACHE/$NAME ] || q pixi run python scripts/augment.py $ENV --env.level I --task_ids "[0,1,2,3]" --dst_repo reece-omahoney/$NAME \
+    --n_seg 1 --bend_margin 0.4 --demogen true --retarget 0.25 --retarget_place 0.12 \
+    --ik_iters 32 --ik_tol 0.01 --vel_frac 0.8 --ik_tol_aug 0.05 --vel_frac_aug 1.5 $AUG
+  ENS="--ensemble 3 --ensemble_m 0.7"
+  arm_args() { case $1 in
+    cloud) echo "--env.obstacle true --cond cloud --n_cond 1 $ENS";;
+    free) echo "--env.obstacle false --cond cloud --n_cond 1 $ENS";;
+  esac; }
+  run() { # ARM CELL
+    OUT=outputs/eval_${NAME}_s$SEED; mkdir -p $OUT; f=$OUT/$1_$2.log
+    grep -q "^overall" $f 2>/dev/null && { echo "skip $f"; return; }
+    t=${2%_*}; l=${2#*_}
+    OMP_NUM_THREADS=2 pixi run python scripts/eval.py $ENV --env.task_id $t --env.level $l \
+      --repo_id reece-omahoney/$NAME --checkpoint $RUN --episodes 5 $(arm_args $1) > $f 2>&1
+    echo "done $f $(grep -aE '^overall' $f | tr '\n' ' ')"
+  }
+  export -f run arm_args; export ENV ENS NAME
+  for SEED in $SEEDS; do
+    RUN=outputs/libero/${NAME}_s$SEED; export SEED RUN
+    echo "##### train $RUN"
+    [ -f $RUN/model.safetensors ] || q pixi run python scripts/train.py $ENV --repo_id reece-omahoney/$NAME \
+      --horizon 50 --num_iters $ITERS --eval_every 0 --balance_tasks true --seed $SEED --run_dir $RUN \
+      --cloud_points $POINTS --cond_dim 0 --wandb_mode disabled
+    { for C in $CELLS; do echo "cloud $C"; done; for T in 1 2 3; do echo "free ${T}_I"; done; } \
+      | xargs -P $PAR -L 1 bash -c 'run "$@"' _
+    echo "##### TABLE $NAME s$SEED"
+    for f in outputs/eval_${NAME}_s$SEED/*.log; do echo "$(basename $f .log) $(grep -aE '^overall' $f | tr '\n' ' ')"; done
+  done
+  rm -rf $SNAP

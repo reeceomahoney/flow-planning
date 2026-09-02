@@ -163,10 +163,14 @@ def main(cfg: Config):
     if cfg.cond is Cond.CLOUD:
         n_pts = getattr(policy.config, "cloud_points", 0)
         assert n_pts, "checkpoint has no point encoder"
-        pts = env.scene_pointcloud() if cfg.env.obstacle else np.zeros((0, 3))
-        cloud = subsample_cloud(pts, n_pts, rng)
-        policy.cloud = torch.as_tensor(cloud, device=device)[None]
-        print(f"cloud cond: {len(pts)} scene points -> {n_pts}")
+        if hasattr(env, "obstacle_cloud"):
+            policy.cloud = torch.zeros(1, n_pts, 3, device=device)
+            print(f"cloud cond: {n_pts} obstacle surface points per world, per reset")
+        else:
+            pts = env.scene_pointcloud() if cfg.env.obstacle else np.zeros((0, 3))
+            cloud = subsample_cloud(pts, n_pts, rng)
+            policy.cloud = torch.as_tensor(cloud, device=device)[None]
+            print(f"cloud cond: {len(pts)} scene points -> {n_pts}")
         if policy.selector_fn is not None:
             policy.n_samples = cfg.n_cond
     if cfg.cond is Cond.SAMPLE:
@@ -268,6 +272,9 @@ def main(cfg: Config):
             break
         policy.reset()
         env.reset()
+        if cfg.cond is Cond.CLOUD and hasattr(env, "obstacle_cloud"):
+            cloud = env.obstacle_cloud(policy.config.cloud_points, rng)
+            policy.cloud = torch.as_tensor(cloud, device=device)
         if sel is not None and hasattr(env, "obstacle_boxes"):
             sel.set_boxes(env.obstacle_boxes())
         if cbf is not None:

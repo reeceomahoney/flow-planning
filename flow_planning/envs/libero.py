@@ -246,6 +246,21 @@ def body_aabb(e, name: str) -> np.ndarray:
     return union_box(geom_boxes(e, name))
 
 
+def box_surface_cloud(boxes, n: int, rng) -> np.ndarray:
+    boxes = np.asarray(boxes, np.float32).reshape(-1, 6)
+    c, h = boxes[:, :3], boxes[:, 3:]
+    faces = np.stack([h[:, 1] * h[:, 2], h[:, 0] * h[:, 2], h[:, 0] * h[:, 1]], 1)
+    area = faces.sum(1)
+    b = rng.choice(len(boxes), n, p=area / area.sum())
+    hb = h[b]
+    cdf = np.cumsum(faces[b], 1) / area[b, None]
+    ax = (rng.random(n)[:, None] < cdf).argmax(1)
+    p = rng.uniform(-1.0, 1.0, (n, 3)) * hb
+    rows = np.arange(n)
+    p[rows, ax] = hb[rows, ax] * rng.choice([-1.0, 1.0], n)
+    return (c[b] + p).astype(np.float32)
+
+
 def obstacle_geom_boxes(e, name: str) -> np.ndarray:
     boxes = geom_boxes(e, name)
     ob = union_box(boxes)
@@ -468,6 +483,14 @@ class LiberoEnv:
                 continue
             b = geom_boxes(e, self.obstacle[i])
             out.append((b[:, None, :3] + signs[None] * b[:, None, 3:]).reshape(-1, 3))
+        return out
+
+    def obstacle_cloud(self, n: int, rng) -> np.ndarray:
+        out = np.zeros((len(self.envs), n, 3), np.float32)
+        for i, e in enumerate(self.envs):
+            if self.obstacle[i] is not None:
+                boxes = obstacle_geom_boxes(e, self.obstacle[i])
+                out[i] = box_surface_cloud(boxes, n, rng)
         return out
 
     @property

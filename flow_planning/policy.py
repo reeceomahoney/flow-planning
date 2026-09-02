@@ -359,7 +359,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # plans x horizon constant instead of hard-coding a count (retiming took
         # the horizon 599 -> 832 and OOM'd a fixed 4096)
         mb = max(256, int(4096 * 600 / self.config.horizon))
-        cloud = None if self.cloud is None else self.cloud.expand(m, -1, -1)
+        cloud = None
+        if self.cloud is not None:
+            cloud = (
+                self.cloud.repeat_interleave(k, 0)
+                if self.cloud.shape[0] > 1
+                else self.cloud.expand(m, -1, -1)
+            )
         x = torch.cat(
             [
                 self.flow_integrate(

@@ -33,6 +33,7 @@ from flow_planning.bend import (
 from flow_planning.envs import EnvConfig, FrankaConfig
 from flow_planning.envs.env import PiperConfig
 from flow_planning.kinematics import EE_FRAME, build_franka_chain, build_piper_chain
+from flow_planning.plan import retime, rrt_connect, shortcut, smooth_pinned
 from flow_planning.selector import FrankaCollision, box_sdf
 from flow_planning.utils import hf_column, quat_to_rot6d, rot6d_to_quat
 
@@ -77,6 +78,13 @@ class Config:
     wall_margin: float = 0.12
     outside_margin: float = 0.08
     arm_margin: float = 0.01
+    box_xy: tuple[float, float] = (0.015, 0.06)
+    box_h: tuple[float, float] = (0.02, 0.11)
+    box_pad: float = 0.5
+    box_clear: float = 0.03
+    box_tries: int = 40
+    tilt_max: float = 30.0
+    plan_iters: int = 2000
 
     recover: int = 0
     recover_approach: int = 0
@@ -171,10 +179,8 @@ def libero_demos(cfg, env, chain, base, limit):
         segs, held = held_segments(obs, act[:, 7], len(names))
         ee, quat = fk(chain, act[:, ARM], base)
         env.set_state(0, f["data"][k]["states"][0])
-        half = [
-            body_aabb(env.envs[0], names[j])[3:5] if j is not None else np.ones(2)
-            for j in held
-        ]
+        boxes = np.stack([body_aabb(env.envs[0], n) for n in names])
+        half = [boxes[j, 3:5] if j is not None else np.ones(2) for j in held]
         demos.append(
             dict(
                 key=k,
@@ -186,6 +192,7 @@ def libero_demos(cfg, env, chain, base, limit):
                 ee=ee,
                 quat=quat,
                 half=half,
+                boxes=boxes,
                 dbs=[np.zeros(3)] * len(segs),
                 dps=[np.zeros(3)] * len(segs),
                 ends=[np.zeros(3)] * len(segs),
@@ -255,6 +262,173 @@ def libero_candidates(cfg, demos, rng, per_demo):
                 cands.append(c)
                 mine += 1
     return cands
+
+
+def demogen_candidates(cfg, demos, rng, per_demo):
+    m = round(cfg.bend_margin * cfg.env.fps)
+    cands: list[dict[str, Any]] = []
+    for d, x in enumerate(demos):
+        held_idx = [k for k, j in enumerate(x["held"]) if j is not None]
+        if not held_idx:
+            continue
+        for _ in range(per_demo):
+            pick = held_idx[rng.integers(len(held_idx))]
+            delta = np.append(rng.uniform(-cfg.retarget, cfg.retarget, 2), 0.0)
+            r = cfg.retarget_place
+            dplace = np.append(rng.uniform(-r, r, 2), 0.0) if r else None
+            dbs = [np.zeros(3)] * len(x["segs"])
+            dps = [np.zeros(3)] * len(x["segs"])
+            dbs[pick] = delta
+            if dplace is not None:
+                dps[pick] = dplace
+            c = build(
+                dict(x) | {"dbs": dbs, "dps": dps},
+                tuple(SEG_ZERO for _ in x["held"]),
+                m,
+            )
+            if c is not None:
+                c["d"], c["shift"], c["pick"] = d, (pick, delta, dplace), pick
+                cands.append(c)
+    return cands
+
+
+def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
+    fps = cfg.env.fps
+    m, pad = round(cfg.bend_margin * fps), round(cfg.box_pad * fps)
+    k = c["pick"]
+    j_held = x["held"][k]
+    cl, op = x["segs"][k]
+    w0 = x["segs"][k - 1][1] + m if k else 1
+    phases = [(w0, cl - m), (cl + m, op - m)]
+    phases = [(a, b) for a, b in phases if b - a >= 2 * pad + 10]
+    if not phases:
+        c["why"] = "short"
+        return False
+    hand = fcol.frames.index("fr3_hand")
+    base_t = fcol.base_pos
+    act = c["act"]
+    q_all = torch.as_tensor(act[:, ARM], dtype=torch.float32, device=DEV)
+    mats, pts = fcol.forward(q_all)
+    pts_w = pts + base_t
+    hand_w = mats[:, hand, :3, 3] + base_t
+    scene = x["boxes"].copy()
+    pick, delta, dplace = c["shift"]
+    scene[j_held, :3] += delta
+    if dplace is not None:
+        for j, mv in enumerate(movable):
+            if mv and j != j_held:
+                scene[j, :3] += dplace
+    table_z = float((scene[:, 2] - scene[:, 5]).min())
+    above = fcol.owner >= 2
+    r_obj = float(x["half"][k].max()) + 0.01
+    obj = torch.as_tensor(c["objs"][k], dtype=torch.float32, device=DEV)
+    cos_tilt = float(np.cos(np.radians(cfg.tilt_max)))
+    lo_t = torch.as_tensor(lo, dtype=torch.float32, device=DEV)
+    hi_t = torch.as_tensor(hi, dtype=torch.float32, device=DEV)
+    c["why"] = "box"
+    for _ in range(cfg.box_tries):
+        p0, p1 = phases[rng.integers(len(phases))]
+        held = p0 >= cl
+        t = int(rng.integers(p0, p1))
+        low = pts_w[t][above & (pts_w[t, :, 2] < table_z + 2 * cfg.box_h[1])]
+        if not len(low):
+            continue
+        p = low[int(rng.integers(len(low)))].cpu().numpy()
+        hz = rng.uniform(*cfg.box_h)
+        if table_z + 2 * hz < p[2]:
+            hz = min(cfg.box_h[1], 0.5 * (p[2] - table_z) + rng.uniform(0.0, 0.02))
+        box = np.array(
+            [
+                *(p[:2] + rng.uniform(-0.03, 0.03, 2)),
+                table_z + hz,
+                *rng.uniform(*cfg.box_xy, 2),
+                hz,
+            ],
+            np.float32,
+        )
+        if not (np.abs(box[:3] - scene[:, :3]) > box[3:] + scene[:, 3:]).any(1).all():
+            continue
+        bc, bh = (
+            torch.as_tensor(v, dtype=torch.float32, device=DEV)
+            for v in (box[:3], box[3:])
+        )
+        dmin = box_sdf(pts_w, bc, bh).amin(1)
+        if held:
+            dmin = torch.minimum(dmin, box_sdf(obj, bc, bh) - r_obj + fcol.radius)
+        hit = (dmin < fcol.radius + cfg.box_clear).cpu().numpy()
+        inside = np.zeros(len(act), bool)
+        inside[p0:p1] = True
+        if not hit[inside].any() or hit[~inside].any():
+            continue
+        hs = np.flatnonzero(hit)
+        ws, we = max(p0, hs[0] - pad), min(p1 - 1, hs[-1] + pad)
+        if we - ws < 10 or hit[ws] or hit[we]:
+            continue
+        q_s, q_g = act[ws, ARM].astype(float), act[we, ARM].astype(float)
+        boxes = torch.as_tensor(
+            np.concatenate([box[None], scene]), dtype=torch.float32, device=DEV
+        )
+        margins = torch.zeros(len(boxes), device=DEV)
+        margins[0] = cfg.box_clear
+        near = box_sdf(pts_w[[ws, we]][:, :, None], boxes[:, :3], boxes[:, 3:]).amin(
+            (0, 1)
+        )
+        keep = torch.ones(len(boxes), dtype=torch.bool, device=DEV)
+        keep[1:] = near[1:] >= fcol.radius + 0.01
+        boxes, margins = boxes[keep], margins[keep]
+        z0 = mats[ws, hand, :3, 2]
+        off = obj[ws] - hand_w[ws] if held else None
+
+        def valid(Q):
+            q = torch.as_tensor(np.asarray(Q, np.float32), device=DEV).view(-1, 7)
+            ok = ((q >= lo_t) & (q <= hi_t)).all(1)
+            mt, pt = fcol.forward(q)
+            ok &= (fcol.self_gap - fcol.self_dists(mt, pt)).amax(1) <= 0
+            pw = pt + base_t
+            d = box_sdf(pw[:, :, None], boxes[:, :3], boxes[:, 3:]).amin(1)
+            ok &= (d >= fcol.radius + margins).all(1)
+            ok &= pw[:, above, 2].amin(1) >= table_z + 0.005
+            ok &= (mt[:, hand, :3, 2] * z0).sum(-1) >= cos_tilt
+            if off is not None:
+                po = mt[:, hand, :3, 3] + base_t + off
+                do = box_sdf(po[:, None], boxes[:, :3], boxes[:, 3:])
+                ok &= (do >= r_obj + margins).all(1)
+            return ok.cpu().numpy()
+
+        if not valid(np.stack([q_s, q_g])).all():
+            c["why"] = "endpoint"
+            continue
+        path = rrt_connect(q_s, q_g, valid, lo, hi, rng, cfg.plan_iters)
+        if path is None:
+            c["why"] = "plan"
+            continue
+        q_new = retime(shortcut(path, valid, rng), we - ws + 1)
+        sm = smooth_pinned(q_new)
+        q_new = sm if valid(sm).all() else q_new
+        if not valid(q_new).all():
+            c["why"] = "plan"
+            continue
+        if np.abs(np.diff(q_new, axis=0)).max() > cfg.vel_frac_aug * cfg.env.delta_max:
+            c["why"] = "vel"
+            continue
+        act2 = act.copy()
+        act2[ws : we + 1, ARM] = q_new
+        if np.abs(np.diff(act2[:, ARM], n=2, axis=0)).max() > 0.6 * (50 / fps) ** 2:
+            c["why"] = "jerk"
+            continue
+        q_t = torch.as_tensor(q_new, dtype=torch.float32, device=DEV)
+        hand_new = fcol.forward(q_t)[0][:, hand, :3, 3] + base_t
+        d = (hand_new - hand_w[ws : we + 1]).cpu().numpy()
+        c["ee_t"] = c["ee_t"].copy()
+        c["ee_t"][ws : we + 1] += d
+        if held:
+            c["objs"] = list(c["objs"])
+            c["objs"][k] = c["objs"][k].copy()
+            c["objs"][k][ws : we + 1] += d
+        c["act"], c["wall"], c["why"] = act2.astype(np.float32), box, ""
+        c["fam"] = "transit" if held else "approach"
+        return True
+    return False
 
 
 def held_combo(combo, held):
@@ -639,6 +813,9 @@ def augment_libero(cfg):
             "action": {"dtype": "float32", "shape": (8,), "names": None},
             "bend": {"dtype": "float32", "shape": (ldim,), "names": None},
         }
+        if cfg.demogen:
+            features["wall"] = {"dtype": "float32", "shape": (6,), "names": None}
+        wall0 = np.zeros(6, np.float32) if cfg.demogen else None
         if dst is None:
             dst = LeRobotDataset.create(
                 repo_id=cfg.dst_repo,
@@ -650,7 +827,7 @@ def augment_libero(cfg):
         assert features == shapes, (task_id, features, shapes)
         for x in demos:
             for _ in range(cfg.orig_copies):
-                write(dst, x["obs"], x["act"], np.zeros(ldim), env.language)
+                write(dst, x["obs"], x["act"], np.zeros(ldim), env.language, wall0)
         if cfg.recover or cfg.recover_approach:
             n_rec, lens, mags = 0, [], []
             by_demo, why_all = recover_all(cfg, demos, chain, base, fcol, rng)
@@ -696,9 +873,14 @@ def augment_libero(cfg):
         tcfg = cfg
         if cfg.alpha_tasks and task_id not in cfg.alpha_tasks:
             tcfg = replace(cfg, alpha_prob=0.0)
-        cands = libero_candidates(tcfg, demos, rng, 4 * cfg.copies)
+        if cfg.demogen:
+            cands = demogen_candidates(cfg, demos, rng, 8 * cfg.copies)
+            limits = chain.get_joint_limits()
+        else:
+            cands = libero_candidates(tcfg, demos, rng, 4 * cfg.copies)
         print(f"{len(cands)} candidates")
         libero_solve(cfg, cands, demos, chain, base, fcol, rng)
+        fams: dict[str, int] = {}
         written = 0
         why: dict[str, int] = {}
         labels = []
@@ -710,6 +892,12 @@ def augment_libero(cfg):
             if per_demo[c["d"]] >= cfg.copies:
                 continue
             x = demos[c["d"]]
+            if cfg.demogen:
+                lo, hi = limits
+                if not demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
+                    why[c["why"]] = why.get(c["why"], 0) + 1
+                    continue
+                fams[c["fam"]] = fams.get(c["fam"], 0) + 1
             if cfg.filter:
                 shift = c.get("shift")
                 if shift is not None:
@@ -729,11 +917,13 @@ def augment_libero(cfg):
             )
             if pos:
                 label[-1] = c.get("psi", 0.0)
-            write(dst, obs, c["act"], label, env.language)
+            write(dst, obs, c["act"], label, env.language, c.get("wall"))
             labels.append(label)
             written += 1
             per_demo[c["d"]] += 1
         print(f"wrote {written}/{len(cands)} copies; rejected {why}")
+        if fams:
+            print(f"demogen phases {fams}")
         if labels:
             lab = np.stack(labels)
             print("label nonzero fraction per dim:", (np.abs(lab) > 0).mean(0).round(2))
