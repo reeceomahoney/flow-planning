@@ -98,9 +98,9 @@ def ensure_libero_config():
         )
     )
     cfg_file = cfg_dir / "config.yaml"
-    if cfg_file.exists():
-        return
     root = libero_package_root()
+    if cfg_file.exists() and f"benchmark_root: {root}\n" in cfg_file.read_text():
+        return
     paths = {
         "benchmark_root": root,
         "bddl_files": root / "bddl_files",

@@ -1,16 +1,14 @@
 name: flow-planning
 
 resources:
-  infra: vast
-  accelerators: RTX5090:1
-  cpus: 16+
-  memory: 32+
-  disk_size: 60
-  image_id: docker:nvidia/cuda:13.0.3-runtime-ubuntu22.04
+  infra: ssh/ori
+  accelerators: RTX4090:1
+  cpus: 8
 
 envs:
   HF_TOKEN:
   WANDB_API_KEY:
+  CUDA_VISIBLE_DEVICES: 1
   MUJOCO_GL: egl
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
@@ -18,11 +16,7 @@ envs:
   TASKS: "0 1 2 3"
   N_INITS: 20
 workdir: .
-
 setup: |
-  DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | cut -d. -f1)
-  [ "$DRV" -ge 580 ] || { echo "driver $DRV too old"; exit 1; }
-  apt-get update -qq && apt-get install -y -qq curl git build-essential linux-libc-dev libegl1 libgl1 libglib2.0-0 > /dev/null
   curl -fsSL https://pixi.sh/install.sh | sh
   export PATH="$HOME/.pixi/bin:$PATH"
   cd ~/sky_workdir && pixi install
