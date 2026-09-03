@@ -180,6 +180,20 @@ def libero_demos(cfg, env, chain, base, limit):
         ee, quat = fk(chain, act[:, ARM], base)
         env.set_state(0, f["data"][k]["states"][0])
         boxes = np.stack([body_aabb(env.envs[0], n) for n in names])
+        e0 = env.envs[0]
+        others = [
+            n
+            for n in list(e0.env.objects_dict)
+            + list(getattr(e0.env, "fixtures_dict", {}))
+            if n not in names
+        ]
+        fixed = (
+            np.stack([body_aabb(e0, n) for n in others]) if others else np.zeros((0, 6))
+        )
+        g = e0.sim.model._model.geom("table_collision").id
+        table_z = float(
+            e0.sim.data._data.geom_xpos[g][2] + e0.sim.model._model.geom_size[g][2]
+        )
         half = [boxes[j, 3:5] if j is not None else np.ones(2) for j in held]
         demos.append(
             dict(
@@ -193,6 +207,8 @@ def libero_demos(cfg, env, chain, base, limit):
                 quat=quat,
                 half=half,
                 boxes=boxes,
+                fixed=fixed,
+                table_z=table_z,
                 dbs=[np.zeros(3)] * len(segs),
                 dps=[np.zeros(3)] * len(segs),
                 ends=[np.zeros(3)] * len(segs),
@@ -318,8 +334,11 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
         for j, mv in enumerate(movable):
             if mv and j != j_held:
                 scene[j, :3] += dplace
-    table_z = float((scene[:, 2] - scene[:, 5]).min())
+    scene = np.concatenate([scene, x["fixed"]]).astype(np.float32)
+    table_z = x["table_z"]
     above = fcol.owner >= 2
+    clear = None
+    low_any = (pts_w[:, above, 2] < table_z + 2 * cfg.box_h[1]).any(1).cpu().numpy()
     r_obj = float(x["half"][k].max()) + 0.01
     obj = torch.as_tensor(c["objs"][k], dtype=torch.float32, device=DEV)
     cos_tilt = float(np.cos(np.radians(cfg.tilt_max)))
@@ -329,17 +348,21 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
     for _ in range(cfg.box_tries):
         p0, p1 = phases[rng.integers(len(phases))]
         held = p0 >= cl
-        t = int(rng.integers(p0, p1))
-        low = pts_w[t][above & (pts_w[t, :, 2] < table_z + 2 * cfg.box_h[1])]
-        if not len(low):
-            continue
-        p = low[int(rng.integers(len(low)))].cpu().numpy()
+        lowz = table_z + 2 * cfg.box_h[1]
+        lowf = np.flatnonzero(low_any[p0:p1]) + p0
+        t = (
+            int(rng.choice(lowf))
+            if len(lowf) and rng.random() < 0.8
+            else int(rng.integers(p0, p1))
+        )
+        low = pts_w[t][above & (pts_w[t, :, 2] < lowz)]
+        p = (low[int(rng.integers(len(low)))] if len(low) else hand_w[t]).cpu().numpy()
         hz = rng.uniform(*cfg.box_h)
         if table_z + 2 * hz < p[2]:
             hz = min(cfg.box_h[1], 0.5 * (p[2] - table_z) + rng.uniform(0.0, 0.02))
         box = np.array(
             [
-                *(p[:2] + rng.uniform(-0.03, 0.03, 2)),
+                *(p[:2] + rng.uniform(-0.12, 0.12, 2)),
                 table_z + hz,
                 *rng.uniform(*cfg.box_xy, 2),
                 hz,
@@ -347,6 +370,7 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
             np.float32,
         )
         if not (np.abs(box[:3] - scene[:, :3]) > box[3:] + scene[:, 3:]).any(1).all():
+            c["why"] = "scene"
             continue
         bc, bh = (
             torch.as_tensor(v, dtype=torch.float32, device=DEV)
@@ -358,11 +382,18 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
         hit = (dmin < fcol.radius + cfg.box_clear).cpu().numpy()
         inside = np.zeros(len(act), bool)
         inside[p0:p1] = True
-        if not hit[inside].any() or hit[~inside].any():
+        if hit[~inside].any():
+            c["why"] = "outside"
+            continue
+        if not hit[inside].any():
+            if clear is None and (dmin >= fcol.radius + cfg.box_clear).all():
+                clear = box
+            c["why"] = "nohit"
             continue
         hs = np.flatnonzero(hit)
         ws, we = max(p0, hs[0] - pad), min(p1 - 1, hs[-1] + pad)
         if we - ws < 10 or hit[ws] or hit[we]:
+            c["why"] = "window"
             continue
         q_s, q_g = act[ws, ARM].astype(float), act[we, ARM].astype(float)
         boxes = torch.as_tensor(
@@ -427,6 +458,9 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
             c["objs"][k][ws : we + 1] += d
         c["act"], c["wall"], c["why"] = act2.astype(np.float32), box, ""
         c["fam"] = "transit" if held else "approach"
+        return True
+    if clear is not None:
+        c["wall"], c["why"], c["fam"] = clear, "", "clear"
         return True
     return False
 
