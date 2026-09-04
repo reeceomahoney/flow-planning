@@ -550,7 +550,7 @@ def posture_copies(cfg, demos, chain, base, fcol, rng, movable):
     return out, why
 
 
-def kinematic_obs(x, c, chain, base, movable):
+def kinematic_obs(x, c, chain, base, movable, target=None):
     obs, act = x["obs"], c["act"]
     q_obs = np.concatenate([obs[:1, ARM], act[:-1, ARM]])
     pos0, quat0 = fk(chain, obs[:, ARM], base)
@@ -569,6 +569,8 @@ def kinematic_obs(x, c, chain, base, movable):
         for k, mv in enumerate(movable):
             if mv and k not in x["held"]:
                 out[:, obj_slice(k)] += shift[2]
+        if target is not None:
+            out[:, target] += shift[2]
     for k, j in enumerate(x["held"]):
         if j is not None:
             out[:, obj_slice(j)] = c["objs"][k]
@@ -667,6 +669,7 @@ def augment_libero(cfg):
         demos = libero_demos(cfg, env, chain, base, cfg.limit)
         mj = env.envs[0].sim.model._model
         movable = [mj.body(f"{n}_main").jntadr[0] >= 0 for n in env.objects]
+        target = env.target_slice() if cfg.env.target_obs else None
         if cfg.n_seg:
             kept = [x for x in demos if len(x["segs"]) <= cfg.n_seg]
             print(
@@ -767,7 +770,7 @@ def augment_libero(cfg):
                 if not succ:
                     why["replay"] = why.get("replay", 0) + 1
                     continue
-            obs = kinematic_obs(x, c, chain, base, movable)
+            obs = kinematic_obs(x, c, chain, base, movable, target)
             label = np.zeros(ldim, np.float32)
             label[: LABEL_DIM * n_seg] = encode_label(
                 held_combo(c["combo"], x["held"]), n_seg

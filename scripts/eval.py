@@ -60,7 +60,7 @@ class Config:
     n_cond: int = 8  # search: uniform candidates drawn at startup
     fixed: str = ""  # cond=fixed: comma-separated label values
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
-    hold: float = 0.0  # selector: held-object sphere radius after the plan grips
+    hold: float = 0.0  # selector: held-object sphere radius; <0 = from object geometry
     deviation: float = 0.0  # search: penalise action distance from the zero-label plan
     resample: bool = False  # search: fresh candidates + re-selection every replan
     cbf: bool = False  # AEGIS-style EE-ellipsoid safety filter on executed actions
@@ -142,6 +142,10 @@ def main(cfg: Config):
         cloud = env.scene_pointcloud() if cfg.collision == "pointcloud" else None
         if cloud is not None:
             print(f"scene pointcloud: {len(cloud)} points")
+        hold = cfg.hold
+        if hold < 0:
+            hold = env.held_radius()
+            print(f"hold sphere radius from object geometry: {hold:.3f}")
         sel = AnalyticSelector(
             geom["center"] + geom["half_extents"],
             list(env.robot_base_pos),
@@ -150,9 +154,9 @@ def main(cfg: Config):
             joint_start=policy.state_dim,
             device=device,
             cube_size=env.cube_size,
-            cube_index=18 if cfg.hold > 0 else getattr(env, "cube_index", 18),
+            cube_index=env.held_slot() if hold > 0 else getattr(env, "cube_index", 18),
             pointcloud=cloud,
-            hold=cfg.hold,
+            hold=hold,
         )
         joints = hf_column(dataset.hf_dataset, "observation.state")[::50, :7]
         sel.fc.calibrate_self(torch.as_tensor(joints, device=device))

@@ -75,6 +75,7 @@ class LiberoConfig(EnvConfig):
     render: bool = False
     render_size: int = 256
     task_onehot: int = 0
+    target_obs: bool = False
 
 
 def task_name(cfg: LiberoConfig) -> str:
@@ -403,6 +404,8 @@ class LiberoEnv:
             for k, n in enumerate(self.objects):
                 parts += [o[f"{n}_pos"], r6[k + 1]]
             parts.append(e.sim.data.qpos[self.fixture_qpos])
+            if self.cfg.target_obs:
+                parts.append(self.target_pos(i))
             if self.cfg.task_onehot:
                 parts.append(np.eye(self.cfg.task_onehot)[self.cfg.task_id])
             rows.append(np.concatenate(parts))
@@ -453,6 +456,36 @@ class LiberoEnv:
 
     def goals(self):
         return [g for g in self.envs[0].env.parsed_problem["goal_state"] if len(g) == 3]
+
+    def held_slot(self):
+        for g in self.goals():
+            if g[1] in self.objects:
+                return 18 + 9 * self.objects.index(g[1])
+        return 18
+
+    def target_name(self):
+        parts = self.goals()[0][2].split("_")
+        bodies = self.envs[0].sim.model.body_names
+        for n in range(len(parts), 0, -1):
+            name = "_".join(parts[:n])
+            if f"{name}_main" in bodies:
+                return name
+        raise KeyError(self.goals()[0][2])
+
+    def target_pos(self, i=0):
+        e = self.envs[i]
+        body = f"{self.target_name()}_main"
+        return np.asarray(e.sim.data.get_body_xpos(body), np.float32)
+
+    def target_slice(self):
+        start = 18 + 9 * len(self.objects) + len(self.fixture_qpos)
+        return slice(start, start + 3)
+
+    def held_radius(self, margin=0.01):
+        for g in self.goals():
+            if g[1] in self.objects:
+                return float(body_aabb(self.envs[0], g[1])[3:].max()) + margin
+        return 0.09
 
     def obstacle_boxes(self):
         far = np.array([1e3, 1e3, 1e3, 0.01, 0.01, 0.01], np.float32)
