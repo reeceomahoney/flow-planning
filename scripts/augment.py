@@ -84,6 +84,11 @@ class Config:
     box_tries: int = 40
     tilt_max: float = 30.0
     plan_iters: int = 2000
+    obstacle_objects: bool = False
+    obstacle_inits: int = 10
+    box_depth: float = 0.0
+    clear_frac: float = 1.0
+    oversample: int = 8
 
     filter: bool = False
     postures: int = 0
@@ -277,6 +282,39 @@ def libero_candidates(cfg, demos, rng, per_demo):
     return cands
 
 
+WALL_K = 40
+
+
+def harvest_obstacles(cfg, task_ids):
+    from flow_planning.envs.libero import LiberoEnv, obstacle_geom_boxes
+
+    lib = []
+    for t in task_ids:
+        for lvl in ("I", "II"):
+            env = LiberoEnv(
+                replace(cfg.env, task_id=t, level=lvl, world_count=1, obstacle=True)
+            )
+            for _ in range(cfg.obstacle_inits):
+                env.reset()
+                name = env.obstacle[0]
+                if name is None:
+                    continue
+                b = obstacle_geom_boxes(env.envs[0], name).astype(np.float32)
+                b[:, :2] -= env.obstacle_pos0[0, :2]
+                assert len(b) <= WALL_K, (name, len(b))
+                lib.append(b)
+            del env
+    mx = max(len(b) for b in lib)
+    print(f"harvested {len(lib)} obstacle instances, boxes per instance max {mx}")
+    return lib
+
+
+def pad_wall(boxes):
+    out = np.zeros((WALL_K, 6), np.float32)
+    out[: len(boxes)] = boxes
+    return out.ravel()
+
+
 def demogen_candidates(cfg, demos, rng, per_demo):
     m = round(cfg.bend_margin * cfg.env.fps)
     cands: list[dict[str, Any]] = []
@@ -305,7 +343,7 @@ def demogen_candidates(cfg, demos, rng, per_demo):
     return cands
 
 
-def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
+def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable, lib=None):
     fps = cfg.env.fps
     m, pad = round(cfg.bend_margin * fps), round(cfg.box_pad * fps)
     k = c["pick"]
@@ -335,6 +373,7 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
     table_z = x["table_z"]
     above = fcol.owner >= 2
     clear = None
+    wall_of = pad_wall if lib is not None else (lambda b: b[0])
     low_any = (pts_w[:, above, 2] < table_z + 2 * cfg.box_h[1]).any(1).cpu().numpy()
     r_obj = float(x["half"][k].max()) + 0.01
     obj = torch.as_tensor(c["objs"][k], dtype=torch.float32, device=DEV)
@@ -354,36 +393,49 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
         )
         low = pts_w[t][above & (pts_w[t, :, 2] < lowz)]
         p = (low[int(rng.integers(len(low)))] if len(low) else hand_w[t]).cpu().numpy()
-        hz = rng.uniform(*cfg.box_h)
-        if table_z + 2 * hz < p[2]:
-            hz = min(cfg.box_h[1], 0.5 * (p[2] - table_z) + rng.uniform(0.0, 0.02))
-        box = np.array(
-            [
-                *(p[:2] + rng.uniform(-0.12, 0.12, 2)),
-                table_z + hz,
-                *rng.uniform(*cfg.box_xy, 2),
-                hz,
-            ],
-            np.float32,
+        if lib is not None:
+            box = lib[int(rng.integers(len(lib)))].copy()
+            box[:, :2] += p[:2] + rng.uniform(-0.2, 0.2, 2)
+        else:
+            hz = rng.uniform(*cfg.box_h)
+            if table_z + 2 * hz < p[2]:
+                hz = min(cfg.box_h[1], 0.5 * (p[2] - table_z) + rng.uniform(0.0, 0.02))
+            box = np.array(
+                [
+                    [
+                        *(p[:2] + rng.uniform(-0.12, 0.12, 2)),
+                        table_z + hz,
+                        *rng.uniform(*cfg.box_xy, 2),
+                        hz,
+                    ]
+                ],
+                np.float32,
+            )
+        sep = (
+            np.abs(box[:, None, :3] - scene[None, :, :3])
+            > box[:, None, 3:] + scene[None, :, 3:]
         )
-        if not (np.abs(box[:3] - scene[:, :3]) > box[3:] + scene[:, 3:]).any(1).all():
+        if not sep.any(-1).all():
             c["why"] = "scene"
             continue
         bc, bh = (
             torch.as_tensor(v, dtype=torch.float32, device=DEV)
-            for v in (box[:3], box[3:])
+            for v in (box[:, :3], box[:, 3:])
         )
-        dmin = box_sdf(pts_w, bc, bh).amin(1)
+        dmin = box_sdf(pts_w[:, :, None], bc, bh).amin((1, 2))
         if held:
-            dmin = torch.minimum(dmin, box_sdf(obj, bc, bh) - r_obj + fcol.radius)
+            dmin = torch.minimum(
+                dmin, box_sdf(obj[:, None], bc, bh).amin(1) - r_obj + fcol.radius
+            )
         hit = (dmin < fcol.radius + cfg.box_clear).cpu().numpy()
+        deep = (dmin < fcol.radius - cfg.box_depth).cpu().numpy()
         inside = np.zeros(len(act), bool)
         inside[p0:p1] = True
         if hit[~inside].any():
             c["why"] = "outside"
             continue
-        if not hit[inside].any():
-            if clear is None and (dmin >= fcol.radius + cfg.box_clear).all():
+        if not deep[inside].any():
+            if clear is None and not hit.any():
                 clear = box
             c["why"] = "nohit"
             continue
@@ -393,16 +445,17 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
             c["why"] = "window"
             continue
         q_s, q_g = act[ws, ARM].astype(float), act[we, ARM].astype(float)
+        nb = len(box)
         boxes = torch.as_tensor(
-            np.concatenate([box[None], scene]), dtype=torch.float32, device=DEV
+            np.concatenate([box, scene]), dtype=torch.float32, device=DEV
         )
         margins = torch.zeros(len(boxes), device=DEV)
-        margins[0] = cfg.box_clear
+        margins[:nb] = cfg.box_clear
         near = box_sdf(pts_w[[ws, we]][:, :, None], boxes[:, :3], boxes[:, 3:]).amin(
             (0, 1)
         )
         keep = torch.ones(len(boxes), dtype=torch.bool, device=DEV)
-        keep[1:] = near[1:] >= fcol.radius + 0.01
+        keep[nb:] = near[nb:] >= fcol.radius + 0.01
         boxes, margins = boxes[keep], margins[keep]
         z0 = mats[ws, hand, :3, 2]
         off = obj[ws] - hand_w[ws] if held else None
@@ -453,11 +506,11 @@ def demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
             c["objs"] = list(c["objs"])
             c["objs"][k] = c["objs"][k].copy()
             c["objs"][k][ws : we + 1] += d
-        c["act"], c["wall"], c["why"] = act2.astype(np.float32), box, ""
+        c["act"], c["wall"], c["why"] = act2.astype(np.float32), wall_of(box), ""
         c["fam"] = "transit" if held else "approach"
         return True
     if clear is not None:
-        c["wall"], c["why"], c["fam"] = clear, "", "clear"
+        c["wall"], c["why"], c["fam"] = wall_of(clear), "", "clear"
         return True
     return False
 
@@ -660,6 +713,7 @@ def augment_libero(cfg):
     chain, _, _ = build_franka_chain("cpu")
     chain = pk.SerialChain(chain, EE_FRAME).to(dtype=torch.float32, device=DEV)
     dst = None
+    lib = None
     for task_id in cfg.task_ids or [cfg.env.task_id]:
         env = LiberoEnv(
             replace(cfg.env, task_id=task_id, world_count=1, obstacle=False)
@@ -693,9 +747,10 @@ def augment_libero(cfg):
             "action": {"dtype": "float32", "shape": (8,), "names": None},
             "bend": {"dtype": "float32", "shape": (ldim,), "names": None},
         }
+        wdim = 6 * WALL_K if cfg.obstacle_objects else 6
         if cfg.demogen:
-            features["wall"] = {"dtype": "float32", "shape": (6,), "names": None}
-        wall0 = np.zeros(6, np.float32) if cfg.demogen else None
+            features["wall"] = {"dtype": "float32", "shape": (wdim,), "names": None}
+        wall0 = np.zeros(wdim, np.float32) if cfg.demogen else None
         if dst is None:
             dst = LeRobotDataset.create(
                 repo_id=cfg.dst_repo,
@@ -734,8 +789,10 @@ def augment_libero(cfg):
         if cfg.alpha_tasks and task_id not in cfg.alpha_tasks:
             tcfg = replace(cfg, alpha_prob=0.0)
         if cfg.demogen:
-            cands = demogen_candidates(cfg, demos, rng, 8 * cfg.copies)
+            cands = demogen_candidates(cfg, demos, rng, cfg.oversample * cfg.copies)
             limits = chain.get_joint_limits()
+            if cfg.obstacle_objects and lib is None:
+                lib = harvest_obstacles(cfg, cfg.task_ids or [cfg.env.task_id])
         else:
             cands = libero_candidates(tcfg, demos, rng, 4 * cfg.copies)
         print(f"{len(cands)} candidates")
@@ -745,6 +802,7 @@ def augment_libero(cfg):
         why: dict[str, int] = {}
         labels = []
         per_demo = np.zeros(len(demos), int)
+        per_clear = np.zeros(len(demos), int)
         for c in tqdm(cands, desc="copies"):
             if not c["ok"]:
                 why[c["why"]] = why.get(c["why"], 0) + 1
@@ -754,9 +812,14 @@ def augment_libero(cfg):
             x = demos[c["d"]]
             if cfg.demogen:
                 lo, hi = limits
-                if not demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable):
+                if not demogen_plan(cfg, x, c, fcol, lo, hi, rng, movable, lib):
                     why[c["why"]] = why.get(c["why"], 0) + 1
                     continue
+                if c["fam"] == "clear":
+                    if per_clear[c["d"]] >= round(cfg.clear_frac * cfg.copies):
+                        why["clearcap"] = why.get("clearcap", 0) + 1
+                        continue
+                    per_clear[c["d"]] += 1
                 fams[c["fam"]] = fams.get(c["fam"], 0) + 1
             if cfg.filter:
                 shift = c.get("shift")

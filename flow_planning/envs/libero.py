@@ -518,11 +518,13 @@ class LiberoEnv:
             out.append((b[:, None, :3] + signs[None] * b[:, None, 3:]).reshape(-1, 3))
         return out
 
-    def obstacle_cloud(self, n: int, rng) -> np.ndarray:
+    def obstacle_cloud(self, n: int, rng, union: bool = False) -> np.ndarray:
         out = np.zeros((len(self.envs), n, 3), np.float32)
         for i, e in enumerate(self.envs):
             if self.obstacle[i] is not None:
                 boxes = obstacle_geom_boxes(e, self.obstacle[i])
+                if union:
+                    boxes = union_box(boxes)
                 out[i] = box_surface_cloud(boxes, n, rng)
         return out
 

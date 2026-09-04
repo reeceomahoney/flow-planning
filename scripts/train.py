@@ -238,7 +238,9 @@ def main(cfg: Config):
             if np.abs(w).sum() == 0:
                 continue
             if cfg.env.type == "libero":
-                pts = box_surface_cloud(w, policy_cfg.cloud_points, rng)
+                b = w.reshape(-1, 6)
+                b = b[np.abs(b[:, 3:]).sum(1) > 0]
+                pts = box_surface_cloud(b, policy_cfg.cloud_points, rng)
             else:
                 pts = box_pointcloud([w[:3], table[0]], [w[3:], table[1]], th)
                 pts = subsample_cloud(pts, policy_cfg.cloud_points, rng)

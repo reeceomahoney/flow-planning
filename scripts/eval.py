@@ -60,6 +60,7 @@ class Config:
     n_cond: int = 8  # search: uniform candidates drawn at startup
     fixed: str = ""  # cond=fixed: comma-separated label values
     collision: str = "box"  # selector geometry: "box" (ground truth) or "pointcloud"
+    cloud_union: bool = False  # cond=cloud: obstacle as its single bounding box
     hold: float = 0.0  # selector: held-object sphere radius; <0 = from object geometry
     deviation: float = 0.0  # search: penalise action distance from the zero-label plan
     resample: bool = False  # search: fresh candidates + re-selection every replan
@@ -277,7 +278,7 @@ def main(cfg: Config):
         policy.reset()
         env.reset()
         if cfg.cond is Cond.CLOUD and hasattr(env, "obstacle_cloud"):
-            cloud = env.obstacle_cloud(policy.config.cloud_points, rng)
+            cloud = env.obstacle_cloud(policy.config.cloud_points, rng, cfg.cloud_union)
             policy.cloud = torch.as_tensor(cloud, device=device)
         if sel is not None and hasattr(env, "obstacle_boxes"):
             sel.set_boxes(env.obstacle_boxes())
