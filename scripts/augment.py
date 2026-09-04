@@ -8,7 +8,6 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from scipy.signal import lfilter, lfilter_zi
 from scipy.spatial.transform import Rotation as R
-from scipy.spatial.transform import Slerp
 from tqdm import tqdm
 
 from flow_planning.bend import (
@@ -86,10 +85,6 @@ class Config:
     tilt_max: float = 30.0
     plan_iters: int = 2000
 
-    recover: int = 0
-    recover_approach: int = 0
-    recover_noise: tuple[float, float] = (0.02, 0.15)
-    recover_arc: bool = False
     filter: bool = False
     postures: int = 0
     posture_range: tuple[float, float] = (0.3, 1.0)
@@ -653,159 +648,6 @@ def libero_solve(cfg, cands, demos, chain, base, fcol, rng=None):
                 c["ok"], c["why"] = False, "self"
 
 
-def recover_candidates(cfg, x, pos, quat, rng, lo, hi, e, span, j, count, slot):
-    fps = cfg.env.fps
-    q_obs = x["obs"][:, ARM]
-    speed = np.linalg.norm(np.diff(pos[span[0] : span[1]], axis=0), axis=1).mean() * fps
-    z_min = pos[span[0] : span[1], 2].min() - 0.02
-    out, why, tries = [], {}, 0
-    while len(out) < 3 * count and tries < 10 * count:
-        tries += 1
-        f = int(rng.integers(lo, hi))
-        d = rng.normal(size=3)
-        d *= rng.uniform(*cfg.recover_noise) / np.linalg.norm(d)
-        if cfg.recover_arc:
-            d[2] = abs(d[2])
-        p0 = pos[f] + d
-        if p0[2] < z_min:
-            why["low"] = why.get("low", 0) + 1
-            continue
-        n = max(3, int(round(np.linalg.norm(pos[e] - p0) / speed * fps)))
-        lab = np.zeros(LABEL_DIM, np.float32)
-        if cfg.recover_arc:
-            pa = float(rng.uniform(*cfg.phi_range))
-            ta = float(
-                rng.choice(
-                    [0.0, 3 * np.pi / 4, np.pi / 2] if slot == 0 else [np.pi / 2]
-                )
-            )
-            n = max(4, int(round(n * pa * np.pi / np.sin(pa * np.pi))))
-            lab[2 + 2 * slot : 4 + 2 * slot] = [pa * np.cos(ta), pa * np.sin(ta)]
-        u = np.arange(n) / n
-        p_t = p0 + (pos[e] - p0) * u[:, None]
-        if cfg.recover_arc:
-            p_t = p_t + bend_delta(p_t, 0, n, pa * np.pi, ta)
-        key = R.from_quat(np.stack([quat[f], quat[e]]))
-        q_t = Slerp([0.0, 1.0], key)(u).as_quat()
-        ref = q_obs[f] + (q_obs[e] - q_obs[f]) * u[:, None]
-        out.append(
-            dict(f=f, d=d, e=e, j=j, slot=slot, n=n, p_t=p_t, q_t=q_t, ref=ref, lab=lab)
-        )
-    return out, why
-
-
-def recover_finish(cfg, x, pos, quat, c, q_lin, chain, base, fcol):
-    obs, act = x["obs"], x["act"]
-    q_obs = obs[:, ARM]
-    f, e, j, n = c["f"], c["e"], c["j"], c["n"]
-    jerk_limit = 0.6 * (50 / cfg.env.fps) ** 2
-    fpos, fquat = fk(chain, q_lin, base)
-    rot_err = R.from_quat(fquat) * R.from_quat(c["q_t"]).inv()
-    assert isinstance(rot_err, R)
-    q_all = np.concatenate([q_lin, q_obs[e : e + 3]])
-    if np.linalg.norm(fpos - c["p_t"], axis=1).max() > cfg.ik_tol:
-        return None, "ik"
-    if rot_err.magnitude().max() > np.radians(15):
-        return None, "rot"
-    if np.abs(np.diff(q_all, n=2, axis=0)).max() > jerk_limit:
-        return None, "jerk"
-    if np.abs(np.diff(q_all, axis=0)).max() > cfg.vel_frac * cfg.env.delta_max:
-        return None, "vel"
-    body, _ = fcol.body_penetration(
-        torch.as_tensor(q_lin, dtype=torch.float32, device=DEV), None
-    )
-    if float(body.max()) > 0.0:
-        return None, "self"
-    r_f = R.from_quat(quat[f])
-    r_t = R.from_quat(fquat)
-    assert isinstance(r_t, R)
-    off_ee = r_f.inv().apply(obs[f, EE] - pos[f])
-    rel_ee = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, ROT]))
-    assert isinstance(rel_ee, R)
-    seg = np.repeat(obs[e : e + 1], n, 0)
-    seg[:, ARM] = q_lin
-    seg[:, 7:9] = obs[f, 7:9]
-    seg[:, EE] = fpos + r_t.apply(np.repeat(off_ee[None], n, 0))
-    rot_ee_t = r_t * rel_ee
-    assert isinstance(rot_ee_t, R)
-    seg[:, ROT] = quat_to_rot6d(rot_ee_t.as_quat())
-    if j is not None:
-        off_obj = r_f.inv().apply(obs[f, obj_slice(j)] - pos[f])
-        rot_obj = slice(obj_slice(j).stop, obj_slice(j).stop + 6)
-        rel_obj = r_f.inv() * R.from_quat(rot6d_to_quat(obs[f : f + 1, rot_obj]))
-        assert isinstance(rel_obj, R)
-        seg[:, obj_slice(j)] = fpos + r_t.apply(np.repeat(off_obj[None], n, 0))
-        rot_obj_t = r_t * rel_obj
-        assert isinstance(rot_obj_t, R)
-        seg[:, rot_obj] = quat_to_rot6d(rot_obj_t.as_quat())
-    a = np.repeat(act[f : f + 1], n, 0)
-    a[:, ARM] = np.concatenate([q_lin[1:], q_obs[e : e + 1]])
-    return (
-        np.concatenate([seg, obs[e:]]).astype(np.float32),
-        np.concatenate([a, act[e:]]).astype(np.float32),
-        n,
-        float(np.linalg.norm(c["d"])),
-        c["lab"],
-    ), ""
-
-
-def recover_all(cfg, demos, chain, base, fcol, rng):
-    m = int(round(cfg.bend_margin * cfg.env.fps))
-    fks, cands, why = {}, [], {}
-    for di, x in enumerate(demos):
-        if not x["segs"]:
-            why["noseg"] = why.get("noseg", 0) + 1
-            continue
-        (c, o), j = x["segs"][0], x["held"][0]
-        pos, quat = fk(chain, x["obs"][:, ARM], base)
-        fks[di] = (pos, quat)
-        phases = []
-        if cfg.recover and o - m - (c + m) >= 2 and j is not None:
-            phases.append((c + m, o - m, o - m, (c, o), j, cfg.recover, 1))
-        if cfg.recover_approach and c - m >= 2:
-            phases.append((0, c - m, c - m, (0, c), None, cfg.recover_approach, 0))
-        for lo, hi, e, span, held, count, slot in phases:
-            cs, w = recover_candidates(
-                cfg, x, pos, quat, rng, lo, hi, e, span, held, count, slot
-            )
-            for k, v in w.items():
-                why[k] = why.get(k, 0) + v
-            for cc in cs:
-                cc["d_idx"], cc["count"] = di, count
-            cands += cs
-    out: dict[int, list] = {}
-    if not cands:
-        return out, why
-    pad = 10
-    tm = max(c["n"] for c in cands) + pad
-    front = lambda a: np.concatenate([np.repeat(a[:1], pad, 0), a])  # noqa: E731
-    for s0 in range(0, len(cands), 1024):
-        chunk = cands[s0 : s0 + 1024]
-        q_all = solve_seq(
-            chain,
-            np.stack([tpad(front(c["p_t"]), tm) for c in chunk], axis=1),
-            np.stack([tpad(front(c["q_t"]), tm) for c in chunk], axis=1),
-            np.stack([tpad(front(c["ref"]), tm) for c in chunk], axis=1),
-            cfg.ik_iters,
-            cfg.ik_damping,
-            base,
-        )
-        for i, c in enumerate(chunk):
-            done = sum(1 for o in out.get(c["d_idx"], []) if o[-1] == c["slot"])
-            if done >= c["count"]:
-                continue
-            x = demos[c["d_idx"]]
-            pos, quat = fks[c["d_idx"]]
-            res, k = recover_finish(
-                cfg, x, pos, quat, c, q_all[pad : pad + c["n"], i], chain, base, fcol
-            )
-            if res is None:
-                why[k] = why.get(k, 0) + 1
-                continue
-            out.setdefault(c["d_idx"], []).append(res + (c["slot"],))
-    return out, why
-
-
 def augment_libero(cfg):
     from flow_planning.envs.libero import LiberoConfig, LiberoEnv
 
@@ -831,9 +673,8 @@ def augment_libero(cfg):
             )
             demos = kept
         n_seg = cfg.n_seg or max(sum(j is not None for j in x["held"]) for x in demos)
-        rec = 1 if cfg.recover_arc and (cfg.recover or cfg.recover_approach) else 0
         pos = 1 if (cfg.postures or cfg.posture_prob) else 0
-        ldim = LABEL_DIM * n_seg + rec + pos
+        ldim = LABEL_DIM * n_seg + pos
         print(
             f"task {task_id}: {len(demos)} demos, {n_seg} grasp segments, "
             f"label dim {LABEL_DIM * n_seg}"
@@ -862,26 +703,6 @@ def augment_libero(cfg):
         for x in demos:
             for _ in range(cfg.orig_copies):
                 write(dst, x["obs"], x["act"], np.zeros(ldim), env.language, wall0)
-        if cfg.recover or cfg.recover_approach:
-            n_rec, lens, mags = 0, [], []
-            by_demo, why_all = recover_all(cfg, demos, chain, base, fcol, rng)
-            for segs in by_demo.values():
-                for o, a, n, mag, lab, _ in segs:
-                    label = np.zeros(ldim, np.float32)
-                    if rec:
-                        label[:LABEL_DIM] = lab
-                        label[LABEL_DIM * n_seg] = 1.0
-                    write(dst, o, a, label, env.language)
-                    n_rec += 1
-                    lens.append(n)
-                    mags.append(mag)
-            print(
-                f"task {task_id}: {n_rec} recovery segments "
-                f"({n_rec / max(len(demos), 1):.1f}/demo), rejected {why_all}, "
-                f"linear frames p50 {np.median(lens) if lens else 0:.0f} "
-                f"max {max(lens) if lens else 0}, |noise| mean "
-                f"{np.mean(mags) if mags else 0:.3f}"
-            )
         if cfg.postures:
             n_pos = 0
             mags = []
