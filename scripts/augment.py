@@ -185,10 +185,12 @@ def libero_demos(cfg, env, chain, base, limit):
         fixed = (
             np.stack([body_aabb(e0, n) for n in others]) if others else np.zeros((0, 6))
         )
-        g = e0.sim.model._model.geom("table_collision").id
-        table_z = float(
-            e0.sim.data._data.geom_xpos[g][2] + e0.sim.model._model.geom_size[g][2]
-        )
+        mj = e0.sim.model._model
+        try:
+            g = mj.geom("table_collision").id
+            table_z = float(e0.sim.data._data.geom_xpos[g][2] + mj.geom_size[g][2])
+        except KeyError:
+            table_z = float((boxes[:, 2] - boxes[:, 5]).min())
         half = [boxes[j, 3:5] if j is not None else np.ones(2) for j in held]
         demos.append(
             dict(

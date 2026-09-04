@@ -16,6 +16,7 @@ envs:
   NAME: spatial_base
   TASKS: "[0,1,2,3]"
   ONEHOT: 4
+  AUG: "--copies 0 --orig_copies 1"
   ITERS: 40000
   SEEDS: "0 1 2"
   CELLS: "0_I 0_II 1_I 1_II 2_I 2_II 3_I 3_II"
@@ -38,9 +39,9 @@ run: |
   CACHE=~/.cache/huggingface/lerobot/reece-omahoney
   ENV="--env.type libero --env.suite $SUITE --env.task_onehot $ONEHOT --env.n_action_steps 10 --env.world_count 10"
   q() { "$@" 2>&1 | grep --line-buffered -vE "it/s|Warning|examples/s|EGL|egl_|OpenGL|glCheck|binding_utils|raise self|^\s*$"; }
-  echo "##### augment $NAME: originals only"
+  echo "##### augment $NAME: $AUG"
   [ -d $CACHE/$NAME ] || q pixi run python scripts/augment.py $ENV --env.level I --task_ids "$TASKS" --dst_repo reece-omahoney/$NAME \
-    --n_seg 4 --bend_margin 0.4 --copies 0 --orig_copies 1 --ik_iters 32 --ik_tol 0.01 --vel_frac 0.8
+    --n_seg 4 --bend_margin 0.4 --ik_iters 32 --ik_tol 0.01 --vel_frac 0.8 $AUG
   arm_args() { case $1 in
     aegis) echo "--env.obstacle true --cond zero --cbf true";;
     free) echo "--env.obstacle false --cond zero";;
