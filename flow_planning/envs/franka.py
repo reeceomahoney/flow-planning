@@ -117,6 +117,7 @@ def subsample_cloud(pts, n: int, rng) -> np.ndarray:
     return out
 
 
+@wp.kernel(enable_backward=False)
 def set_target_pose_kernel(
     task: int,
     t: float,
