@@ -71,6 +71,7 @@ class LiberoConfig(EnvConfig):
     kp: float = 400.0
     delta_max: float = 0.2
     settle_steps: int = 10
+    settle_max: int = 60
     collision_displacement: float = 0.001
     render: bool = False
     render_size: int = 256
@@ -380,6 +381,14 @@ class LiberoEnv:
                     continue
                 if p[2] > 0 and abs(p[0]) < WORKSPACE and abs(p[1]) < WORKSPACE:
                     self.obstacle[i] = name
+                    still = 0
+                    for _ in range(self.cfg.settle_max):
+                        if still >= 3:
+                            break
+                        self.obs[i] = e.step(DUMMY_ACTION)[0]
+                        q = self.obs[i][f"{name}_pos"]
+                        still = still + 1 if np.abs(q - p).sum() < 2e-4 else 0
+                        p = q
                     self.obstacle_pos0[i] = p
                     break
 
@@ -474,8 +483,9 @@ class LiberoEnv:
 
     def target_pos(self, i=0):
         e = self.envs[i]
-        body = f"{self.target_name()}_main"
-        return np.asarray(e.sim.data.get_body_xpos(body), np.float32)
+        return np.asarray(
+            e.sim.data.get_body_xpos(f"{self.target_name()}_main"), np.float32
+        )
 
     def target_slice(self):
         start = 18 + 9 * len(self.objects) + len(self.fixture_qpos)
