@@ -2,7 +2,7 @@ name: flow-planning
 
 resources:
   infra: vast
-  accelerators: RTX5090:1
+  accelerators: RTX4090:1
   cpus: 16+
   memory: 32+
   disk_size: 60
@@ -14,8 +14,8 @@ envs:
   MUJOCO_GL: egl
   HF_DATASETS_DISABLE_PROGRESS_BARS: 1
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
-  NAME: spatial_demogen
-  AUG: "--copies 8 --orig_copies 5"
+  NAME: spatial_demogen_obj2
+  AUG: "--copies 8 --orig_copies 5 --obstacle_objects true --box_tries 80 --box_depth 0.01 --clear_frac 0.3 --oversample 16"
   POINTS: 256
   ITERS: 40000
   SEEDS: "0 1 2"
